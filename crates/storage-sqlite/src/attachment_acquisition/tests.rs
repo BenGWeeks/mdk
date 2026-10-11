@@ -2865,8 +2865,25 @@ fn attachment_idle_permission_resume_is_read_only() {
     );
 }
 
+/// Free space beyond the reserve that readmits a job parked with `headroom`.
+fn fits(headroom: u64) -> u64 {
+    headroom + STORAGE_READMIT_MARGIN_BYTES
+}
+fn parked_headroom(store: &SqliteAccountStorage, asset: &AttachmentAssetRef) -> Option<i64> {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT storage_blocked_headroom FROM attachment_acquisition WHERE token=?1",
+            [&asset.token],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
 /// mdk#2239: a storage-parked job keeps its checkpoint, never rejoins the due
-/// page on its own, readmits exactly when the reserve fits, and clears on retry.
+/// page on its own, readmits exactly when its recorded headroom plus the margin
+/// fits below the free space, and clears on either retry path.
 #[test]
 fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -2881,9 +2898,9 @@ fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
     store
         .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
         .unwrap();
-    assert!(store.block_attachment_storage(&job, 2048).unwrap());
+    assert!(store.block_attachment_storage(&job, 8192).unwrap());
     assert!(
-        !store.block_attachment_storage(&job, 2048).unwrap(),
+        !store.block_attachment_storage(&job, 8192).unwrap(),
         "only the live attempt parks"
     );
     assert_eq!(
@@ -2916,20 +2933,27 @@ fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
         .unwrap();
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(21, 1000, 1000 + 4 * 2048 - 1)
+            .readmit_storage_blocked_attachments(21, 1000, 1000 + fits(8192) - 1, true)
             .unwrap(),
         0,
-        "one byte short of the reserve keeps the job parked"
+        "one byte short of the target plus margin keeps the job parked"
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(21, 1000, 999)
+            .readmit_storage_blocked_attachments(21, 1000, 999, true)
             .unwrap(),
         0
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(21, 1000, 1000 + 4 * 2048)
+            .readmit_storage_blocked_attachments(21, 1000, 1000 + fits(8192), false)
+            .unwrap(),
+        0,
+        "an automatic row waits for automatic acquisition to be enabled"
+    );
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(21, 1000, 1000 + fits(8192), true)
             .unwrap(),
         1
     );
@@ -2937,9 +2961,11 @@ fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
         transfer(&store, "disk", true).state,
         AttachmentTransferState::Queued
     );
+    assert_eq!(parked_headroom(&store, &asset), None);
     assert_eq!(
-        store.attachment_transfer_candidates(22, 64, true).unwrap(),
-        vec![asset.clone()]
+        store.attachment_transfer_candidates(21, 64, true).unwrap(),
+        vec![asset.clone()],
+        "a first park readmits without delay"
     );
     assert_eq!(partial_usage(&store), 3, "readmission keeps the prefix");
     assert_eq!(
@@ -2952,38 +2978,225 @@ fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(23, 0, u64::MAX)
+            .readmit_storage_blocked_attachments(23, 0, u64::MAX, true)
             .unwrap(),
         0,
         "nothing else is storage-parked"
     );
-    // Explicit retry readmits at once, both through the native and the host path.
+    // A second park waits out the claim streak before it is due again, so a
+    // target that free space keeps crossing cannot drive a hot loop.
     let job = store
         .claim_attachment_acquisition(&asset, 24, 100)
         .unwrap()
         .unwrap();
-    assert!(store.block_attachment_storage(&job, 2048).unwrap());
-    assert!(store.retry_attachment_acquisition(&asset, 25).unwrap());
+    assert!(store.block_attachment_storage(&job, 8192).unwrap());
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(30, 0, fits(8192), true)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .due,
+        Some(45),
+        "second park: 15 s"
+    );
+    assert!(
+        store
+            .attachment_transfer_candidates(44, 64, true)
+            .unwrap()
+            .is_empty()
+    );
+    let job = store
+        .claim_attachment_acquisition(&asset, 45, 100)
+        .unwrap()
+        .unwrap();
+    assert!(store.block_attachment_storage(&job, 8192).unwrap());
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(50, 0, fits(8192), true)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .due,
+        Some(80),
+        "third park: 30 s"
+    );
+    // Explicit retry readmits at once and clears the parked marker on both
+    // paths, so a later ordinary failure never renders as a storage park.
+    let job = store
+        .claim_attachment_acquisition(&asset, 80, 100)
+        .unwrap()
+        .unwrap();
+    assert!(store.block_attachment_storage(&job, 8192).unwrap());
+    assert!(store.retry_attachment_acquisition(&asset, 81).unwrap());
     assert_eq!(
         transfer(&store, "disk", true).state,
         AttachmentTransferState::Queued
     );
+    assert_eq!(parked_headroom(&store, &asset), None);
     let job = store
-        .claim_attachment_acquisition(&asset, 26, 100)
+        .claim_attachment_acquisition(&asset, 82, 100)
         .unwrap()
         .unwrap();
-    assert!(store.block_attachment_storage(&job, 2048).unwrap());
-    assert!(store.explicitly_retry_attachment(&asset, 27).unwrap());
+    assert!(store.block_attachment_storage(&job, 8192).unwrap());
+    assert!(store.explicitly_retry_attachment(&asset, 83).unwrap());
     assert_eq!(
         transfer(&store, "disk", false).state,
         AttachmentTransferState::Queued
     );
+    assert_eq!(parked_headroom(&store, &asset), None);
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(28, 0, u64::MAX)
+            .readmit_storage_blocked_attachments(84, 0, u64::MAX, true)
             .unwrap(),
         0,
         "retry cleared the parked marker"
+    );
+    // Retry racing readmission in either order leaves one queued row.
+    let job = store
+        .claim_attachment_acquisition(&asset, 85, 100)
+        .unwrap()
+        .unwrap();
+    assert!(store.block_attachment_storage(&job, 8192).unwrap());
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(86, 0, fits(8192), false)
+            .unwrap(),
+        1,
+        "an explicitly retried row readmits while automatic work is disabled"
+    );
+    assert!(store.explicitly_retry_attachment(&asset, 86).unwrap());
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .state,
+        AttachmentAcquisitionState::Queued
+    );
+    assert_eq!(parked_headroom(&store, &asset), None);
+    // Cancelling a parked job keeps it parked for the user, not the scheduler.
+    let job = store
+        .claim_attachment_acquisition(&asset, 90, 100)
+        .unwrap()
+        .unwrap();
+    assert!(store.block_attachment_storage(&job, 8192).unwrap());
+    store.cancel_attachment_acquisition(&asset).unwrap();
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(91, 0, u64::MAX, true)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        transfer(&store, "disk", true).state,
+        AttachmentTransferState::Cancelled
+    );
+}
+
+/// A verified-body shortage under a revoked automatic permission parks under
+/// the permission owner: the row waits as `Paused`, keeps its prefix, and the
+/// permission readmission path requeues it for a fresh capacity check.
+#[test]
+fn storage_block_under_permission_pause_stays_permission_owned() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "paused");
+    let asset = request(&store, "paused");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    store.pause_automatic_attachments(13).unwrap();
+    assert!(store.block_attachment_storage(&job, 8192).unwrap());
+    assert_eq!(
+        transfer(&store, "paused", true).state,
+        AttachmentTransferState::Paused
+    );
+    assert_eq!(partial_usage(&store), 3);
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(14, 0, u64::MAX, true)
+            .unwrap(),
+        0,
+        "permission, not space, owns the row"
+    );
+    assert_eq!(
+        store.resume_permitted_attachments(40, [true; 4]).unwrap(),
+        1
+    );
+    assert_eq!(
+        transfer(&store, "paused", true).state,
+        AttachmentTransferState::Queued
+    );
+    assert_eq!(partial_usage(&store), 3);
+    let job = store
+        .claim_attachment_acquisition(&asset, 41, 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        parked_headroom(&store, &asset),
+        None,
+        "a claim starts clean"
+    );
+    assert!(store.block_attachment_storage(&job, 8192).unwrap());
+    assert_eq!(
+        transfer(&store, "paused", true).state,
+        AttachmentTransferState::StorageBlocked
+    );
+}
+
+/// The 24-hour checkpoint expiry skips storage-parked jobs: their prefix is
+/// what lets readmission finish without refetching.
+#[test]
+fn storage_parked_checkpoints_are_exempt_from_idle_expiry() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for m in ["parked", "idle"] {
+        seed(&store, m);
+    }
+    let parked = request(&store, "parked");
+    let job = store
+        .claim_attachment_acquisition(&parked, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    assert!(store.block_attachment_storage(&job, 8192).unwrap());
+    let idle = request(&store, "idle");
+    let idle_job = store
+        .claim_attachment_acquisition(&idle, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&idle_job, &partial_identity(10), 0, b"abcd", 12, 100)
+        .unwrap();
+    assert_eq!(partial_usage(&store), 7);
+    let far_future = 12 + 48 * 60 * 60;
+    assert_eq!(store.prune_attachment_partials(far_future, 64).unwrap(), 1);
+    assert_eq!(partial_usage(&store), 3, "only the idle prefix expired");
+    assert!(
+        store
+            .retry_attachment_acquisition(&parked, far_future)
+            .unwrap()
+    );
+    assert_eq!(store.prune_attachment_partials(far_future, 64).unwrap(), 1);
+    assert_eq!(
+        partial_usage(&store),
+        0,
+        "a retried job's prefix expires normally"
     );
 }
 
@@ -3027,8 +3240,9 @@ fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
         BODY.len() as u64
     );
     assert_eq!(read(&store, &asset), BODY);
-    // The retired bind-the-whole-body form pays the trigger rewrite as a fourth
-    // row change, which is the copy the publication path no longer makes.
+    // The retired bind-the-whole-body form pays the trigger rewrite inside one
+    // statement: insert, row rewrite and usage charge also count three, which
+    // is the copy the publication path no longer makes.
     seed(&store, "legacy");
     let legacy = request(&store, "legacy");
     let before = store.lock().unwrap().total_changes();

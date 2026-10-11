@@ -1041,8 +1041,9 @@ pub(crate) enum AttachmentDownloadFailure {
     SizeLimit(AppError, u64),
     /// Explicit acquisitions select a file sink before buffering a large body.
     FileRequired,
-    /// Free disk cannot cover the publication reserve for this many plaintext
-    /// bytes. The job parks with its checkpoints instead of retrying on a timer.
+    /// Free disk cannot cover the publication reserve. The payload is the
+    /// headroom beyond the policy reserve a retried attempt needs; the job
+    /// parks with its checkpoints instead of retrying on a timer.
     StorageBlocked(u64),
 }
 impl From<AppError> for AttachmentDownloadFailure {
@@ -1190,7 +1191,7 @@ pub(crate) async fn download_encrypted_media_classified(
     // On success, ownership moves into the publication result below.
     let mut plaintext = zeroize::Zeroizing::new(plaintext);
     if let Some(resume) = &transport.resume {
-        resume.completed_body(plaintext.len()).await?;
+        resume.completed_body(plaintext.len(), 0).await?;
     }
     let plaintext = std::mem::take(&mut *plaintext);
     Ok(MediaDownloadResult {

@@ -11,8 +11,9 @@
   canonical source tags in the page snapshot without a history backfill.
 - Migrations 0103 through 0107 advance account storage to schema 107 on first
   open. Older binaries reject the upgraded database; downgrade is unsupported.
-  Migration 0107 adds `attachment_acquisition.storage_blocked_bytes` and keeps
-  ciphertext checkpoints for jobs parked on disk space.
+  Migration 0107 adds `attachment_acquisition.storage_blocked_headroom` with
+  a partial index for parked rows and keeps ciphertext checkpoints for jobs
+  parked on disk space.
 - `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
 
 ### Added
@@ -41,10 +42,14 @@
   representation bounds, without increasing user quotas. (#2175)
 
 - `SqliteAccountStorage::block_attachment_storage` parks a live attempt whose
-  publication disk reserve the device cannot cover, and
-  `readmit_storage_blocked_attachments` requeues up to 64 parked jobs whose
-  reserve fits the supplied free space. Explicit retry clears the parked
-  marker; cancelled and size-policy work stays parked (mdk#2239).
+  publication disk reserve the device cannot cover, recording the free space it
+  needs beyond the reserve, and `readmit_storage_blocked_attachments` requeues
+  up to 64 parked jobs whose target fits the supplied free space less
+  `STORAGE_READMIT_MARGIN_BYTES`, delaying a repeated park by its claim streak
+  and skipping automatic rows while automatic acquisition is disabled. Explicit
+  retry and a new claim clear the parked marker; cancelled and size-policy
+  work stays parked, and `prune_attachment_partials` leaves parked prefixes in
+  place (mdk#2239).
 
 ### Fixed
 

@@ -43,11 +43,12 @@ fn retry(message: &str) -> AttachmentDownloadFailure {
 fn stop(message: &str) -> AttachmentDownloadFailure {
     AttachmentDownloadFailure::Stop(AppError::BlobStore(message.into()))
 }
-/// Publishing `plaintext_len` bytes needs `disk_reserve + 4 * plaintext_len` free
-/// (SQLite row, WAL and private staging copies). Below that, the job parks as
-/// `StorageBlocked` with its checkpoints instead of re-fetching on a timer.
-fn storage_blocked(plaintext_len: u64) -> AttachmentDownloadFailure {
-    AttachmentDownloadFailure::StorageBlocked(plaintext_len)
+/// Publishing `bytes` needs `disk_reserve + 4 * bytes` free (SQLite row, WAL and
+/// private staging copies). Below that, the job parks as `StorageBlocked` with
+/// its checkpoints instead of re-fetching on a timer. The payload is the
+/// headroom beyond the reserve a retried attempt needs, in the worker's frame.
+fn storage_blocked(headroom: u64) -> AttachmentDownloadFailure {
+    AttachmentDownloadFailure::StorageBlocked(headroom)
 }
 
 /// Distinguish revocation from transport errors without nesting Result values.
@@ -134,6 +135,7 @@ impl AttachmentResume {
         Ok(())
     }
     /// Final progress keeps ciphertext units; only the receipt uses plaintext length.
+    /// The decrypted file is this attempt's own staging at the receipt.
     pub(crate) async fn completed_file_body(
         &self,
         plaintext_len: usize,
@@ -143,12 +145,16 @@ impl AttachmentResume {
             .ok_or_else(|| stop("attachment length overflow"))?;
         self.progress(ciphertext_len, Some(ciphertext_len), false)
             .await?;
-        self.completed_body(plaintext_len).await
+        self.completed_body(plaintext_len, plaintext_len as u64)
+            .await
     }
 
+    /// `held` is the staging this attempt occupies at the receipt; the
+    /// in-memory sink stages nothing and passes zero.
     pub(crate) async fn completed_body(
         &self,
         plaintext_len: usize,
+        held: u64,
     ) -> Result<(), AttachmentDownloadFailure> {
         self.finishing.store(true, Ordering::Release);
         let this = self.clone();
@@ -156,7 +162,7 @@ impl AttachmentResume {
             // Park on disk pressure before recording a completed receipt, so a
             // blocked job never becomes an opted-in body with no retention.
             // Stable retention quota failures after this boundary remain terminal.
-            this.check_publication_capacity(plaintext_len as u64)?;
+            this.check_publication_capacity(plaintext_len as u64, 0, held)?;
             this.storage
                 .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
                 .map_err(|_| stop("attachment receipt failed"))
@@ -169,17 +175,36 @@ impl AttachmentResume {
         Ok(())
     }
 
-    /// The durable policy's reserve plus four times `bytes` must be free. Both
-    /// sinks apply this as soon as a size is known, again as a body grows
-    /// without a validator, and once more before the completed-body receipt.
-    fn check_publication_capacity(&self, bytes: u64) -> Result<(), AttachmentDownloadFailure> {
+    /// Publishing `bytes` needs the durable policy's reserve plus four times
+    /// `bytes` free at the strictest point of the attempt. Both sinks apply
+    /// this as soon as a size is known, again as a body grows, and once more
+    /// before the completed-body receipt.
+    ///
+    /// `ahead` is the staging, checkpoint and decrypted-file growth this
+    /// attempt will still consume before that point, so the check anticipates
+    /// it instead of fetching a body it must then park. `held` is the staging
+    /// this attempt already occupies, which the worker's free-space
+    /// measurement (taken once that staging is gone) does not see. A shortage
+    /// parks the job with the headroom a retried attempt needs beyond the
+    /// reserve: `4 * bytes + ahead + held`. Readmission requires that headroom
+    /// in the worker's frame, so a readmitted attempt sees at least the space
+    /// this check wanted, and a later check that parks again records a
+    /// strictly larger target. Unknown free space is a transient failure.
+    fn check_publication_capacity(
+        &self,
+        bytes: u64,
+        ahead: u64,
+        held: u64,
+    ) -> Result<(), AttachmentDownloadFailure> {
         let policy = self
             .storage
             .attachment_download_policy(&self.policy)
             .map_err(|_| retry("attachment publication policy unavailable"))?;
-        let free = fs4::available_space(&self.directory).unwrap_or(0);
-        if free < policy.disk_reserve.saturating_add(bytes.saturating_mul(4)) {
-            return Err(storage_blocked(bytes));
+        let free = fs4::available_space(&self.directory)
+            .map_err(|_| retry("free disk space unavailable"))?;
+        let needed = bytes.saturating_mul(4).saturating_add(ahead);
+        if free < policy.disk_reserve.saturating_add(needed) {
+            return Err(storage_blocked(needed.saturating_add(held)));
         }
         Ok(())
     }
@@ -188,21 +213,25 @@ impl AttachmentResume {
     pub(super) async fn publication_capacity(
         self: &Arc<Self>,
         bytes: u64,
+        ahead: u64,
+        held: u64,
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || this.check_publication_capacity(bytes))
+        tokio::task::spawn_blocking(move || this.check_publication_capacity(bytes, ahead, held))
             .await
             .map_err(|_| retry("attachment capacity task failed"))?
     }
 
     /// Early in-memory capacity check: a definite shortage parks the job, but
-    /// an unobservable policy must not mask a later cryptographic verdict. The
-    /// completed-body receipt repeats the check authoritatively.
+    /// an unobservable policy or free-space figure must not mask a later
+    /// cryptographic verdict. The completed-body receipt repeats the check
+    /// authoritatively. The in-memory sink stages nothing on disk.
     async fn early_publication_capacity(
         self: &Arc<Self>,
         bytes: u64,
+        ahead: u64,
     ) -> Result<(), AttachmentDownloadFailure> {
-        match self.publication_capacity(bytes).await {
+        match self.publication_capacity(bytes, ahead, 0).await {
             Err(blocked @ AttachmentDownloadFailure::StorageBlocked(_)) => Err(blocked),
             _ => Ok(()),
         }
@@ -382,7 +411,13 @@ impl AttachmentResume {
                     (&this.ciphertext_digest, &locator_digest),
                 )
                 .map_err(|_| retry("partial checkpoint metadata unavailable"))?;
-            this.check_publication_capacity(total.unwrap_or(0))?;
+            // Restoring a checkpoint stages it again, and the download then
+            // grows both the staging file and the checkpoint to the total.
+            this.check_publication_capacity(
+                total.unwrap_or(0),
+                total.map(|total| total.saturating_mul(2)).unwrap_or(0),
+                0,
+            )?;
             let mut file = super::file_transfer::PrivateMediaFile::create(&directory)?;
             let mut writer = file.writer()?;
             let part = this
@@ -492,13 +527,21 @@ pub(super) async fn read_body(
     }
     if let Some(total) = expected_total {
         // The size is known now: refuse before fetching a body the device
-        // cannot publish, and reserve the buffer once so it never doubles.
+        // cannot publish, counting the checkpoint bytes a validated body will
+        // still add, and reserve the buffer once so it never doubles. A
+        // peer-declared length must not abort the process on allocation.
+        let checkpoint_growth = identity
+            .as_ref()
+            .map_or(0, |_| total.saturating_sub(bytes.len() as u64));
         context
             .early_publication_capacity(
                 total.saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES),
+                checkpoint_growth,
             )
             .await?;
-        bytes.reserve_exact((total as usize).saturating_sub(bytes.len()));
+        bytes
+            .try_reserve_exact((total as usize).saturating_sub(bytes.len()))
+            .map_err(|_| retry("attachment body buffer unavailable"))?;
     }
     context
         .progress(bytes.len() as u64, expected_total, true)
@@ -567,6 +610,7 @@ pub(super) async fn read_body(
     if let Err(error) = context
         .early_publication_capacity(
             (bytes.len() as u64).saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES),
+            0,
         )
         .await
     {

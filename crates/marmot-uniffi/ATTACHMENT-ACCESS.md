@@ -134,7 +134,8 @@ bodies above the automatic cap stream through a private file sink instead of a w
 array, so receiving never buffers more than the automatic cap in memory. Initial disk/quota
 admission reserves the automatic cap (64 MiB by default). As soon as a response declares the
 body size, and again before publication, the job needs the disk reserve plus four times the
-body free. Automatic transfers have a two-minute deadline. Policy requires retained quota at
+body free, counting the staging and checkpoint bytes the attempt itself still has to write.
+Automatic transfers have a two-minute deadline. Policy requires retained quota at
 least equal to the automatic cap. Retained-quota pressure appears as `RetryScheduled` with a
 retry time; a body the device cannot publish parks as `StorageBlocked` (see the state table);
 an intentionally high disk reserve can pause work.
@@ -213,7 +214,7 @@ cancellation, retry deadlines, progress, budgets and their opaque reference.
 | PreviouslyAcquiredUnavailable | Previously published bytes are gone; no automatic reacquisition. |
 | CompletedUnretained | A verified body could not be published, or the process stopped after recording its receipt; no automatic reacquisition. |
 | RetryExhausted | The durable acquisition or network budget is spent; no automatic retry. |
-| StorageBlocked | Free disk cannot cover the publication reserve for this body. Checkpointed ciphertext is kept; the worker readmits the job once free space covers the reserve, and Retry readmits it at once. Render a storage prompt, not a retry timer. |
+| StorageBlocked | Free disk cannot cover the publication reserve for this body. Checkpointed ciphertext is kept; the worker readmits the job once free space covers its recorded target (the reserve, the body and the staging a retry needs) by a 4 MiB margin, and Retry readmits it at once. Render a storage prompt, not a retry timer. |
 | Failed / Cancelled / Removed | Preserves terminal state or suppression. |
 | Unavailable | Source is obsolete, hidden, expired, rejected or otherwise unusable. |
 
@@ -234,11 +235,15 @@ automatic permission, not its budget. A completed verified body has one receipt 
 before publication; insufficient retention capacity or publication failure is terminal
 for opted-in jobs. The free-disk check runs as soon as the size is known and again before
 the receipt; a shortage parks the job as `StorageBlocked` without recording successful
-acquisition and keeps its checkpoint (the complete ciphertext when the body had already
-arrived), so the readmitted attempt publishes without fetching the body again. No retry
-timer runs while parked: the worker readmits the job once free space covers its reserve,
-and explicit Retry readmits it immediately. Resource pressure before fetching can defer
-admission without spending an attempt. If receipt storage fails, the persisted budgets still bound
+acquisition and keeps its checkpoint. When the whole body had already arrived, the in-memory
+sink checkpoints the complete ciphertext, so its readmitted attempt publishes without another
+request; the file sink keeps every saved 1 MiB checkpoint and re-requests at most the unsaved
+tail, and a body without a strong validator starts over. No timer refetches while parked: the
+job records the free space it needs beyond the reserve (the body plus the staging and
+checkpoint bytes a retry occupies), the worker readmits it once free space exceeds that by
+a 4 MiB margin, a job that parks again waits out its claim streak (15 s, doubling to an
+hour) before it is due, and explicit Retry readmits it immediately. Resource pressure before
+fetching can defer admission without spending an attempt. If receipt storage fails, the persisted budgets still bound
 subsequent fetches. A size-policy failure remains `PolicyBlocked` even if the budget
 is exhausted; raising the size cap does not replenish that budget, so explicit retry
 may also be needed.

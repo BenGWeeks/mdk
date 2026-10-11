@@ -864,8 +864,13 @@ pub(crate) async fn download_file(
                 continue;
             }
         };
+        // The ciphertext file is this attempt's staging at this point.
         observation
-            .publication_capacity(encrypted.len.saturating_sub(MEDIA_AEAD_TAG_BYTES))
+            .publication_capacity(
+                encrypted.len.saturating_sub(MEDIA_AEAD_TAG_BYTES),
+                0,
+                encrypted.len,
+            )
             .await?;
         let decryption_directory = directory.clone();
         let decryption_control = control.clone();

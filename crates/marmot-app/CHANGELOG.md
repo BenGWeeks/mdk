@@ -9,6 +9,9 @@
   update exhaustive matches. `MarmotAppConfig` adds `moderation_report_config`;
   struct literals that do not use `..Default::default()` must set it.
 
+- `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
+  publication reserve for the body. Update exhaustive matches; the job keeps
+  its checkpoint and readmits once space frees or on explicit Retry.
 - Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
   field. Update Rust struct literals; gallery consumers can exclude `InlineEmoji`
   without changing original slots, parser verdicts or acquisition references.
@@ -89,10 +92,14 @@
   plaintext) is checked as soon as a response declares the size and again
   before the completed-body receipt; a shortage parks the job as
   `AttachmentTransferState::StorageBlocked` with its ciphertext checkpoint
-  instead of scheduling a timer. The worker readmits parked jobs once free
-  space covers their reserve, explicit Retry readmits them at once, and a body
-  that had already arrived is checkpointed whole so readmission publishes
-  without another request. Automatic history keeps its caps (#2239).
+  instead of scheduling a timer. The parked job records the free space it
+  needs beyond the reserve, including the staging and checkpoint bytes a retry
+  occupies; the worker readmits it once free space exceeds that by 4 MiB, a
+  job that parks again waits out its claim streak first, and explicit Retry
+  readmits at once. A body that had already arrived through the in-memory sink
+  is checkpointed whole, so readmission publishes without another request; the
+  file sink re-requests at most its unsaved sub-MiB tail. Automatic history
+  keeps its caps (#2239).
 - Receiving an attachment no longer holds several copies of it in native
   memory. The body buffer is reserved once from the declared length and
   decrypted in place, explicit downloads above the automatic transfer limit

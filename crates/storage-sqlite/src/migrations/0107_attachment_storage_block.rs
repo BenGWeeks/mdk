@@ -5,21 +5,26 @@ use rusqlite::Transaction;
 use crate::SqliteResultExt;
 
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
-    // Plaintext bytes whose publication reserve the device could not cover when
-    // a verified or size-known transfer stopped. NULL means the job is not
-    // parked for disk space. Existing jobs never start parked.
+    // Free bytes beyond the policy disk reserve that a parked transfer needs
+    // before it is readmitted: the publication reserve of the check that parked
+    // it plus the staging and checkpoint bytes that attempt will occupy again.
+    // NULL means the job is not parked for disk space; existing jobs never
+    // start parked. The partial index serves the per-tick readmission probe.
     //
     // A storage-parked job keeps its ciphertext checkpoint: the blocked state
     // is the same terminal-looking row as a failure, but the next admitted
     // attempt is meant to resume (ideally without any request), so the
     // terminal cleanup trigger must not discard the prefix for it.
     tx.execute_batch(
-        "ALTER TABLE attachment_acquisition ADD COLUMN storage_blocked_bytes INTEGER
-             CHECK(storage_blocked_bytes IS NULL OR storage_blocked_bytes>=0);
+        "ALTER TABLE attachment_acquisition ADD COLUMN storage_blocked_headroom INTEGER
+             CHECK(storage_blocked_headroom IS NULL OR storage_blocked_headroom>=0);
+        CREATE INDEX attachment_acquisition_storage_parked
+            ON attachment_acquisition(priority_at DESC,token)
+            WHERE state=4 AND storage_blocked_headroom IS NOT NULL;
         DROP TRIGGER attachment_partial_terminal;
         CREATE TRIGGER attachment_partial_terminal AFTER UPDATE OF state ON attachment_acquisition
         WHEN NEW.state=3 OR (NEW.state=5 AND NEW.permission_paused=0)
-            OR (NEW.state=4 AND NEW.cancelled=0 AND NEW.storage_blocked_bytes IS NULL) BEGIN
+            OR (NEW.state=4 AND NEW.cancelled=0 AND NEW.storage_blocked_headroom IS NULL) BEGIN
             DELETE FROM attachment_partial WHERE token=NEW.token;
         END;",
     )
@@ -49,14 +54,14 @@ mod tests {
         apply(&tx).unwrap();
         tx.rollback().unwrap();
         assert!(
-            conn.prepare("SELECT storage_blocked_bytes FROM attachment_acquisition")
+            conn.prepare("SELECT storage_blocked_headroom FROM attachment_acquisition")
                 .is_err()
         );
         run(&mut conn, MIGRATIONS).unwrap();
         run(&mut conn, MIGRATIONS).unwrap();
         let row = conn
             .query_row(
-                "SELECT state,attempts,due,storage_blocked_bytes FROM attachment_acquisition",
+                "SELECT state,attempts,due,storage_blocked_headroom FROM attachment_acquisition",
                 [],
                 |r| {
                     Ok((
@@ -71,17 +76,30 @@ mod tests {
         assert_eq!(row, (2, 7, 1234, None));
         assert!(
             conn.execute(
-                "UPDATE attachment_acquisition SET storage_blocked_bytes=-1",
+                "UPDATE attachment_acquisition SET storage_blocked_headroom=-1",
                 []
             )
             .is_err(),
-            "negative reserve requirements are rejected"
+            "negative headroom targets are rejected"
+        );
+        // The per-tick readmission probe is served by the partial index.
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition
+                 WHERE state=4 AND storage_blocked_headroom IS NOT NULL ORDER BY priority_at DESC,token",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("attachment_acquisition_storage_parked"),
+            "{plan}"
         );
         // Parking for disk space keeps the checkpoint; any other blocked
         // transition still discards it, as before this migration.
         assert_eq!(partials(&conn), 1);
         conn.execute(
-            "UPDATE attachment_acquisition SET state=4,due=NULL,storage_blocked_bytes=4096",
+            "UPDATE attachment_acquisition SET state=4,due=NULL,storage_blocked_headroom=4096",
             [],
         )
         .unwrap();
@@ -91,7 +109,7 @@ mod tests {
             "a storage-parked job resumes its prefix"
         );
         conn.execute(
-            "UPDATE attachment_acquisition SET state=0,due=1,storage_blocked_bytes=NULL",
+            "UPDATE attachment_acquisition SET state=0,due=1,storage_blocked_headroom=NULL",
             [],
         )
         .unwrap();

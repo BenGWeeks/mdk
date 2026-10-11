@@ -587,7 +587,7 @@ impl SqliteAccountStorage {
                 [&reference.token],
             ).storage()?;
             conn.execute(
-                "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),progress_phase=0,body_completed=CASE WHEN automatic_history=0 THEN 0 ELSE body_completed END,
+                "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),progress_phase=0,storage_blocked_headroom=NULL,body_completed=CASE WHEN automatic_history=0 THEN 0 ELSE body_completed END,
                     progress_epoch=progress_epoch+1,progress_received=0,progress_total=NULL,
                     attempts=min(attempts+1,2147483647),acquisition_attempts=min(acquisition_attempts+automatic_history,2147483647),preparation_deferrals=0 WHERE token=?1",
                 params![reference.token, deadline],
@@ -740,7 +740,7 @@ impl SqliteAccountStorage {
         }
         Ok(conn
             .execute(
-                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_bytes=NULL,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
+                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
              WHERE token=?1 AND state IN (2,4,5)",
                 params![reference.token, u64_to_i64(now)?],
             )
@@ -970,13 +970,7 @@ fn insert_retained_array(conn: &Connection, token: &[u8], plaintext: &[u8]) -> S
         params![token, u64_to_i64(plaintext.len() as u64)?],
     )
     .storage()?;
-    let row_id: i64 = conn
-        .query_row(
-            "SELECT rowid FROM retained_attachment_bytes WHERE token=?1",
-            [token],
-            |r| r.get(0),
-        )
-        .storage()?;
+    let row_id = conn.last_insert_rowid();
     let mut blob = conn
         .blob_open("main", "retained_attachment_bytes", "bytes", row_id, false)
         .storage()?;
@@ -1065,7 +1059,7 @@ pub use access::RetainedAttachmentAsset;
 mod controls;
 pub use controls::{
     AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
-    AttachmentTransferStatus,
+    AttachmentTransferStatus, STORAGE_READMIT_MARGIN_BYTES,
 };
 
 mod outgoing;

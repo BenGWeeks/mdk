@@ -162,5 +162,5 @@ pub use timeline::reports::{
 
 pub use attachment_acquisition::{
     AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
-    AttachmentTransferStatus,
+    AttachmentTransferStatus, STORAGE_READMIT_MARGIN_BYTES,
 };

@@ -535,6 +535,9 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Storage-parked jobs are exempt: their prefix is what makes readmission
+    /// local work, and it is released by retry, cancellation, source removal or
+    /// the job's own completion rather than by idle time.
     pub fn prune_attachment_partials(&self, now: u64, limit: usize) -> StorageResult<usize> {
         if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
             return Err(invalid("invalid partial prune limit"));
@@ -542,8 +545,10 @@ impl SqliteAccountStorage {
         self.lock()?
             .execute(
                 "DELETE FROM attachment_partial WHERE token IN (
-                 SELECT token FROM attachment_partial WHERE expires_at<=?1
-                 ORDER BY expires_at,token LIMIT ?2)",
+                 SELECT p.token FROM attachment_partial p WHERE p.expires_at<=?1
+                 AND NOT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE q.token=p.token
+                     AND q.state=4 AND q.storage_blocked_headroom IS NOT NULL)
+                 ORDER BY p.expires_at,p.token LIMIT ?2)",
                 params![u64_to_i64(now)?, limit as i64],
             )
             .storage()

@@ -2237,9 +2237,10 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
         .unwrap()
         .unwrap();
     let result = prepared.run_classified(context).await;
+    // No validator, so the park target is the publication reserve alone.
     assert!(matches!(
         &result,
-        Err(AttachmentDownloadFailure::StorageBlocked(bytes)) if *bytes == body.len() as u64
+        Err(AttachmentDownloadFailure::StorageBlocked(headroom)) if *headroom == 4 * body.len() as u64
     ));
     complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
     let status = store
@@ -2263,14 +2264,14 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     let free = fs4::available_space(dir.path()).unwrap();
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(now, unavailable_reserve, free)
+            .readmit_storage_blocked_attachments(now, unavailable_reserve, free, true)
             .unwrap(),
         0,
         "still parked while the reserve stays out of reach"
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(now, 0, free)
+            .readmit_storage_blocked_attachments(now, 0, free, true)
             .unwrap(),
         1
     );
