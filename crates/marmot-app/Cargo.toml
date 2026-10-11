@@ -46,6 +46,7 @@ marmot-forensics.workspace = true
 marmot-markdown.workspace = true
 nostr = { workspace = true, features = ["nip04"] }
 nostr-sdk.workspace = true
+openssl.workspace = true
 opentelemetry-proto = { workspace = true, optional = true }
 # Request-owned, DNS-pinned WebSocket dials for public-event previews. Same
 # tokio-tungstenite release async-wsocket 0.17 links, so frames convert with
@@ -62,6 +63,7 @@ serde_json.workspace = true
 sha2.workspace = true
 storage-sqlite.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "net"] }
 tokio-util.workspace = true
 tracing.workspace = true

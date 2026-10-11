@@ -12,10 +12,10 @@ impl MarmotAppRuntime {
     ///
     /// Returns exactly one result per input, duplicates included, in input
     /// order. The whole request (at most 16 references) is validated before
-    /// storage is touched; invalid input is an error. If account lifecycle work
-    /// currently owns the account transaction, every row is `Busy` (retryable)
-    /// rather than waiting or reporting `Missing`. Never sleeps, blocks on an
-    /// async lock, or enters the async runtime.
+    /// storage is touched; invalid input is an error. If another account/storage
+    /// operation currently owns the shared account transaction, every row is
+    /// `Busy` (retryable) rather than waiting or reporting `Missing`. Never
+    /// sleeps, blocks on an async lock, or enters the async runtime.
     pub fn cached_public_event_previews(
         &self,
         account_ref: &str,
@@ -73,8 +73,9 @@ impl MarmotAppRuntime {
     /// state. Local state is read under the account transaction, which is then
     /// released before any relay await; persistence reacquires it and writes
     /// only if the same account-cache incarnation is still published. Requests
-    /// for one key coalesce, and an attempted refresh starts a 30-second
-    /// in-memory cooldown. Failed or empty refreshes keep prior content. If the
+    /// for one key coalesce, and a refresh reaching persistence starts a 30-second
+    /// in-memory cooldown. Cancellation during network acquisition permits an
+    /// immediate retry. Failed or empty refreshes keep prior content. If the
     /// account was removed, wiped, reimported or closed meanwhile, the leader
     /// and every coalesced waiter return a retryable `Busy` row without
     /// opening any storage for the replaced incarnation.
@@ -117,7 +118,7 @@ impl MarmotAppRuntime {
         {
             return Ok(local);
         }
-        let mut lease = match cache.begin_refresh(&key.storage_key()) {
+        let lease = match cache.begin_refresh(&key.storage_key()) {
             RefreshAdmission::Lead(lease) => lease,
             RefreshAdmission::Coalesced(mut done) => {
                 // Expiry is not completion: the leader may still own the
@@ -146,7 +147,6 @@ impl MarmotAppRuntime {
         };
 
         // Network: no account transaction or database guard is held here.
-        lease.mark_attempted();
         let candidates = self
             .accounts
             .app
@@ -161,8 +161,11 @@ impl MarmotAppRuntime {
         blocking_app_task(move || {
             let _account_transaction = account_transaction;
             // Keep the refresh lease until persistence finishes so coalesced
-            // callers observe the written state.
-            let _lease = lease;
+            // callers never read the pre-admission cache.
+            // A cancelled network future starts no cooldown; once persistence
+            // owns the account fence it completes even if the caller leaves.
+            let mut lease = lease;
+            lease.mark_attempted();
             persist_refresh_if_current(&app, &account, &current, &cache, &reference, &candidates)
         })
         .await
@@ -323,6 +326,52 @@ mod tests {
                 .and_then(|profile| profile.name.clone()),
             _ => None,
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_does_not_suppress_an_immediate_retry() {
+        use futures::StreamExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (requested, request_seen) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = pinned_tokio_tungstenite::accept_async(socket)
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = websocket.next().await {
+                if message
+                    .to_text()
+                    .is_ok_and(|text| text.starts_with("[\"REQ\""))
+                {
+                    let _ = requested.send(());
+                    std::future::pending::<()>().await;
+                    return;
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), &url);
+        let runtime = app.runtime();
+        let cache = app.public_event_cache_for_account(&account).unwrap();
+        app.directory_cache_for_account(&account).unwrap();
+        let id = "ef".repeat(32);
+        let mut resolve = Box::pin(runtime.resolve_public_event_preview("alice", &id));
+        tokio::select! {
+            _ = request_seen => {},
+            result = &mut resolve => panic!("refresh unexpectedly completed: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => panic!("no target request"),
+        }
+        drop(resolve);
+        assert!(matches!(
+            cache.begin_refresh(&format!("event:{id}")),
+            RefreshAdmission::Lead(_)
+        ));
+        server.abort();
+        runtime.shutdown_and_close().await.unwrap();
     }
 
     #[tokio::test]

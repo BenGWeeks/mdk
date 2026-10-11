@@ -1300,6 +1300,351 @@ fn eviction_removes_whole_cohorts_and_documents_the_end_of_deletion_knowledge() 
     );
 }
 
+#[tokio::test]
+async fn target_and_evidence_queries_reuse_the_same_relay_connection() {
+    use futures::{SinkExt, StreamExt};
+    use pinned_tokio_tungstenite::tungstenite::Message;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let connections = Arc::new(AtomicUsize::new(0));
+    let count = connections.clone();
+    let server = tokio::spawn(async move {
+        let mut sockets = tokio::task::JoinSet::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            count.fetch_add(1, Ordering::SeqCst);
+            sockets.spawn(async move {
+                let mut ws = pinned_tokio_tungstenite::accept_async(socket)
+                    .await
+                    .unwrap();
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.into_text() else {
+                        continue;
+                    };
+                    let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    if request[0] == "REQ" {
+                        ws.send(Message::Text(
+                            serde_json::json!(["EOSE", request[1]]).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                }
+            });
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), &url);
+    app.fetch_public_event_candidates(&address(&Keys::generate(), 30023), &[], None)
+        .await;
+    let actual = connections.load(Ordering::SeqCst);
+    server.abort();
+    let _ = server.await;
+    assert_eq!(
+        actual, 1,
+        "target and deletion evidence share a request-owned socket"
+    );
+}
+
+#[tokio::test]
+async fn failed_relay_handshakes_do_not_dilute_the_live_relay_event_budget() {
+    use futures::{SinkExt, StreamExt};
+    use pinned_tokio_tungstenite::tungstenite::Message;
+    let good = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let good_url = format!("ws://{}", good.local_addr().unwrap());
+    let mut hints = vec![good_url.clone()];
+    let mut bad_servers = Vec::new();
+    for _ in 0..3 {
+        let bad = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        hints.push(format!("ws://{}", bad.local_addr().unwrap()));
+        bad_servers.push(tokio::spawn(async move {
+            while let Ok((socket, _)) = bad.accept().await {
+                drop(socket); // TCP works, but the WebSocket handshake fails.
+            }
+        }));
+    }
+    let (limit_tx, limit_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut limit_tx = Some(limit_tx);
+        for _ in 0..2 {
+            let (socket, _) = good.accept().await.unwrap();
+            let mut websocket = pinned_tokio_tungstenite::accept_async(socket)
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = websocket.next().await {
+                let Ok(text) = message.into_text() else {
+                    continue;
+                };
+                let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if request[0] != "REQ" {
+                    continue;
+                }
+                if let Some(tx) = limit_tx.take() {
+                    tx.send(request[2]["limit"].as_u64().unwrap()).unwrap();
+                }
+                websocket
+                    .send(Message::Text(
+                        serde_json::json!(["EOSE", request[1]]).to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), &good_url);
+    let reference = address(&Keys::generate(), 30023);
+    app.fetch_public_event_candidates(&reference, &hints, None)
+        .await;
+    let actual = limit_rx.await.unwrap();
+    server.abort();
+    for server in bad_servers {
+        server.abort()
+    }
+    assert_eq!(
+        actual,
+        4, // the coordinate filter is narrower than its phase budget
+        "scheduled connections diluted the sole live relay's budget"
+    );
+}
+
+#[test]
+fn batch_lookup_rolls_back_all_recency_touches_on_failure() {
+    let (_dir, cache) = fixture();
+    let keys = Keys::generate();
+    let first = signed(&keys, 1, 1000, "first");
+    let second = signed(&keys, 1, 1000, "second");
+    let first_ref = super_reference(&first);
+    let second_ref = super_reference(&second);
+    cache.admit(&first_ref, &[first.as_json()], 1000).unwrap();
+    cache.admit(&second_ref, &[second.as_json()], 1000).unwrap();
+    {
+        let conn = cache.conn.lock().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_second_touch BEFORE UPDATE OF touched_at ON public_event_previews
+             WHEN OLD.cache_key = '{}' BEGIN SELECT RAISE(ABORT, 'test write failure'); END;",
+            second_ref.key().unwrap(),
+        ))
+        .unwrap();
+    }
+    assert!(
+        cache
+            .lookup_states(&[first_ref.clone(), second_ref], 1001)
+            .is_err()
+    );
+    let touched: i64 = cache
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT touched_at FROM public_event_previews WHERE cache_key = ?1",
+            [first_ref.key().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        touched, 1000,
+        "the first touch committed outside the batch transaction"
+    );
+}
+
+#[tokio::test]
+async fn slow_target_phase_reserves_time_for_author_evidence() {
+    use futures::{SinkExt, StreamExt};
+    use pinned_tokio_tungstenite::tungstenite::Message;
+    let keys = Keys::generate();
+    let profile = signed(&keys, 0, crate::unix_now_seconds(), r#"{"name":"Alice"}"#);
+    let expected = profile.as_json();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let reply = expected.clone();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut websocket = pinned_tokio_tungstenite::accept_async(socket)
+            .await
+            .unwrap();
+        while let Some(Ok(message)) = websocket.next().await {
+            let Ok(text) = message.to_text() else {
+                continue;
+            };
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            // Deliberately stall the target request. The evidence request on
+            // this same connection must still have time for a slow author read.
+            let evidence = request.as_array().is_some_and(|request| {
+                request.iter().skip(2).any(|filter| {
+                    filter["kinds"]
+                        .as_array()
+                        .is_some_and(|kinds| kinds.contains(&serde_json::json!(0)))
+                })
+            });
+            if request[0] == "REQ" && evidence {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let id = request[1].as_str().unwrap();
+                websocket
+                    .send(Message::Text(
+                        format!("[\"EVENT\",\"{id}\",{reply}]").into(),
+                    ))
+                    .await
+                    .unwrap();
+                websocket
+                    .send(Message::Text(format!("[\"EOSE\",\"{id}\"]").into()))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), &url);
+    let candidates = app
+        .fetch_public_event_candidates(&address(&keys, 30023), &[], None)
+        .await;
+    server.abort();
+    assert!(
+        candidates.contains(&expected),
+        "target timeout consumed the evidence deadline"
+    );
+}
+
+#[test]
+fn existing_external_preview_database_never_creates_a_replacement_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let keys = Keys::generate();
+    let account = home
+        .add_external_signer_account(&keys.public_key().to_hex())
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let path = app.public_event_cache_path(&account.label);
+    std::fs::write(&path, b"existing encrypted database").unwrap();
+    let lock = crate::sqlcipher::database_open_lock(&path);
+    let result = app.external_sqlcipher_key(
+        &account.label,
+        &account.account_id_hex,
+        &lock.lock(),
+        crate::sqlcipher::SqlcipherDatabaseKind::PublicEventCache,
+    );
+    assert!(matches!(
+        result,
+        Err(crate::AppError::AccountHome(
+            marmot_account::AccountHomeError::SecretNotFound(_)
+        ))
+    ));
+    assert!(
+        home.external_database_secret(&account.label, marmot_account::ExternalSecretMode::Existing)
+            .is_err()
+    );
+}
+
+#[test]
+fn admission_reuses_verified_author_metadata_without_a_second_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let keys = Keys::generate();
+    let now = crate::unix_now_seconds();
+    let target = signed(&keys, 1, now, "target");
+    let profile = signed(&keys, 0, now, r#"{"name":"Alice"}"#);
+    METADATA_PARSE_COUNT.with(|count| count.set(0));
+    let read = app
+        .admit_public_events_for_account(
+            &account,
+            &super_reference(&target),
+            &[target.as_json(), profile.as_json()],
+        )
+        .unwrap();
+    assert!(matches!(read.result, PublicEventCacheResult::Present(_)));
+    assert_eq!(
+        METADATA_PARSE_COUNT.with(|count| count.get()),
+        1,
+        "the already verified profile was parsed again during directory admission"
+    );
+}
+
+#[test]
+fn preview_admitted_profiles_expire_from_the_account_search_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let keys = Keys::generate();
+    let now = crate::unix_now_seconds() as i64;
+    let profile = signed(&keys, 0, (now - 10) as u64, r#"{"name":"Alice"}"#);
+    app.remember_account_profile_events(&account, &keys.public_key().to_hex(), &[profile])
+        .unwrap();
+    let graph = app.directory_cache_for_account(&account).unwrap();
+    // Opening encrypted caches may take seconds; measure expiry after admission.
+    let now = crate::unix_now_seconds() as i64;
+    assert!(
+        graph
+            .search_graph_record(&keys.public_key().to_hex(), now)
+            .unwrap()
+            .unwrap()
+            .profile
+            .is_some()
+    );
+    assert!(
+        graph
+            .search_graph_record(&keys.public_key().to_hex(), now + 24 * 60 * 60 + 1)
+            .unwrap()
+            .unwrap()
+            .profile
+            .is_none()
+    );
+}
+
+#[test]
+fn cohort_eviction_uses_the_most_recent_member_touch() {
+    let (_dir, cache) = fixture();
+    let keys = Keys::generate();
+    let reference = address(&keys, 30023);
+    let old = signed(&keys, 30023, 1000, "old");
+    let latest = signed(&keys, 30023, 1300, "latest");
+    cache.admit(&reference, &[old.as_json()], 2000).unwrap();
+    cache
+        .admit(
+            &reference,
+            &[deletion(&keys, 1200, vec![e_tag(&old)]).as_json()],
+            2000,
+        )
+        .unwrap();
+    cache.admit(&reference, &[latest.as_json()], 3000).unwrap();
+    // A present read touches the selection, not the old version's tombstone.
+    assert!(cache.lookup(&reference, 6000).unwrap().is_some());
+    let protected = signed(&Keys::generate(), 1, 1000, "protected");
+    let protected_ref = id_reference(&protected);
+    cache
+        .admit(&protected_ref, &[protected.as_json()], 7000)
+        .unwrap();
+    {
+        let mut conn = cache.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        for i in 0..(MAX_ENTRIES - 2) {
+            tx.execute(
+                "INSERT INTO public_event_previews (cache_key, event_json, received_at, touched_at, bytes)
+                 VALUES (?1, 'fixture', 1, 5000, 1)",
+                [format!("fixture:{i}")],
+            ).unwrap();
+        }
+        PublicEventCache::trim(&tx, &cache.provenance, &protected_ref.key().unwrap()).unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        Some(latest.id.to_hex()),
+        present_id(&cache.lookup_state(&reference, 7001).unwrap())
+    );
+    assert_eq!(1, count(&cache, "public_event_tombstones"));
+    assert_eq!(MAX_ENTRIES - 1, count(&cache, "public_event_previews"));
+}
+
 #[test]
 fn refresh_admission_coalesces_cools_down_and_stays_bounded() {
     let (_dir, cache) = fixture();

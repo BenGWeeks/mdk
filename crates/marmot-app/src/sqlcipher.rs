@@ -231,7 +231,8 @@ impl MarmotApp {
         let db_path = database.path;
         let allow_create = !self.account_storage_path(label).try_exists()?
             && !self.legacy_account_projection_path(label).try_exists()?
-            && !self.directory_cache_path(label).try_exists()?;
+            && !self.directory_cache_path(label).try_exists()?
+            && !self.public_event_cache_path(label).try_exists()?;
         let mode = if allow_create {
             marmot_account::ExternalSecretMode::Create
         } else {

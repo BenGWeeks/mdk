@@ -5,10 +5,13 @@
 
 use nostr::prelude::Event;
 
-// The digest-only verifier is retained for the BIP-340 reference vectors, not
-// exported to hosts: public-event consumers must also verify the canonical ID.
-#[cfg(test)]
-fn verify_bip340_signature(public_key_hex: &str, message_hex: &str, signature_hex: &str) -> bool {
+// Kept crate-private for compact cached authorship proofs and the BIP-340
+// reference vectors. Full-event consumers must also verify the canonical ID.
+pub(crate) fn verify_bip340_signature(
+    public_key_hex: &str,
+    message_hex: &str,
+    signature_hex: &str,
+) -> bool {
     use secp256k1::{Secp256k1, XOnlyPublicKey, schnorr::Signature};
 
     let (mut public_key, mut message, mut signature) = ([0u8; 32], [0u8; 32], [0u8; 64]);

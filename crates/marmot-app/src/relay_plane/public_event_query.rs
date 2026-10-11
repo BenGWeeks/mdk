@@ -80,21 +80,16 @@ pub(crate) struct PublicEventQueryOutcome {
 }
 
 impl super::MarmotRelayPlane {
-    /// Query safe relays for public-event preview evidence. Unsafe, retired or
-    /// policy-rejected endpoints are dropped before any dial, and the pinned
-    /// transport re-checks each dial. An empty outcome says nothing about
-    /// whether the events exist.
-    pub(crate) async fn query_public_events(
+    /// One anonymous request-owned connection set, shared by bounded phases.
+    pub(crate) fn public_event_query_session(
         &self,
         endpoints: Vec<TransportEndpoint>,
-        filters: Vec<PublicEventQueryFilter>,
-        budget: PublicEventQueryBudget,
         request: &Arc<PublicEventTrafficMeter>,
         deadline: Instant,
-    ) -> PublicEventQueryOutcome {
+    ) -> PublicEventQuerySession {
         let policy = self.inner.relay_safety.clone();
         let endpoints = policy.retain_safe_endpoints(endpoints, "public event query");
-        query_public_events_on(policy, endpoints, filters, budget, request, deadline).await
+        PublicEventQuerySession::new(policy, endpoints, request, deadline)
     }
 }
 
@@ -143,7 +138,118 @@ fn sdk_filter(filter: &PublicEventQueryFilter) -> Option<Filter> {
     })
 }
 
-/// Execute one bounded phase over already-sanitized endpoints.
+/// The sockets remain request-owned, never join a shared pool and are closed
+/// on request completion or cancellation. Each phase still has its own meter.
+pub(crate) struct PublicEventQuerySession {
+    client: NostrSdkClient,
+    sockets: Arc<PublicEventSocketRegistry>,
+    _close_sockets: CloseSocketsOnDrop,
+    route: Arc<PublicEventTrafficMeter>,
+    request: Arc<PublicEventTrafficMeter>,
+    urls: Option<Vec<RelayUrl>>,
+    connected: Vec<RelayUrl>,
+    deadline: Instant,
+}
+
+impl PublicEventQuerySession {
+    fn new(
+        policy: RelaySafetyPolicy,
+        endpoints: Vec<TransportEndpoint>,
+        request: &Arc<PublicEventTrafficMeter>,
+        deadline: Instant,
+    ) -> Self {
+        let mut urls = endpoints
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
+            .collect::<Vec<_>>();
+        urls.sort();
+        urls.dedup();
+        urls.truncate(PUBLIC_EVENT_QUERY_MAX_RELAYS);
+        let sockets = PublicEventSocketRegistry::new();
+        let route = PublicEventTrafficMeter::routed(request);
+        let client = NostrSdkClient::builder()
+            .websocket_transport(PinnedPublicEventTransport::new(
+                policy,
+                route.clone(),
+                sockets.clone(),
+                deadline,
+            ))
+            .build();
+        Self {
+            client,
+            _close_sockets: CloseSocketsOnDrop(sockets.clone()),
+            sockets,
+            route,
+            request: request.clone(),
+            urls: Some(urls),
+            connected: Vec::new(),
+            deadline,
+        }
+    }
+
+    pub(crate) async fn query(
+        &mut self,
+        filters: Vec<PublicEventQueryFilter>,
+        budget: PublicEventQueryBudget,
+        deadline: Instant,
+    ) -> PublicEventQueryOutcome {
+        let mut outcome = PublicEventQueryOutcome::default();
+        let deadline = deadline.min(self.deadline);
+        if budget.max_items == 0
+            || budget.max_bytes == 0
+            || filters.is_empty()
+            || self.request.is_exhausted()
+            || Instant::now() >= deadline
+        {
+            return outcome;
+        }
+        let Some(filters) = filters.iter().map(sdk_filter).collect::<Option<Vec<_>>>() else {
+            return outcome;
+        };
+        let phase = PublicEventTrafficMeter::child(
+            &self.request,
+            PublicEventTrafficLimits {
+                max_items: budget.max_items,
+                max_bytes: budget.max_bytes,
+                max_messages: usize::MAX,
+            },
+        );
+        self.route.route_to(&phase);
+        if let Some(urls) = self.urls.take() {
+            self.connected = connect(&self.client, urls, deadline).await;
+        }
+        let mut connected = Vec::with_capacity(self.connected.len());
+        for url in &self.connected {
+            if let Ok(Some(relay)) = self.client.relay(url.clone()).await {
+                if relay.status().is_connected() {
+                    connected.push(url.clone());
+                }
+            }
+        }
+        let _ = timeout_at(
+            deadline,
+            acquire(
+                &self.client,
+                &connected,
+                filters,
+                budget,
+                deadline,
+                &mut outcome,
+            ),
+        )
+        .await;
+        outcome.received_items = phase.items();
+        outcome.received_bytes = phase.bytes();
+        outcome
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.sockets.close_all();
+        shutdown_before_deadline(self.deadline, self.client.shutdown()).await;
+    }
+}
+
+#[cfg(test)]
 pub(super) async fn query_public_events_on(
     policy: RelaySafetyPolicy,
     endpoints: Vec<TransportEndpoint>,
@@ -152,62 +258,9 @@ pub(super) async fn query_public_events_on(
     request: &Arc<PublicEventTrafficMeter>,
     deadline: Instant,
 ) -> PublicEventQueryOutcome {
-    let mut outcome = PublicEventQueryOutcome::default();
-    if budget.max_items == 0
-        || budget.max_bytes == 0
-        || filters.is_empty()
-        || request.is_exhausted()
-    {
-        return outcome;
-    }
-    let Some(filters) = filters.iter().map(sdk_filter).collect::<Option<Vec<_>>>() else {
-        return outcome;
-    };
-    let mut urls = endpoints
-        .iter()
-        .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
-        .collect::<Vec<_>>();
-    urls.sort();
-    urls.dedup();
-    urls.truncate(PUBLIC_EVENT_QUERY_MAX_RELAYS);
-    if urls.is_empty() {
-        return outcome;
-    }
-    let phase = PublicEventTrafficMeter::child(
-        request,
-        PublicEventTrafficLimits {
-            max_items: budget.max_items,
-            max_bytes: budget.max_bytes,
-            max_messages: usize::MAX,
-        },
-    );
-    // Every socket of this phase; dropping the guard (phase end or caller
-    // cancellation) forcibly closes them all and refuses new dials.
-    let sockets = PublicEventSocketRegistry::new();
-    let _close_sockets = CloseSocketsOnDrop(sockets.clone());
-    // A request-owned anonymous client: discovered targets never join a shared
-    // pool, and closing it stops reconnects for every relay this phase added.
-    // No signer means an optional NIP-42 challenge cannot close the fetch.
-    let client = NostrSdkClient::builder()
-        .websocket_transport(PinnedPublicEventTransport::new(
-            policy,
-            phase.clone(),
-            sockets.clone(),
-            deadline,
-        ))
-        .build();
-    let _ = timeout_at(
-        deadline,
-        acquire(&client, urls, filters, budget, deadline, &mut outcome),
-    )
-    .await;
-    // Close descriptors and refuse reconnects before bounded SDK cleanup.
-    // Both acquisition and cleanup share the request's absolute deadline.
-    sockets.close_all();
-    shutdown_before_deadline(deadline, client.shutdown()).await;
-    // Actual raw traffic, not the SDK's verified and deduplicated result.
-    outcome.received_items = phase.items();
-    outcome.received_bytes = phase.bytes();
+    let mut session = PublicEventQuerySession::new(policy, endpoints, request, deadline);
+    let outcome = session.query(filters, budget, deadline).await;
+    session.shutdown().await;
     outcome
 }
 
@@ -218,14 +271,7 @@ async fn shutdown_before_deadline(
     let _ = timeout_at(deadline, shutdown).await;
 }
 
-async fn acquire(
-    client: &NostrSdkClient,
-    urls: Vec<RelayUrl>,
-    filters: Vec<Filter>,
-    budget: PublicEventQueryBudget,
-    deadline: Instant,
-    outcome: &mut PublicEventQueryOutcome,
-) {
+async fn connect(client: &NostrSdkClient, urls: Vec<RelayUrl>, deadline: Instant) -> Vec<RelayUrl> {
     let mut connects = JoinSet::new();
     for url in urls {
         if client.add_relay(url.clone()).await.is_err() {
@@ -236,7 +282,7 @@ async fn acquire(
             let connected = matches!(
                 timeout(
                     DIRECTORY_RELAY_CONNECT_WAIT,
-                    client.connect_relay(url.clone())
+                    client.try_connect_relay(url.clone(), DIRECTORY_RELAY_CONNECT_WAIT),
                 )
                 .await,
                 Ok(Ok(()))
@@ -245,11 +291,22 @@ async fn acquire(
         });
     }
     let mut connected = Vec::new();
-    while let Some(result) = connects.join_next().await {
+    while let Ok(Some(result)) = timeout_at(deadline, connects.join_next()).await {
         if let Ok((url, true)) = result {
             connected.push(url);
         }
     }
+    connected
+}
+
+async fn acquire(
+    client: &NostrSdkClient,
+    connected: &[RelayUrl],
+    filters: Vec<Filter>,
+    budget: PublicEventQueryBudget,
+    deadline: Instant,
+    outcome: &mut PublicEventQueryOutcome,
+) {
     if connected.is_empty() {
         return;
     }
@@ -262,7 +319,7 @@ async fn acquire(
     let per_relay_items = (budget.max_items / connected.len()).max(1);
     let per_relay_bytes = (budget.max_bytes / connected.len()).max(1);
     let relay_count = connected.len();
-    let target = ReqTarget::manual(connected.into_iter().map(|url| (url, filters.clone())));
+    let target = ReqTarget::manual(connected.iter().cloned().map(|url| (url, filters.clone())));
     let Ok(handle) = client
         .acquire_events(
             target,
@@ -377,6 +434,78 @@ mod tests {
         assert!(bounded.events_json.len() <= 2);
         assert!(bounded.received_items <= 3);
         assert_eq!(request.items(), bounded.received_items);
+    }
+
+    #[tokio::test]
+    async fn refused_relays_do_not_reduce_a_connected_relays_response_budget() {
+        let (_relay, endpoint, ids) = published_notes(3).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        drop(listener);
+        let request = request_meter();
+        let outcome = query_public_events_on(
+            RelaySafetyPolicy::with_allow_loopback(true),
+            vec![endpoint, refused],
+            id_filters(&ids),
+            PublicEventQueryBudget {
+                max_items: 3,
+                max_bytes: 1024 * 1024,
+            },
+            &request,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            outcome.events_json.len(),
+            3,
+            "failed connections receive no share of the response budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_disconnected_between_phases_does_not_reduce_the_live_budget() {
+        let (_live, live, ids) = published_notes(3).await;
+        let (_other, other, _) = published_notes(1).await;
+        let request = request_meter();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut session = PublicEventQuerySession::new(
+            RelaySafetyPolicy::with_allow_loopback(true),
+            vec![live, other.clone()],
+            &request,
+            deadline,
+        );
+        let first = session
+            .query(
+                id_filters(&ids[..1]),
+                PublicEventQueryBudget {
+                    max_items: 8,
+                    max_bytes: 1024 * 1024,
+                },
+                deadline,
+            )
+            .await;
+        assert_eq!(first.events_json.len(), 1);
+        session
+            .client
+            .disconnect_relay(RelayUrl::parse(other.as_str()).unwrap())
+            .await
+            .unwrap();
+        let evidence = session
+            .query(
+                id_filters(&ids),
+                PublicEventQueryBudget {
+                    max_items: 3,
+                    max_bytes: 1024 * 1024,
+                },
+                deadline,
+            )
+            .await;
+        session.shutdown().await;
+        assert_eq!(
+            evidence.events_json.len(),
+            3,
+            "a no-longer-connected relay receives no share of the evidence budget"
+        );
     }
 
     #[tokio::test]

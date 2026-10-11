@@ -9,6 +9,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_create_identity_with_initial_profile` creates a generated identity
+  whose first public kind-0 is the borrowed onboarding profile. New symbol;
+  use the matching header and library.
+
+- File-backed media upload inputs, token-aware upload calls and operation
+  cancellation/progress handles. New symbols and borrowed input records require
+  matching headers/libraries; existing byte-array APIs retain their bounds.
+
 - `marmot_cached_public_event_previews` (synchronous, local), `marmot_cache_public_event_preview` (local admission)
   and `marmot_resolve_public_event_preview` (bounded relay refresh) return `MarmotPublicEventCacheRead` rows: a
   canonical `MarmotPublicEventCacheKey`, a `MarmotPublicEventCacheState` (`Present`, `AuthoritativeDeleted`,

@@ -11,6 +11,12 @@
 
 ### Added
 
+- `MarmotAppRuntime::create_identity_local_ready_with_initial_profile` makes a
+  caller-selected profile the first public kind-0 of a generated account, so
+  contacts never see the key-derived default name. A setup resumed past
+  its first local step ignores the profile and returns what its bootstrap
+  publishes.
+
 - Account-scoped public-event previews provide cached ordered reads, signed-candidate
   admission and bounded relay refresh through `cached_public_event_previews`,
   `cache_public_event_preview` and `resolve_public_event_preview`.
@@ -28,6 +34,21 @@
   conversation-preview cap. Missing, hidden, deleted, invalidated and
   retention-pruned targets return no participants; blocked reactors are excluded.
   The read performs no network work or conversation-history scan.
+- `MarmotAppRuntime::upload_media_files` and
+  `upload_media_files_with_client_token` upload file-backed attachments
+  (`MediaFileUploadRequest`, `MediaFileTransferControl`) without whole-file
+  byte arrays: sources are snapshotted and encrypted into owner-only files
+  under the account's `media-staging/` before the first PUT, with the existing
+  wire format, ordered server fallback on identical ciphertext and the
+  existing publication and local-send admission. Optional retention streams
+  into SQLCipher through `stage_attachment_upload_files` and stays bounded by
+  the file-backed 900 MiB ceiling while preserving the account quota.
+  Explicit large acquisitions use private file sinks, bounded authenticated
+  decryption and ciphertext Range checkpoints. Legacy arrays retain their
+  smaller limits. Cancellation observed before admission starts publishes
+  nothing; admission itself is not interruptible. File uploads wait for their
+  size-bounded endpoint attempts without the legacy 16-minute response timeout.
+  File uploads require the server descriptor's `sha256` and `size`. (#2175)
 
 ### Changed
 
@@ -38,6 +59,25 @@
 
 ### Fixed
 
+- Profile, follow-list and relay-list saves still return on the first relay
+  acknowledgement, but relays the quorum cancelled now receive the identical
+  signed record in a bounded background send. Previously those relays kept
+  serving the older version, such as a generated signup name (#2216).
+
+- Explicit onboarding relay edits now preview and publish the selected endpoint
+  changes without rebuilding untouched tags: mixed NIP-65 roles, duplicate
+  occurrences, tag extensions, unrelated tags and event content survive, including
+  when a host supplies an equivalent URL spelling. No-op selections cannot publish. Approval revalidates the exact preview and current
+  endpoint policy; restart retries the same persisted signed event. Manual edit
+  checkpoints use version 7, which older readers reject; no database migration
+  or binding signature change is required. Follow-up to #1979.
+
+
+- File acquisition enforces disk reserve with or without resumable validators,
+  saves interrupted ciphertext tails, retries a rejected resumed representation
+  from zero without consuming redirect hops, and discards responses exceeding
+  their advertised total. Completed files keep progress in ciphertext units.
+  Cancelled file upload completion releases staging even when `send` is false.
 - Lossless relay repairs accept case-insensitive NIP-65 read/write markers,
   matching relay-list inspection while preserving their original spelling
   and extension fields through approval and publication.

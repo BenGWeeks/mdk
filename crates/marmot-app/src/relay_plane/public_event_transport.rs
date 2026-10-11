@@ -27,12 +27,12 @@
 //! spellings included) and undecodable text counts as an event. Outbound
 //! traffic is locally generated (bounded filters) and not charged.
 //!
-//! Every socket of a request phase belongs to a request-owned
+//! Every socket of a preview request belongs to a request-owned
 //! [`PublicEventSocketRegistry`]. The same absolute deadline is enforced by the
 //! socket adapter for reads and writes (readiness, flush and shutdown
 //! included), by the outbound sink and by the inbound stream; whichever sees it
 //! first forcibly drops the TCP stream, closing the descriptor even while SDK
-//! cleanup still runs its own longer close timeout. When the phase ends, or its
+//! cleanup still runs its own longer close timeout. When the request ends, or its
 //! future is dropped, the registry closes every remaining socket and refuses new
 //! ones. There is no background task: cleanup is bounded by the request's own
 //! lifetime.
@@ -67,9 +67,9 @@ use super::{DIRECTORY_RELAY_CONNECT_WAIT, RelaySafetyPolicy};
 pub(crate) const PUBLIC_EVENT_MAX_FRAME_BYTES: usize = 320 * 1024;
 /// Resolved addresses tried per relay; the rest are ignored.
 const MAX_PINNED_ADDRESSES: usize = 8;
-/// Sockets one request phase may open, reconnect attempts included: two per
+/// Sockets one preview request may open, reconnect attempts included: two per
 /// relay for the four-relay maximum.
-const MAX_SOCKETS_PER_PHASE: usize = 8;
+const MAX_SOCKETS_PER_REQUEST: usize = 8;
 
 type TransportSink = Pin<Box<dyn Sink<Message, Error = SdkError> + Send>>;
 type TransportStream = Pin<Box<dyn Stream<Item = Result<Message, SdkError>> + Send>>;
@@ -138,6 +138,7 @@ fn saturating_add(counter: &AtomicUsize, amount: usize) -> usize {
 #[derive(Debug)]
 pub(crate) struct PublicEventTrafficMeter {
     parent: Option<Arc<PublicEventTrafficMeter>>,
+    route: Option<Arc<StdMutex<Arc<PublicEventTrafficMeter>>>>,
     limits: PublicEventTrafficLimits,
     items: AtomicUsize,
     bytes: AtomicUsize,
@@ -149,6 +150,7 @@ impl PublicEventTrafficMeter {
     pub(crate) fn new(limits: PublicEventTrafficLimits) -> Arc<Self> {
         Arc::new(Self {
             parent: None,
+            route: None,
             limits,
             items: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
@@ -160,6 +162,7 @@ impl PublicEventTrafficMeter {
     pub(crate) fn child(parent: &Arc<Self>, limits: PublicEventTrafficLimits) -> Arc<Self> {
         Arc::new(Self {
             parent: Some(parent.clone()),
+            route: None,
             limits,
             items: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
@@ -168,20 +171,54 @@ impl PublicEventTrafficMeter {
         })
     }
 
+    /// A request-owned transport route. Each phase supplies a fresh child
+    /// meter, while existing sockets keep charging the same request parent.
+    pub(crate) fn routed(initial: &Arc<Self>) -> Arc<Self> {
+        let mut routed = Self::new(initial.limits);
+        Arc::get_mut(&mut routed)
+            .expect("new meter is exclusively owned")
+            .route = Some(Arc::new(StdMutex::new(initial.clone())));
+        routed
+    }
+
+    pub(crate) fn route_to(&self, phase: &Arc<Self>) {
+        if let Some(route) = &self.route {
+            *route.lock().unwrap_or_else(|p| p.into_inner()) = phase.clone();
+        }
+    }
+
+    fn routed_phase(&self) -> Option<Arc<Self>> {
+        self.route
+            .as_ref()
+            .map(|route| route.lock().unwrap_or_else(|p| p.into_inner()).clone())
+    }
+
     pub(crate) fn items(&self) -> usize {
+        if let Some(phase) = self.routed_phase() {
+            return phase.items();
+        }
         self.items.load(Ordering::SeqCst)
     }
 
     pub(crate) fn bytes(&self) -> usize {
+        if let Some(phase) = self.routed_phase() {
+            return phase.bytes();
+        }
         self.bytes.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
     pub(crate) fn messages(&self) -> usize {
+        if let Some(phase) = self.routed_phase() {
+            return phase.messages();
+        }
         self.messages.load(Ordering::SeqCst)
     }
 
     pub(crate) fn is_exhausted(&self) -> bool {
+        if let Some(phase) = self.routed_phase() {
+            return phase.is_exhausted();
+        }
         self.exhausted.load(Ordering::SeqCst)
             || self
                 .parent
@@ -208,6 +245,9 @@ impl PublicEventTrafficMeter {
     }
 
     fn charge_counts(&self, bytes: usize, items: usize, messages: usize) -> bool {
+        if let Some(phase) = self.routed_phase() {
+            return phase.charge_counts(bytes, items, messages);
+        }
         let parent_ok = self
             .parent
             .as_ref()
@@ -294,7 +334,7 @@ impl PublicEventSocketRegistry {
     /// Adopt a connected socket, or drop it when the registry is closed or full.
     fn register(&self, stream: TcpStream) -> Option<Arc<SocketSlot>> {
         let mut state = self.lock();
-        if state.closed || state.sockets.len() >= MAX_SOCKETS_PER_PHASE {
+        if state.closed || state.sockets.len() >= MAX_SOCKETS_PER_REQUEST {
             return None;
         }
         let slot = Arc::new(SocketSlot {
@@ -714,13 +754,17 @@ async fn connect_pinned(
     addrs: &[SocketAddr],
     deadline: Instant,
 ) -> Result<TcpStream, PublicEventDialRefused> {
-    for addr in addrs {
-        if let Ok(Ok(stream)) = timeout_at(deadline, TcpStream::connect(*addr)).await {
+    // All addresses have passed admission and the list is bounded. Race them
+    // so a blackholed first address cannot consume the entire connect window.
+    // Dropping losing futures closes their sockets; no tasks are detached.
+    let mut attempts = futures::stream::FuturesUnordered::new();
+    for addr in addrs.iter().copied() {
+        attempts.push(TcpStream::connect(addr));
+    }
+    while let Ok(Some(result)) = timeout_at(deadline, attempts.next()).await {
+        if let Ok(stream) = result {
             let _ = stream.set_nodelay(true);
             return Ok(stream);
-        }
-        if Instant::now() >= deadline {
-            break;
         }
     }
     Err(PublicEventDialRefused)
@@ -981,12 +1025,14 @@ mod tests {
         let request = PublicEventTrafficMeter::new(limits(3, 1000, 2));
         let first = PublicEventTrafficMeter::child(&request, limits(8, 1000, usize::MAX));
         let second = PublicEventTrafficMeter::child(&request, limits(8, 1000, usize::MAX));
-        assert!(first.charge(10, true));
-        assert!(first.charge(10, true));
-        assert!(second.charge(10, false));
-        assert!(second.charge(10, true));
+        let routed = PublicEventTrafficMeter::routed(&first);
+        assert!(routed.charge(10, true));
+        assert!(routed.charge(10, true));
+        routed.route_to(&second);
+        assert!(routed.charge(10, false));
+        assert!(routed.charge(10, true));
         assert!(
-            !second.charge(10, true),
+            !routed.charge(10, true),
             "the fourth event exceeds the request"
         );
         assert!(first.is_exhausted() && second.is_exhausted());
@@ -994,6 +1040,34 @@ mod tests {
         assert_eq!(request.bytes(), 50);
         assert_eq!(second.items(), 2);
         assert_eq!(request.messages(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_stalled_first_address_does_not_hide_a_reachable_pinned_address() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let stalled = socket.listen(1).unwrap();
+        let stalled_addr = stalled.local_addr().unwrap();
+        let mut occupied = Vec::new();
+        for _ in 0..2 {
+            occupied.push(
+                tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(stalled_addr))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        let result = connect_pinned(
+            &[stalled_addr, live_addr],
+            Instant::now() + Duration::from_millis(250),
+        )
+        .await;
+        let connected = result.expect("the second validated address is reachable");
+        assert_eq!(connected.peer_addr().unwrap(), live_addr);
+        drop(occupied);
     }
 
     #[tokio::test]

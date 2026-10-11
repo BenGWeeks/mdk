@@ -25,7 +25,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
-- Media: [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
+- Media: [file-backed media upload](#file-backed-media-upload),
+  [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
 - Audit logs: [audit v5 recording and delivery](#audit-v5-recording-and-delivery),
   [legacy audit v4 upload](#legacy-audit-v4-upload)
 - Building and packaging: [building local bindings](#building-local-bindings), [build phases](#build-phases),
@@ -348,8 +349,9 @@ Imported identities can use the durable preflight API instead of `login`:
    offers explicit editing instead of recommending an append that cannot add a write route.
    Relay findings are advisory once a usable outbox/inbox route is
    confirmed. Proposals require a policy-allowed write route (or inbox route);
-   reachability is checked after publication. Explicit relay selections replace
-   the list and require every selected endpoint to pass dial policy. Approval
+   reachability is checked after publication. Explicit relay selections edit known
+   endpoint roles, preserving retained tag occurrences and unrelated fields in a
+   typed preview, and require every selected endpoint to pass dial policy. Approval
    requires every configured discovery source to complete; failures from additional
    user-declared sources are tolerated only when the previous record is found.
    This bounded check cannot rule out newer records on unreachable or unqueried sources.
@@ -406,7 +408,13 @@ resuming an approved, unsigned proposal as a destructive replacement. Preparing
 an exact lossless relay repair upgrades the checkpoint to version 6, preserving
 that version through approval, signing and completion. Version 3/4/5 readers
 reject it rather than discard the typed preview and publish replacement tags.
-Downgrading once either format is used is unsupported; use a build that supports
+Explicit relay edits return the same typed before/after preview. Retained
+endpoint roles keep their original tag occurrences, order and extension fields,
+even when selected with equivalent URL spelling; unrelated tags and content remain unchanged. An unchanged selection returns
+`ManualReview` without an approval action. These manual previews use checkpoint
+version 7 because version 6 readers can only revalidate automatic minimal repairs.
+No binding signature changes are required. Downgrading once any of these formats
+is used is unsupported; use a build that supports
 the checkpoint version. Do not relabel versions or delete checkpoints to
 force a downgrade. Restore/upgrade to a supporting build, or explicitly recover
 unsupported evidence with this API.
@@ -898,6 +906,35 @@ epoch, a later startup's incremental comparison, or a new explicit repair. Expli
 full-history repair remains available and can still complete parked history that its
 comparison of the retained window certifies. Notices carry no relay, message or key identities; keep them out of
 analytics. C callers: see the [C guide](../marmot-c/README.md#history-may-be-incomplete-notices).
+
+## File-backed media upload
+
+Use `uploadMediaFiles` for private regular-file inputs instead of sending a
+whole-file byte array across the binding. `uploadMediaFilesWithClientToken`
+preserves durable local-send admission; probe `localSendStatus` after an unknown
+outcome before another upload. Keep the host source valid until return, use one
+`MediaFileTransferControlFfi` per operation, and explicitly cancel it rather than
+only dropping the host's wait. All sources are privately snapshotted before PUT.
+The counter is monotonic processed bytes, not a percentage.
+
+Cancellation observed before message admission starts prevents publication.
+Admission is not interruptible once started, including while durable acceptance
+is pending. File-backed uploads have no fixed worker-response timeout;
+per-endpoint network deadlines still apply.
+
+`maxFileMediaCiphertextBytes` includes a 16-byte AEAD tag for each attachment in
+the batch. This is a finite implementation bound, not a claimed server maximum.
+Uploads try policy endpoints in order; ordinary rejection or invalid descriptors
+fall through, while signer denial and cancellation stop the operation. An
+explicit endpoint override intentionally selects only that endpoint. Receiver
+acquisition streams large bodies into private files, resumes protected ciphertext
+where valid, and authenticates before publishing bounded readable local assets.
+Automatic transfer policy and account retention quotas remain separate. Preview
+limits and the legacy byte-array API bounds are not increased.
+
+See [the upload reference](API-REFERENCE.md#marmotupload_media_files) and
+[local-send ownership](LOCAL-SENDS.md). C hosts use the
+[file-backed C inputs and control](../marmot-c/README.md#file-backed-media-upload).
 
 ## Bounded attachment history
 

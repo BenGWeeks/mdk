@@ -36,10 +36,10 @@
 //! signed payloads; a batch read verifies it once. Rolling back the whole
 //! encrypted file to an earlier consistent state is outside this check.
 //!
-//! Only a first `d` value of at most 1,024 bytes forms a coordinate. A valid
-//! event with a longer identifier remains cacheable by exact ID as its own
-//! cohort, like an immutable event, so it never creates a large address cohort;
-//! only `e` deletions can name it.
+//! Only a first `d` value of at most 1,024 bytes forms a coordinate. Addressable
+//! events with a longer identifier are rejected even for exact-ID references:
+//! retaining them without coordinate deletion semantics would omit authoritative
+//! `a` deletions. Non-addressable immutable events remain cacheable by exact ID.
 //!
 //! Byte accounting counts every variable retained field (keys, signed JSON,
 //! proof, rank ID, MAC and their index copies) plus a fixed per-row overhead.
@@ -541,11 +541,11 @@ fn normalized_hex64(value: &str) -> Option<String> {
 }
 
 fn is_addressable(kind: u32) -> bool {
-    (30_000..40_000).contains(&kind)
+    u16::try_from(kind).is_ok_and(|kind| nostr::event::Kind::from(kind).is_addressable())
 }
 
 fn is_replaceable(kind: u32) -> bool {
-    kind == 0 || kind == 3 || (10_000..20_000).contains(&kind)
+    u16::try_from(kind).is_ok_and(|kind| nostr::event::Kind::from(kind).is_replaceable())
 }
 
 fn event_kind(event: &Event) -> u32 {
@@ -567,9 +567,9 @@ fn coordinate_storage_key(kind: u32, author_hex: &str, identifier: &str) -> Stri
     format!("address:{kind}:{author_hex}:{identifier}")
 }
 
-/// The coordinate a verified replaceable or addressable event belongs to. An
-/// identifier above [`MAX_COORDINATE_IDENTIFIER_BYTES`] forms no coordinate:
-/// such an event stays an exact-ID entry and never a large address cohort.
+/// The coordinate a verified replaceable or addressable event belongs to.
+/// Oversized identifiers are unsupported targets, including for exact-ID
+/// references. Keep the same bound here for defensive coordinate derivation.
 fn event_coordinate_key(event: &Event) -> Option<String> {
     let kind = event_kind(event);
     let identifier = if is_addressable(kind) {
@@ -657,24 +657,12 @@ fn deletion_targets_coordinate(deletion: &Event, coordinate_key: &str) -> bool {
 
 /// BIP-340 verification of a compact `(id, pubkey, signature)` authorship proof.
 fn verify_id_signature(id_hex: &str, pubkey_hex: &str, signature_hex: &str) -> bool {
-    use secp256k1::{Secp256k1, XOnlyPublicKey, schnorr::Signature};
+    crate::nostr_verification::verify_bip340_signature(pubkey_hex, id_hex, signature_hex)
+}
 
-    let (mut id, mut public_key, mut signature) = ([0u8; 32], [0u8; 32], [0u8; 64]);
-    if hex::decode_to_slice(id_hex, &mut id).is_err()
-        || hex::decode_to_slice(pubkey_hex, &mut public_key).is_err()
-        || hex::decode_to_slice(signature_hex, &mut signature).is_err()
-    {
-        return false;
-    }
-    let (Ok(public_key), Ok(signature)) = (
-        XOnlyPublicKey::from_slice(&public_key),
-        Signature::from_slice(&signature),
-    ) else {
-        return false;
-    };
-    Secp256k1::verification_only()
-        .verify_schnorr(&signature, &id, &public_key)
-        .is_ok()
+#[cfg(test)]
+std::thread_local! {
+    static METADATA_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn parse_verified(json: &str) -> Option<Event> {
@@ -682,6 +670,10 @@ fn parse_verified(json: &str) -> Option<Event> {
         return None;
     }
     let event = Event::from_json(json).ok()?;
+    #[cfg(test)]
+    if event.kind.as_u16() == KIND_METADATA {
+        METADATA_PARSE_COUNT.with(|count| count.set(count.get() + 1));
+    }
     event.verify().is_ok().then_some(event)
 }
 
@@ -1052,13 +1044,17 @@ impl PublicEventCache {
             .iter()
             .map(PublicEventReference::key)
             .collect::<Result<Vec<_>, _>>()?;
-        let conn = self.conn.lock()?;
-        Self::verify_inventory(&conn, &self.provenance)?;
-        keys.iter()
+        let mut conn = self.conn.lock()?;
+        // Authenticate one snapshot and commit every recency touch together.
+        // A failed touch rolls back the entire ordered batch.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::verify_inventory(&tx, &self.provenance)?;
+        let states = keys
+            .iter()
             .zip(references)
             .map(|(key, reference)| {
                 Self::read_state(
-                    &conn,
+                    &tx,
                     &self.provenance,
                     key,
                     reference,
@@ -1066,7 +1062,9 @@ impl PublicEventCache {
                     self.future_skew.as_secs(),
                 )
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit()?;
+        Ok(states)
     }
 
     /// The locally selected signed event, if any; used only to locate refresh evidence.
@@ -1105,12 +1103,23 @@ impl PublicEventCache {
     /// Admit one bounded batch of signed target, NIP-09 deletion and other
     /// evidence. Everything is validated before the single write transaction;
     /// invalid, mismatched, older or fenced candidates never displace state.
+    #[cfg(test)]
     pub(crate) fn admit_state(
         &self,
         reference: &PublicEventReference,
         candidates: &[String],
         now: u64,
     ) -> Result<PublicEventCacheResult, AppError> {
+        self.admit_state_with_metadata(reference, candidates, now)
+            .map(|(state, _)| state)
+    }
+
+    fn admit_state_with_metadata(
+        &self,
+        reference: &PublicEventReference,
+        candidates: &[String],
+        now: u64,
+    ) -> Result<(PublicEventCacheResult, Vec<Event>), AppError> {
         let key = reference.key()?;
         Self::validate_candidates(candidates)?;
         let skew = self.future_skew.as_secs();
@@ -1236,7 +1245,13 @@ impl PublicEventCache {
         Self::write_inventory(&tx, provenance)?;
         let result = Self::read_state(&tx, provenance, &key, reference, now, skew)?;
         tx.commit()?;
-        Ok(result)
+        // Transfer already verified metadata to account-directory admission;
+        // do not parse and signature-check the same batch a second time.
+        let metadata = verified
+            .into_iter()
+            .filter(|event| event.kind.as_u16() == KIND_METADATA)
+            .collect();
+        Ok((result, metadata))
     }
 
     pub(crate) fn close(&self) -> Result<(), AppError> {
@@ -2138,7 +2153,8 @@ impl PublicEventCache {
                          FROM public_event_previews
                          UNION ALL
                          SELECT cohort_key AS cohort, touched_at FROM public_event_tombstones
-                     ) WHERE cohort != ?1 ORDER BY touched_at, cohort LIMIT 1",
+                     ) WHERE cohort != ?1
+                     GROUP BY cohort ORDER BY MAX(touched_at), cohort LIMIT 1",
                     [&protected_cohort],
                     |row| row.get(0),
                 )
@@ -2291,16 +2307,12 @@ impl MarmotApp {
         candidates: &[String],
     ) -> Result<PublicEventCacheRead, AppError> {
         let key = reference.cache_key()?;
-        let result = cache.admit_state(reference, candidates, unix_now())?;
+        let (result, metadata) =
+            cache.admit_state_with_metadata(reference, candidates, unix_now())?;
         if let PublicEventCacheResult::Present(preview) = &result
             && let Ok(selected) = Event::from_json(&preview.event_json)
         {
             let author = selected.pubkey.to_hex();
-            let metadata: Vec<Event> = candidates
-                .iter()
-                .filter_map(|json| parse_verified(json))
-                .filter(|event| event.kind.as_u16() == KIND_METADATA)
-                .collect();
             // Only the selected author's kind-0 enters the account's existing
             // directory store; a metadata failure never hides verified content.
             if !metadata.is_empty()
@@ -2378,8 +2390,9 @@ impl MarmotApp {
 
     /// Bounded network evidence for one reference: the exact ID or complete
     /// coordinate, then kind-5 `#e`/`#a` requests and kind-0 metadata from the
-    /// actual target author only. Never recursive, ten seconds and sixteen
-    /// received events / 4 MiB overall. Returns candidates for admission; it
+    /// actual target author only. Never recursive, ten seconds (at least half
+    /// reserved for evidence) and sixteen received events / 4 MiB overall.
+    /// Returns candidates for admission; it
     /// writes nothing.
     pub(crate) async fn fetch_public_event_candidates(
         &self,
@@ -2428,15 +2441,16 @@ impl MarmotApp {
         // One raw-traffic meter for the whole request, shared by every relay
         // and both phases.
         let traffic = PublicEventTrafficMeter::new(REQUEST_TRAFFIC);
+        let mut session = self
+            .relay_plane
+            .public_event_query_session(relays, &traffic, deadline);
         if !immutable_known {
-            let outcome = self
-                .relay_plane
-                .query_public_events(
-                    relays.clone(),
+            let outcome = session
+                .query(
                     vec![target_filter],
                     TARGET_PHASE_BUDGET,
-                    &traffic,
-                    deadline,
+                    // Preserve half of the aggregate deadline for deletion evidence.
+                    deadline - RESOLVE_DEADLINE / 2,
                 )
                 .await;
             for json in outcome.events_json {
@@ -2471,6 +2485,7 @@ impl MarmotApp {
         // Deletion authority needs the target's actual author; without a
         // verified target there is nothing to authenticate.
         let Some(author) = author else {
+            session.shutdown().await;
             return candidates;
         };
         let mut filters: Vec<PublicEventQueryFilter> = target_ids
@@ -2493,10 +2508,10 @@ impl MarmotApp {
         filters.push(PublicEventQueryFilter::AuthorMetadata {
             author_hex: author.clone(),
         });
-        let outcome = self
-            .relay_plane
-            .query_public_events(relays, filters, EVIDENCE_PHASE_BUDGET, &traffic, deadline)
+        let outcome = session
+            .query(filters, EVIDENCE_PHASE_BUDGET, deadline)
             .await;
+        session.shutdown().await;
         for json in outcome.events_json {
             let Some(event) = parse_verified(&json) else {
                 continue;

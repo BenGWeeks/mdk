@@ -28,6 +28,11 @@
 
 ### Added
 
+- `create_identity_with_initial_profile` creates a generated identity whose
+  first public kind-0 is the onboarding-selected profile. Prefer it over
+  `create_identity_with_profile` followed by `publish_user_profile`, which
+  exposes the generated default to contacts first.
+
 - `Marmot::propose_onboarding_relay_repair` previews a lossless relay-list repair
   without signing or publishing. `OnboardingRepairProposalFfi.relay_repair` carries
   the typed before/after tags, exact diff, restored capabilities and ManualReview
@@ -44,6 +49,13 @@
   retention-pruned targets return no participants; blocked reactors are excluded.
   The read performs no network work or conversation-history scan.
   Regenerate matching Swift/Kotlin bindings to call `messageReactions`.
+- `Marmot::upload_media_files` and `upload_media_files_with_client_token`
+  take `MediaFileUploadRequestFfi` (`source_path`, optional `expected_size`)
+  and a `MediaFileTransferControlFfi` for cancellation and monotonic
+  progress, so large attachments no longer cross the FFI as byte arrays.
+  `max_file_media_ciphertext_bytes()` reports the batch bound. Existing
+  `upload_media` APIs are unchanged. File-backed download is not yet
+  exposed. (#2175)
 
 ### Changed
 
@@ -52,6 +64,8 @@
 
 ### Fixed
 
+- File-transfer cancellation documentation identifies admission start as the
+  last interruptible boundary, not the later durable acceptance.
 - Android build preflight drains `rustup` output before accepting an installed
   target, avoiding false missing-target errors from a broken pipe.
 

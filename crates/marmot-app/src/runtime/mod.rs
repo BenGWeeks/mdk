@@ -3644,6 +3644,18 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn upload_media_files(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        request: crate::MediaFileUploadRequest,
+        control: std::sync::Arc<crate::MediaFileTransferControl>,
+    ) -> Result<MediaUploadResult, AppError> {
+        self.accounts
+            .upload_media_files(account_ref, group_id, request, control)
+            .await
+    }
+
     /// Send already-uploaded attachments as one kind-9 chat that also carries
     /// application tags, such as NIP-30 `emoji` tags naming those attachments.
     pub async fn send_tagged_media(
@@ -4457,18 +4469,15 @@ impl MarmotAppRuntime {
         {
             profile = merge_user_profile_update(current, profile);
         }
-        // Stamp the just-published profile with the current time before caching
-        // it. The published kind-0 event is authored with `now`, so the cached
-        // own-account entry must carry a matching `created_at`. Callers that
-        // arrive via FFI hardcode `created_at == 0` (see
-        // `UserProfileMetadataFfi -> UserProfileMetadata`), and a zero stamp
-        // loses to *any* fetched kind-0 in `remember_directory_profile_if_newer`
-        // (it only retains the cache when `cached.created_at > fetched`). That
-        // let a stale pre-edit copy served by a lagging relay revert the local
-        // edit on the next directory refresh. Stamping `now` protects the edit
-        // against relay copies published before this moment.
+        // Cache the published event's own `created_at`. FFI callers pass
+        // `created_at == 0` (see `UserProfileMetadataFfi -> UserProfileMetadata`),
+        // which loses to any fetched kind-0 in `remember_directory_profile_if_newer`,
+        // and rapid saves author timestamps that run ahead of the clock. Either
+        // way, a stale or intermediate relay copy could otherwise revert the
+        // local edit on the next directory refresh.
         stamp_published_profile_created_at(&mut profile, unix_now_seconds());
-        self.accounts
+        profile.created_at = self
+            .accounts
             .app
             .publish_user_profile_to_endpoints_and_indexers(
                 &account.label,
@@ -5321,7 +5330,25 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
-        self.create_generated_account_local_ready(request, true)
+        self.create_generated_account_local_ready(request, true, None)
+            .await
+    }
+
+    /// Create a generated identity whose first public kind-0 is `profile`.
+    ///
+    /// The profile replaces the key-derived default before any bootstrap
+    /// record can reach a relay, so recipients never see a temporary name.
+    /// A setup resumed past its first local step ignores `profile`, because a
+    /// background bootstrap may already hold the profile it publishes, and
+    /// returns that profile; later changes are ordinary profile edits.
+    pub async fn create_identity_local_ready_with_initial_profile(
+        &self,
+        mut request: AccountSetupRequest,
+        profile: UserProfileMetadata,
+    ) -> Result<AccountSetupResult, AppError> {
+        validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
+        request.identity = None;
+        self.create_generated_account_local_ready(request, true, Some(profile))
             .await
     }
 
@@ -5441,7 +5468,7 @@ impl MarmotAppRuntime {
             }
         };
         if let Err(error) = self
-            .create_generated_account_local_ready(context.request(), true)
+            .create_generated_account_local_ready(context.request(), true, None)
             .await
         {
             self.report_generated_setup_resume_deferred(&account, error.privacy_safe_kind());
@@ -5473,6 +5500,7 @@ impl MarmotAppRuntime {
         &self,
         request: AccountSetupRequest,
         schedule_background: bool,
+        initial_profile: Option<UserProfileMetadata>,
     ) -> Result<AccountSetupResult, AppError> {
         let observation = self.shared.product_analytics.begin(
             crate::ProductFamily::Account,
@@ -5480,7 +5508,11 @@ impl MarmotAppRuntime {
             crate::ProductUnit::Attempt,
         );
         let result = self
-            .create_generated_account_local_ready_unobserved(request, schedule_background)
+            .create_generated_account_local_ready_unobserved(
+                request,
+                schedule_background,
+                initial_profile,
+            )
             .await;
         if let Some(observation) = observation {
             observation.finish(if result.is_ok() { "success" } else { "failure" });
@@ -5492,6 +5524,7 @@ impl MarmotAppRuntime {
         &self,
         request: AccountSetupRequest,
         schedule_background: bool,
+        initial_profile: Option<UserProfileMetadata>,
     ) -> Result<AccountSetupResult, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let _generated_setup_transaction =
@@ -5570,26 +5603,24 @@ impl MarmotAppRuntime {
 
         let profile_started = Instant::now();
         let profile_result = (|| {
-            if let Some(profile) = self
+            let cached = self
                 .accounts
                 .app
                 .directory_entry_for_account_id(&account.account_id_hex)?
-                .and_then(|entry| entry.profile)
-            {
-                Ok(profile)
-            } else {
-                let pseudonym = default_profile_pseudonym(&account.account_id_hex);
-                let profile = UserProfileMetadata {
-                    name: Some(pseudonym.clone()),
-                    display_name: Some(pseudonym),
-                    created_at: unix_now_seconds(),
-                    ..UserProfileMetadata::default()
-                };
+                .and_then(|entry| entry.profile);
+            let (profile, store) = generated_setup_profile(
+                &account.account_id_hex,
+                phase,
+                cached,
+                initial_profile,
+                unix_now_seconds(),
+            );
+            if store {
                 self.accounts
                     .app
                     .remember_directory_profile(&account.account_id_hex, &profile)?;
-                Ok::<_, AppError>(profile)
             }
+            Ok::<_, AppError>(profile)
         })();
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::AccountSetupProfileLocal,
@@ -5694,7 +5725,7 @@ impl MarmotAppRuntime {
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
         let local = self
-            .create_generated_account_local_ready(request, false)
+            .create_generated_account_local_ready(request, false, None)
             .await?;
         let context = self
             .accounts
@@ -8096,7 +8127,7 @@ impl AccountManager {
         if let Some(copy) = publication.indexer_copy {
             self.app.spawn_public_indexer_copy(copy);
         }
-        Ok((publication.status, Some(profile)))
+        Ok((publication.status, Some(publication.profile)))
     }
 
     fn setup_failure_can_roll_back(
@@ -8887,6 +8918,40 @@ fn collect_notification_update_from_event(
                 error_code = "notification_projection_skipped",
                 "notification projection skipped",
             );
+        }
+    }
+}
+
+/// Choose a generated account's setup profile and whether to cache it.
+///
+/// A caller-selected profile applies only in `LocalStateCreated`. After that a
+/// background bootstrap may already hold its snapshot, taken off the setup
+/// lock: the cached profile, or this same key-derived fallback when none was
+/// cached. Ignoring the selection then keeps the result equal to what is
+/// published; later changes are ordinary profile edits.
+fn generated_setup_profile(
+    account_id_hex: &str,
+    phase: AccountSetupPhase,
+    cached: Option<UserProfileMetadata>,
+    initial: Option<UserProfileMetadata>,
+    now: u64,
+) -> (UserProfileMetadata, bool) {
+    let initial = initial.filter(|_| phase == AccountSetupPhase::LocalStateCreated);
+    match (initial, cached) {
+        (Some(mut selected), _) => {
+            stamp_published_profile_created_at(&mut selected, now);
+            (selected, true)
+        }
+        (None, Some(cached)) => (cached, false),
+        (None, None) => {
+            let pseudonym = default_profile_pseudonym(account_id_hex);
+            let profile = UserProfileMetadata {
+                name: Some(pseudonym.clone()),
+                display_name: Some(pseudonym),
+                created_at: now,
+                ..UserProfileMetadata::default()
+            };
+            (profile, true)
         }
     }
 }
