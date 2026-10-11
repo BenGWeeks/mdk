@@ -1,4 +1,6 @@
-//! Durable "not enough free disk to publish" outcome for attachment acquisition.
+//! Migration 0108: durable "not enough free disk to publish" outcome for
+//! attachment acquisition. It follows master's 0107 moderation-report outbox,
+//! which touches no attachment table or trigger.
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
 
@@ -17,11 +19,15 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     // terminal cleanup trigger must not discard the prefix for it.
     //
     // `storage_park_count` drives the readmission delay of a job that keeps
-    // parking (reset by explicit retry, checkpoint progress and completion),
-    // `storage_park_floor` is the last recorded target so a body that restarts
-    // from zero doubles its target across consecutive parks, and `file_sink`
-    // remembers that the body exceeded the in-memory bound so a readmitted
-    // attempt opens the file sink without a header-only request first.
+    // parking (reset by explicit retry, checkpoint progress, completion and
+    // cancellation), `storage_park_floor` is the largest need a body that
+    // restarts from zero has proven, so a later attempt that parked earlier
+    // does not lower its target, and `file_sink` remembers that the body
+    // exceeded the in-memory bound so a readmitted attempt opens the file sink
+    // without a header-only request first.
+    //
+    // The trigger is recreated from its 0105 form with one added clause:
+    // storage-parked rows keep their checkpoint.
     tx.execute_batch(
         "ALTER TABLE attachment_acquisition ADD COLUMN storage_blocked_headroom INTEGER
              CHECK(storage_blocked_headroom IS NULL OR storage_blocked_headroom>=0);
@@ -57,7 +63,24 @@ mod tests {
     #[test]
     fn storage_block_migration_preserves_jobs_and_is_transactional() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        run(&mut conn, &MIGRATIONS[..106]).unwrap();
+        // Everything before this migration, through master's 0107 outbox.
+        run(&mut conn, &MIGRATIONS[..107]).unwrap();
+        assert_eq!(MIGRATIONS[106].version, 107);
+        assert_eq!(MIGRATIONS[107].version, 108);
+        assert_eq!(MIGRATIONS[107].name, "0108_attachment_storage_block");
+        let trigger = |conn: &rusqlite::Connection| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE name='attachment_partial_terminal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let before = trigger(&conn);
+        assert!(
+            before.contains("OR (NEW.state=4 AND NEW.cancelled=0) BEGIN"),
+            "the trigger this migration replaces is still 0105's: {before}"
+        );
         conn.execute_batch("PRAGMA foreign_keys=OFF;
             INSERT INTO attachment_acquisition(token,group_id_hex,message_id_hex,attachment_index,source_message_id_hex,source_epoch,slot_json,plaintext_digest,state,attempts,due)
             VALUES(x'01010101010101010101010101010101','g','m',0,'s',1,'[\"imeta\"]',randomblob(32),2,7,1234);
@@ -69,6 +92,11 @@ mod tests {
         assert!(
             conn.prepare("SELECT storage_blocked_headroom FROM attachment_acquisition")
                 .is_err()
+        );
+        assert_eq!(
+            trigger(&conn),
+            before,
+            "a rolled-back apply keeps the old trigger"
         );
         run(&mut conn, MIGRATIONS).unwrap();
         run(&mut conn, MIGRATIONS).unwrap();
@@ -90,6 +118,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (2, 7, 1234, None, 0, 0, 0));
+        let after = trigger(&conn);
+        assert!(
+            after.contains(
+                "OR (NEW.state=4 AND NEW.cancelled=0 AND NEW.storage_blocked_headroom IS NULL) BEGIN"
+            ),
+            "{after}"
+        );
         assert!(
             conn.execute(
                 "UPDATE attachment_acquisition SET storage_blocked_headroom=-1",
@@ -133,5 +168,25 @@ mod tests {
         conn.execute("UPDATE attachment_acquisition SET state=4,due=NULL", [])
             .unwrap();
         assert_eq!(partials(&conn), 0, "an ordinary block still cleans up");
+    }
+
+    /// Pre-release builds recorded this migration as version 107, which is now
+    /// the moderation-report outbox. Such a database is refused on open rather
+    /// than silently mixing the two schemas, so it must be recreated.
+    #[test]
+    fn a_database_that_recorded_this_migration_as_107_is_refused() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..106]).unwrap();
+        conn.execute(
+            "INSERT INTO cgka_schema_migrations(version,name,applied_at_unix_seconds)
+             VALUES(107,'0107_attachment_storage_block',0)",
+            [],
+        )
+        .unwrap();
+        let error = run(&mut conn, MIGRATIONS).unwrap_err().to_string();
+        assert!(
+            error.contains("migration 107 was applied as 0107_attachment_storage_block"),
+            "{error}"
+        );
     }
 }

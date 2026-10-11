@@ -9,17 +9,15 @@
   Downgrade is unsupported. The public `AttachmentHistoryEntry` adds the required
   `emoji_tags` field; update Rust struct literals. Selected entries read these
   canonical source tags in the page snapshot without a history backfill.
-- Migrations 0103 through 0107 advance account storage to schema 107 on first
+- Migrations 0103 through 0108 advance account storage to schema 108 on first
   open. Older binaries reject the upgraded database; downgrade is unsupported.
-  Migration 0107 adds `attachment_acquisition.storage_blocked_headroom`,
+  Migration 0108 adds `attachment_acquisition.storage_blocked_headroom`,
   `storage_park_count`, `storage_park_floor` and `file_sink`, a partial index
   for parked rows, and keeps ciphertext checkpoints for jobs parked on disk
-  space. Development databases opened under a pre-release build of this
-  change must be recreated if that build was commit 3ff6ef84 (which created
-  `storage_blocked_bytes` instead) or 1a32f09b (which lacked the last three
-  columns): both report schema 107 with a different shape. A database from
-  fa2b2da0 has the final shape but may hold a doubled park target from that
-  build's restart rule until explicit Retry clears it.
+  space. Pre-release builds of this change recorded it as migration 107,
+  which is now the moderation-report outbox, so a development database opened
+  under any of them fails to open with "migration 107 was applied as
+  0107_attachment_storage_block" and must be recreated.
 - `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
   `AttachmentAcquisition` gains the public `file_sink` field.
 

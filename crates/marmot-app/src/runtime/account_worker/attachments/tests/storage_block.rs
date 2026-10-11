@@ -507,7 +507,7 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
     let mut target = fixture.park_and_hold(&requests).await;
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     let mut parks = 1;
-    let mut delays = vec![];
+    let mut delays: Vec<std::ops::RangeInclusive<u64>> = vec![];
     loop {
         // The body needs five of itself (staging plus the publication
         // reserve); no recorded target may ask for more.
@@ -525,6 +525,9 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
         assert_eq!(requests.load(Ordering::SeqCst), before);
         // Free exactly what the last park asked for, as a slowly emptying disk would.
         fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES);
+        let scheduler_now =
+            || crate::unix_now_seconds() + test_clock::skew_for_test(fixture._dir.path());
+        let readmit_from = scheduler_now();
         schedule(
             &fixture.client,
             &fixture.shared,
@@ -532,10 +535,11 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
             &mut fixture.admission,
         )
         .unwrap();
+        let now = scheduler_now();
         assert_eq!(fixture.state(), AttachmentTransferState::Queued);
-        let now = crate::unix_now_seconds() + test_clock::skew_for_test(fixture._dir.path());
         let due = fixture.due().unwrap();
-        delays.push(due - now);
+        // The scheduler read its clock somewhere in this window.
+        delays.push((due - now)..=(due - readmit_from));
         if due > now {
             // Not a moment earlier: a tick before the due time fetches nothing.
             fixture.advance(due - now - 1);
@@ -591,7 +595,13 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
             }
         })
         .collect();
-    assert_eq!(delays, streak);
+    assert_eq!(delays.len(), streak.len());
+    for (window, expected) in delays.iter().zip(&streak) {
+        assert!(
+            window.contains(expected),
+            "readmission delay {window:?} does not allow the streak's {expected} s: {delays:?}"
+        );
+    }
     assert!(
         parks >= 3,
         "the trickle must exercise the streak: {parks} parks"

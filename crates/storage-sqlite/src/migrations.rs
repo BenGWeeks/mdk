@@ -221,8 +221,8 @@ mod migration_0105_file_attachment_partials;
 mod migration_0106_retained_attachment_chunks;
 #[path = "migrations/0107_moderation_report_outbox.rs"]
 mod migration_0107_moderation_report_outbox;
-#[path = "migrations/0107_attachment_storage_block.rs"]
-mod migration_0107_attachment_storage_block;
+#[path = "migrations/0108_attachment_storage_block.rs"]
+mod migration_0108_attachment_storage_block;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -775,9 +775,9 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0107_moderation_report_outbox::apply,
     },
     Migration {
-        version: 107,
-        name: "0107_attachment_storage_block",
-        apply: migration_0107_attachment_storage_block::apply,
+        version: 108,
+        name: "0108_attachment_storage_block",
+        apply: migration_0108_attachment_storage_block::apply,
     },
 ];
 
