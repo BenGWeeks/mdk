@@ -533,10 +533,20 @@ impl EncryptedMediaDownloadHttp {
         let kinds = self.allowed_locator_kinds.clone();
         let transport = self.transport.clone();
         let directory = resume.directory.join("media-staging");
-        let result = self.run_classified(resume.clone()).await;
+        // An explicit job that already learned its body exceeds the in-memory
+        // bound opens the file sink directly instead of repeating a header
+        // probe. Automatic work never takes the file sink.
+        let result = if resume.job.file_sink && !resume.automatic {
+            Err(crate::media::AttachmentDownloadFailure::FileRequired)
+        } else {
+            self.run_classified(resume.clone()).await
+        };
         match result {
             Ok(result) => Ok(AcquiredMediaBody::Memory(result)),
             Err(crate::media::AttachmentDownloadFailure::FileRequired) => {
+                if !resume.job.file_sink {
+                    resume.record_file_sink().await;
+                }
                 let control = Arc::new(crate::MediaFileTransferControl::default());
                 struct CancelOnDrop(Arc<crate::MediaFileTransferControl>);
                 impl Drop for CancelOnDrop {

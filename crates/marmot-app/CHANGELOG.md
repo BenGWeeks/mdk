@@ -89,25 +89,43 @@
   a member's epoch past messages it can then never read (#2086).
 - An explicit attachment download the device lacks room to publish no longer
   retries forever. The publication reserve (disk reserve plus four times the
-  plaintext) is checked as soon as a response declares the size and again
-  before the completed-body receipt; a shortage parks the job as
-  `AttachmentTransferState::StorageBlocked` with its ciphertext checkpoint
-  instead of scheduling a timer. The parked job records the free space it
-  needs beyond the reserve, including the staging and checkpoint bytes a retry
-  occupies; the worker readmits it once free space exceeds that by 4 MiB, a
-  job that parks again waits out its claim streak first, and explicit Retry
-  readmits at once. A body that had already arrived through the in-memory sink
-  is checkpointed whole, so readmission publishes without another request; the
-  file sink re-requests at most its unsaved sub-MiB tail. Automatic history
-  keeps its caps (#2239).
+  plaintext) is checked as soon as a response declares the size, as a body
+  grows, and before the completed-body receipt, counting the staging,
+  checkpoint and decrypted-file bytes the attempt itself still has to write;
+  a shortage, or a database that reports it is full while publishing, parks
+  the job as `AttachmentTransferState::StorageBlocked` with its ciphertext
+  checkpoint instead of scheduling a timer. The parked job records the free
+  space it needs beyond the reserve in the worker's own frame, so a
+  readmitted attempt sees at least what its parking check wanted; the worker
+  readmits it once free space exceeds that by 4 MiB and admission would pass,
+  a job that parks again waits out its park streak (15 s doubling to an hour,
+  reset by explicit Retry, checkpoint progress and completion), and explicit
+  Retry readmits at once. With a strong validator, the in-memory sink
+  checkpoints a body that had already arrived, so readmission publishes
+  without another request, and the file sink re-requests at most its unsaved
+  sub-MiB tail; without one both restart, and a body with neither length nor
+  validator doubles its recorded target across consecutive parks so restarts
+  stay logarithmic. A full database records at least the free space seen at
+  the refusal plus the body and withdraws the completed-body receipt, so the
+  job readmits only once the volume gains room and automatic history is not
+  ended as an unretained body. Parked checkpoints keep their quota
+  reservation and are refreshed past the 24-hour idle expiry; cancellation
+  lets them expire. Storage parks refund the automatic-history claim they
+  consumed. Explicit bodies
+  between the transfer limit and 512 MiB now take the file sink and need the
+  reserve plus five bodies free (six with a strong validator) instead of
+  about four, because their staging and checkpoint copies are counted (#2239).
 - Receiving an attachment no longer holds several copies of it in native
-  memory. The body buffer is reserved once from the declared length and
-  decrypted in place, explicit downloads above the automatic transfer limit
-  stream through the existing private file sink, and in-memory publication
-  writes the row at its final length through bounded incremental BLOB writes
-  so SQLite keeps no bind, record or trigger-rewrite copy. Integrity checks,
-  resume and retention behavior are unchanged; an explicit body above the
-  limit spends one header-only request before the file sink reopens it (#2241).
+  memory. The body buffer is reserved once from the declared length (an
+  undeclared length grows geometrically but never past the transfer limit,
+  and a failed reservation is a transient failure, not an abort), decrypted
+  in place, explicit downloads above the automatic transfer limit stream
+  through the existing private file sink, and in-memory publication writes
+  the row at its final length through bounded incremental BLOB writes so
+  SQLite keeps no bind, record or trigger-rewrite copy. Integrity checks,
+  resume and retention behavior are unchanged. A job that learned it needs the
+  file sink remembers it, so only its first attempt spends a header-only
+  request before the file sink reopens the URL (#2241).
 - Catch-up downloads missed group history in far fewer round trips. Each
   comparison pass now fetches up to 256 events (1 MiB), across all relays, in
   batched requests instead of 16 one-at-a-time requests, so a backlog of a few hundred

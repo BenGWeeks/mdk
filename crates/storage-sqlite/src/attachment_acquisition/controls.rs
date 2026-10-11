@@ -78,7 +78,7 @@ impl SqliteAccountStorage {
         self.lock()?.execute("UPDATE attachment_acquisition SET
             retry_not_before=CASE WHEN state=1 THEN ?1+15 ELSE COALESCE(due,retry_not_before) END,
             due=CASE WHEN state=1 THEN due ELSE NULL END,
-            state=CASE WHEN state=1 THEN 1 ELSE 5 END,permission_paused=1
+            state=CASE WHEN state=1 THEN 1 ELSE 5 END,permission_paused=1,storage_blocked_headroom=NULL
             WHERE state IN (0,1,2) AND explicit_request=0 AND permission_paused=0 AND body_completed=0", [u64_to_i64(now)?]).storage()?;
         Ok(())
     }
@@ -92,7 +92,7 @@ impl SqliteAccountStorage {
         }
         conn.execute(
             "UPDATE attachment_acquisition SET permission_paused=1,
-            retry_not_before=COALESCE(due,retry_not_before),state=5,due=NULL
+            retry_not_before=COALESCE(due,retry_not_before),state=5,due=NULL,storage_blocked_headroom=NULL
             WHERE token=?1 AND state IN (0,2) AND explicit_request=0",
             [&reference.token],
         )
@@ -130,7 +130,7 @@ impl SqliteAccountStorage {
                 tokens.extend(selected.collect::<Result<Vec<_>,_>>().storage()?);
             }
             for token in &tokens {
-                conn.execute("UPDATE attachment_acquisition SET state=0,due=max(?2,retry_not_before),permission_paused=0
+                conn.execute("UPDATE attachment_acquisition SET state=0,due=max(?2,retry_not_before),permission_paused=0,storage_blocked_headroom=NULL
                     WHERE token=?1", params![token,u64_to_i64(now)?]).storage()?;
             }
             Ok(tokens.len())
@@ -345,7 +345,7 @@ impl SqliteAccountStorage {
             drop(conn);
             self.pause_automatic_attachments(now)?;
             let conn = self.lock()?;
-            conn.execute("UPDATE attachment_acquisition SET state=0,due=?1,size_blocked_max=NULL
+            conn.execute("UPDATE attachment_acquisition SET state=0,due=?1,size_blocked_max=NULL,storage_blocked_headroom=NULL
                 WHERE cancelled=0 AND state=4 AND size_blocked_max IS NOT NULL AND size_blocked_max<?2",
                 params![u64_to_i64(now)?,u64_to_i64(policy.transfer_limit)?]).storage()?;
             Ok(())
@@ -360,7 +360,9 @@ impl SqliteAccountStorage {
         if !matches_store(&conn, reference)? {
             return Ok(false);
         }
-        Ok(conn.execute("UPDATE attachment_acquisition SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0
+        // Cancelling clears the storage-park marker, so the kept prefix expires
+        // and is pruned like any other cancelled checkpoint.
+        Ok(conn.execute("UPDATE attachment_acquisition SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0,storage_blocked_headroom=NULL
             WHERE token=?1 AND state<>3",[&reference.token]).storage()?==1)
     }
 
@@ -382,7 +384,7 @@ impl SqliteAccountStorage {
                 .execute(
                     &format!(
                         "UPDATE attachment_acquisition AS q SET
-                    explicit_request=1,priority_at=?2,permission_paused=0,
+                    explicit_request=1,priority_at=?2,permission_paused=0,storage_blocked_headroom=NULL,
                     state=CASE WHEN state=5 THEN 0 ELSE state END,
                     due=CASE WHEN state=5 THEN max(?2,retry_not_before) ELSE due END
                     WHERE token=?1 AND explicit_request=0 AND cancelled=0
@@ -476,7 +478,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
             if !matches_store(&conn,reference)? {return Ok(false);}
-            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,storage_blocked_headroom=NULL,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
+            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
                 WHERE token=?1 AND (state IN(0,1,2,4,5) OR (state=3 AND NOT EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token))) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?2)"),
                 params![reference.token,u64_to_i64(now)?]).storage()?==1)
         })
@@ -579,24 +581,72 @@ impl SqliteAccountStorage {
     /// cover. `headroom` is the free space beyond the policy reserve the next
     /// attempt needs: the check that failed plus this attempt's own staging and
     /// checkpoint bytes, which the worker's free-space frame does not see.
-    /// Partial ciphertext, budgets and the explicit flag are untouched, so the
-    /// next admitted attempt resumes rather than restarting the transfer. A
-    /// permission-paused attempt parks under its permission owner (state 5).
+    /// `restart_cap` is set when the next attempt restarts from zero (no
+    /// checkpoint): the recorded target then doubles across consecutive parks,
+    /// up to the cap, so full refetches grow logarithmically with the body.
+    /// Partial ciphertext keeps its reservation and gets a fresh idle expiry,
+    /// the claim that parked is refunded to the automatic-history budget, and
+    /// the park streak advances. A receipt recorded before a full database
+    /// refused publication is withdrawn, since no body was retained, so the
+    /// readmitted attempt is not ended as an unretained completed body. A
+    /// permission-paused attempt parks under its permission owner (state 5)
+    /// without a storage target.
     pub fn block_attachment_storage(
         &self,
         job: &AttachmentAcquisition,
         headroom: u64,
+        restart_cap: Option<u64>,
+        now: u64,
     ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, &job.reference)? {
+                return Ok(false);
+            }
+            let parked = conn
+                .execute(
+                    "UPDATE attachment_acquisition SET
+                    storage_park_floor=max(?3,CASE WHEN ?4 IS NULL THEN 0 ELSE min(?4,storage_park_floor*2) END),
+                    storage_blocked_headroom=CASE WHEN permission_paused=1 THEN NULL
+                        ELSE max(?3,CASE WHEN ?4 IS NULL THEN 0 ELSE min(?4,storage_park_floor*2) END) END,
+                    state=CASE WHEN permission_paused=1 THEN 5 ELSE 4 END,due=NULL,attempt=NULL,
+                    storage_park_count=min(storage_park_count+1,2147483647),
+                    acquisition_attempts=max(0,acquisition_attempts-automatic_history),body_completed=0
+                    WHERE token=?1 AND state=1 AND attempt=?2",
+                    params![
+                        job.reference.token,
+                        job.attempt,
+                        u64_to_i64(headroom)?,
+                        restart_cap.map(u64_to_i64).transpose()?
+                    ],
+                )
+                .storage()?
+                == 1;
+            if parked {
+                conn.execute(
+                    "UPDATE attachment_partial SET expires_at=?2 WHERE token=?1",
+                    params![
+                        job.reference.token,
+                        u64_to_i64(now.saturating_add(super::partial::PARTIAL_TTL_SECONDS))?
+                    ],
+                )
+                .storage()?;
+            }
+            Ok(parked)
+        })
+    }
+
+    /// Remember that this body exceeds the in-memory bound, so a readmitted
+    /// attempt opens the file sink without a header-only request first.
+    pub fn record_attachment_file_sink(&self, job: &AttachmentAcquisition) -> StorageResult<bool> {
         let conn = self.lock()?;
         if !matches_store(&conn, &job.reference)? {
             return Ok(false);
         }
         Ok(conn
             .execute(
-                "UPDATE attachment_acquisition SET state=CASE WHEN permission_paused=1 THEN 5 ELSE 4 END,
-                due=NULL,attempt=NULL,storage_blocked_headroom=?3
-                WHERE token=?1 AND state=1 AND attempt=?2",
-                params![job.reference.token, job.attempt, u64_to_i64(headroom)?],
+                "UPDATE attachment_acquisition SET file_sink=1 WHERE token=?1 AND state=1 AND attempt=?2",
+                params![job.reference.token, job.attempt],
             )
             .storage()?
             == 1)
@@ -604,49 +654,76 @@ impl SqliteAccountStorage {
 
     /// Readmit at most one bounded page of storage-parked jobs whose recorded
     /// headroom now fits below `free` less the policy reserve and a fixed
-    /// margin. The margin keeps measurement noise from flipping a row every
-    /// tick, and a job that parked more than once waits out its claim streak
-    /// (15 s doubling to an hour) before it is due again, so free space that
-    /// oscillates around a target cannot drive a hot loop. Budgets and
-    /// checkpoints are preserved; cancelled work, size-policy blocks and, while
-    /// automatic acquisition is disabled, automatic rows stay parked.
+    /// margin, provided admission itself (`disk_reserve + 4 * transfer_limit`)
+    /// would pass, so a readmitted row is not bounced back to a timer. The
+    /// margin keeps measurement noise from flipping a row every tick, and a job
+    /// that parked more than once waits out its park streak (15 s doubling to
+    /// an hour) before it is due again, so free space that oscillates around a
+    /// target cannot drive a hot loop. Checkpoints get a fresh idle expiry;
+    /// cancelled work, size-policy blocks and, while automatic acquisition is
+    /// disabled, automatic rows stay parked. Nothing is written when no row fits.
     pub fn readmit_storage_blocked_attachments(
         &self,
         now: u64,
         disk_reserve: u64,
         free: u64,
+        transfer_limit: u64,
         automatic: bool,
     ) -> StorageResult<usize> {
+        if free < disk_reserve.saturating_add(transfer_limit.saturating_mul(4)) {
+            return Ok(0);
+        }
         let Some(headroom) =
             free.checked_sub(disk_reserve.saturating_add(STORAGE_READMIT_MARGIN_BYTES))
         else {
             return Ok(0);
         };
-        let headroom = headroom.min(i64::MAX as u64);
-        // The common tick is a read-only index probe.
-        let parked: bool = self.lock()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM attachment_acquisition WHERE state=4 AND storage_blocked_headroom IS NOT NULL)",
-            [], |row| row.get(0),
+        let headroom = u64_to_i64(headroom.min(i64::MAX as u64))?;
+        // The common tick is a read-only index probe for a row that fits.
+        let fits: bool = self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachment_acquisition WHERE state=4 AND storage_blocked_headroom IS NOT NULL
+                AND cancelled=0 AND (explicit_request=1 OR ?1) AND storage_blocked_headroom<=?2)",
+            params![automatic, headroom], |row| row.get(0),
         ).storage()?;
-        if !parked {
+        if !fits {
             return Ok(0);
         }
-        self.lock()?
-            .execute(
-                "UPDATE attachment_acquisition SET state=0,storage_blocked_headroom=NULL,
-                due=?1+CASE WHEN attempts<=1 THEN 0 ELSE min(15*(1<<min(attempts-2,8)),3600) END
-                WHERE token IN (SELECT token FROM attachment_acquisition
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let tokens: Vec<Vec<u8>> = conn
+                .prepare(
+                    "SELECT token FROM attachment_acquisition
                     WHERE state=4 AND storage_blocked_headroom IS NOT NULL AND cancelled=0
-                    AND (explicit_request=1 OR ?2) AND storage_blocked_headroom<=?3
-                    ORDER BY priority_at DESC,token LIMIT ?4)",
-                params![
-                    u64_to_i64(now)?,
-                    automatic,
-                    u64_to_i64(headroom)?,
-                    ATTACHMENT_ACQUISITION_BATCH_LIMIT as i64
-                ],
-            )
-            .storage()
+                    AND (explicit_request=1 OR ?1) AND storage_blocked_headroom<=?2
+                    ORDER BY priority_at DESC,token LIMIT ?3",
+                )
+                .storage()?
+                .query_map(
+                    params![automatic, headroom, ATTACHMENT_ACQUISITION_BATCH_LIMIT as i64],
+                    |row| row.get(0),
+                )
+                .storage()?
+                .collect::<Result<_, _>>()
+                .storage()?;
+            for token in &tokens {
+                conn.execute(
+                    "UPDATE attachment_acquisition SET state=0,storage_blocked_headroom=NULL,
+                    due=?2+CASE WHEN storage_park_count<=1 THEN 0 ELSE min(15*(1<<min(storage_park_count-2,8)),3600) END
+                    WHERE token=?1",
+                    params![token, u64_to_i64(now)?],
+                )
+                .storage()?;
+                conn.execute(
+                    "UPDATE attachment_partial SET expires_at=?2 WHERE token=?1",
+                    params![
+                        token,
+                        u64_to_i64(now.saturating_add(super::partial::PARTIAL_TTL_SECONDS))?
+                    ],
+                )
+                .storage()?;
+            }
+            Ok(tokens.len())
+        })
     }
 
     /// Called at most four times/second for bytes; phase changes bypass coalescing.
@@ -780,7 +857,7 @@ fn transfer_status(
                     3 if !r.get::<_,bool>(12)? => AttachmentTransferState::PreviouslyAcquiredUnavailable,
                     3 => AttachmentTransferState::Ready,
                     _ if cancelled => AttachmentTransferState::Cancelled,
-                    4 if storage_blocked => AttachmentTransferState::StorageBlocked,
+                    4 if storage_blocked && !cancelled => AttachmentTransferState::StorageBlocked,
                     _ if r.get::<_,bool>(14)? && r.get::<_,bool>(10)? && stored_state!=1 => AttachmentTransferState::CompletedUnretained,
                     _ if size_blocked => AttachmentTransferState::PolicyBlocked,
                     _ if r.get::<_,bool>(14)? && (nonnegative(r,11)? >= 64 || nonnegative(r,13)? >= 4) && stored_state!=1 => AttachmentTransferState::RetryExhausted,

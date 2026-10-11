@@ -11,10 +11,12 @@
   canonical source tags in the page snapshot without a history backfill.
 - Migrations 0103 through 0107 advance account storage to schema 107 on first
   open. Older binaries reject the upgraded database; downgrade is unsupported.
-  Migration 0107 adds `attachment_acquisition.storage_blocked_headroom` with
-  a partial index for parked rows and keeps ciphertext checkpoints for jobs
-  parked on disk space.
+  Migration 0107 adds `attachment_acquisition.storage_blocked_headroom`,
+  `storage_park_count`, `storage_park_floor` and `file_sink`, a partial index
+  for parked rows, and keeps ciphertext checkpoints for jobs parked on disk
+  space.
 - `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
+  `AttachmentAcquisition` gains the public `file_sink` field.
 
 ### Added
 
@@ -43,13 +45,22 @@
 
 - `SqliteAccountStorage::block_attachment_storage` parks a live attempt whose
   publication disk reserve the device cannot cover, recording the free space it
-  needs beyond the reserve, and `readmit_storage_blocked_attachments` requeues
-  up to 64 parked jobs whose target fits the supplied free space less
-  `STORAGE_READMIT_MARGIN_BYTES`, delaying a repeated park by its claim streak
-  and skipping automatic rows while automatic acquisition is disabled. Explicit
-  retry and a new claim clear the parked marker; cancelled and size-policy
-  work stays parked, and `prune_attachment_partials` leaves parked prefixes in
-  place (mdk#2239).
+  needs beyond the reserve (doubled across consecutive parks, up to a caller
+  cap, when the next attempt restarts from zero), refreshing its checkpoint's
+  idle expiry, refunding the automatic-history claim, withdrawing a
+  completed-body receipt that publication could not use, and advancing a park
+  streak. `readmit_storage_blocked_attachments` requeues up to 64 parked jobs
+  whose target fits the supplied free space less `STORAGE_READMIT_MARGIN_BYTES`
+  once admission (`disk_reserve + 4 * transfer_limit`) would pass, delays a
+  repeated park by its park streak, refreshes checkpoint expiry, and skips
+  automatic rows while automatic acquisition is disabled; its probe is
+  read-only until a row fits. Explicit retry, a new claim, cancellation and
+  every permission transition clear the parked marker; size-policy work stays
+  parked, and `prune_attachment_partials` leaves parked (not cancelled)
+  prefixes in place. `attachment_partial_extent` reports a checkpoint's total
+  and saved bytes, `record_attachment_file_sink` remembers a body that needs
+  the file sink, and the doc-hidden `limit_database_pages_for_test` caps the
+  database for capacity tests (mdk#2239).
 
 ### Fixed
 
@@ -57,6 +68,9 @@
   `byte_len` over a `zeroblob` and copies the plaintext through 64 KiB
   incremental BLOB writes, so the insert trigger no longer rewrites the row
   and SQLite holds no bind or record copy of the body (mdk#2241).
+- `load_attachment_partial` sizes the restored prefix for the complete
+  representation with a fallible reservation: a refused allocation is a
+  storage error that keeps the checkpoint, not a process abort (mdk#2241).
 - Outgoing promotion defers file bodies bound after its verification snapshot
   without quarantining them or hiding a verified same-slot sibling. Source
   expiry admission includes time spent verifying and waiting for storage.

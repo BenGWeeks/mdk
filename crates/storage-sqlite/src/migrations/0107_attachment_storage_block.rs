@@ -15,9 +15,22 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     // is the same terminal-looking row as a failure, but the next admitted
     // attempt is meant to resume (ideally without any request), so the
     // terminal cleanup trigger must not discard the prefix for it.
+    //
+    // `storage_park_count` drives the readmission delay of a job that keeps
+    // parking (reset by explicit retry, checkpoint progress and completion),
+    // `storage_park_floor` is the last recorded target so a body that restarts
+    // from zero doubles its target across consecutive parks, and `file_sink`
+    // remembers that the body exceeded the in-memory bound so a readmitted
+    // attempt opens the file sink without a header-only request first.
     tx.execute_batch(
         "ALTER TABLE attachment_acquisition ADD COLUMN storage_blocked_headroom INTEGER
              CHECK(storage_blocked_headroom IS NULL OR storage_blocked_headroom>=0);
+        ALTER TABLE attachment_acquisition ADD COLUMN storage_park_count INTEGER NOT NULL DEFAULT 0
+             CHECK(storage_park_count>=0);
+        ALTER TABLE attachment_acquisition ADD COLUMN storage_park_floor INTEGER NOT NULL DEFAULT 0
+             CHECK(storage_park_floor>=0);
+        ALTER TABLE attachment_acquisition ADD COLUMN file_sink INTEGER NOT NULL DEFAULT 0
+             CHECK(file_sink IN (0,1));
         CREATE INDEX attachment_acquisition_storage_parked
             ON attachment_acquisition(priority_at DESC,token)
             WHERE state=4 AND storage_blocked_headroom IS NOT NULL;
@@ -61,7 +74,7 @@ mod tests {
         run(&mut conn, MIGRATIONS).unwrap();
         let row = conn
             .query_row(
-                "SELECT state,attempts,due,storage_blocked_headroom FROM attachment_acquisition",
+                "SELECT state,attempts,due,storage_blocked_headroom,storage_park_count,storage_park_floor,file_sink FROM attachment_acquisition",
                 [],
                 |r| {
                     Ok((
@@ -69,11 +82,14 @@ mod tests {
                         r.get::<_, i64>(1)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?,
                     ))
                 },
             )
             .unwrap();
-        assert_eq!(row, (2, 7, 1234, None));
+        assert_eq!(row, (2, 7, 1234, None, 0, 0, 0));
         assert!(
             conn.execute(
                 "UPDATE attachment_acquisition SET storage_blocked_headroom=-1",

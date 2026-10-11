@@ -1041,10 +1041,15 @@ pub(crate) enum AttachmentDownloadFailure {
     SizeLimit(AppError, u64),
     /// Explicit acquisitions select a file sink before buffering a large body.
     FileRequired,
-    /// Free disk cannot cover the publication reserve. The payload is the
-    /// headroom beyond the policy reserve a retried attempt needs; the job
-    /// parks with its checkpoints instead of retrying on a timer.
-    StorageBlocked(u64),
+    /// Free disk cannot cover the publication reserve. `headroom` is the free
+    /// space beyond the policy reserve a retried attempt needs; `restart_cap`
+    /// is set when that attempt restarts from zero, so storage doubles the
+    /// recorded target across consecutive parks up to the cap. The job parks
+    /// with its checkpoints instead of retrying on a timer.
+    StorageBlocked {
+        headroom: u64,
+        restart_cap: Option<u64>,
+    },
 }
 impl From<AppError> for AttachmentDownloadFailure {
     fn from(error: AppError) -> Self {
@@ -1058,7 +1063,7 @@ impl AttachmentDownloadFailure {
             Self::FileRequired => {
                 AppError::MediaDownloadFailed("file-backed download required".into())
             }
-            Self::StorageBlocked(_) => {
+            Self::StorageBlocked { .. } => {
                 AppError::BlobStore("insufficient disk space for attachment publication".into())
             }
         }
@@ -1403,7 +1408,7 @@ async fn fetch_encrypted_media_blob_classified(
                     }
                     // Disk is the constraint, not this locator: another candidate
                     // cannot help, and its checkpoint must stay for readmission.
-                    AttachmentDownloadFailure::StorageBlocked(_) => return Err(err),
+                    AttachmentDownloadFailure::StorageBlocked { .. } => return Err(err),
                     AttachmentDownloadFailure::SizeLimit(_, limit) => size_failure = Some(*limit),
                     AttachmentDownloadFailure::Stop(_) => terminal_failure = true,
                     AttachmentDownloadFailure::Retry(AppError::UnsafeMediaFetch(_)) => {}

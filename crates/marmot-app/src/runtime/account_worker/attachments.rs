@@ -212,7 +212,10 @@ pub(super) fn schedule(
         admission.waiting = None;
         return Ok(more);
     }
-    let free = fs4::available_space(client.app.account_dir(&client.state.label)).ok();
+    let free = crate::media::attachment_resume::available_space(
+        &client.app.account_dir(&client.state.label),
+    )
+    .ok();
     // Jobs parked for disk space rejoin the due page only once the device can
     // publish them; their checkpoints make the readmitted attempt local work.
     // Unknown free space readmits nothing, as it admits nothing below.
@@ -221,6 +224,7 @@ pub(super) fn schedule(
             now,
             policy.disk_reserve,
             free,
+            policy.transfer_limit,
             policy.automatic,
         )?,
         None => 0,
@@ -431,12 +435,47 @@ pub(super) fn complete_acquired(
 ) -> Result<(), AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
     let fallback = super::super::attachment_controls::default_policy(&client.app.config);
-    complete_acquired_stored(&storage, &fallback, job, result, byte_budget, &|| false)
+    complete_acquired_stored(
+        &storage,
+        &fallback,
+        &client.app.account_dir(&client.state.label),
+        job,
+        result,
+        byte_budget,
+        &|| false,
+    )
+}
+
+/// Headroom a job records when the database reports it is full while
+/// publishing a `plaintext`-byte body. The disk itself is the likely cause, so
+/// the target is the publication reserve a retried attempt needs in the
+/// worker's frame (`multiple` bodies), but never less than the free space
+/// measured at the refusal plus one more body: readmission then waits until
+/// the volume has actually gained room, rather than refetching into the same
+/// full database whenever free space looked sufficient. `held` is staging this
+/// attempt still occupies at the measurement, which the worker frame does not.
+fn full_database_headroom(
+    directory: &std::path::Path,
+    policy: &storage_sqlite::AttachmentDownloadPolicy,
+    plaintext: u64,
+    multiple: u64,
+    held: u64,
+) -> u64 {
+    let required = plaintext.saturating_mul(multiple);
+    match crate::media::attachment_resume::available_space(directory) {
+        Ok(free) => required.max(
+            free.saturating_add(held)
+                .saturating_sub(policy.disk_reserve)
+                .saturating_add(plaintext),
+        ),
+        Err(_) => required,
+    }
 }
 
 pub(super) fn complete_acquired_stored(
     storage: &SqliteAccountStorage,
     fallback: &storage_sqlite::AttachmentDownloadPolicy,
+    directory: &std::path::Path,
     job: &AttachmentAcquisition,
     result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
     byte_budget: u64,
@@ -459,6 +498,15 @@ pub(super) fn complete_acquired_stored(
                 Err(cgka_traits::StorageError::InvalidAttachmentBody(_)) => {
                     storage.fail_attachment_acquisition(job, None)?;
                 }
+                // The database itself ran out of room: park, never retry on a
+                // timer. A retried file attempt stages the body again before
+                // publishing it, so it needs five bodies; the decrypted file
+                // this attempt still holds is released before the worker looks.
+                Err(cgka_traits::StorageError::Capacity(_)) => {
+                    let headroom =
+                        full_database_headroom(directory, &policy, file.len, 5, file.len);
+                    storage.block_attachment_storage(job, headroom, None, now)?;
+                }
                 _ => {
                     storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
                 }
@@ -474,6 +522,13 @@ pub(super) fn complete_acquired_stored(
             let byte_budget = byte_budget.min(policy.retained_bytes);
             match storage.complete_attachment_acquisition(job, &plaintext, now, byte_budget) {
                 Ok(AttachmentPublishResult::Published | AttachmentPublishResult::Superseded) => {}
+                // A full database parks like a failed free-space check would;
+                // the in-memory sink holds no staging on disk.
+                Err(cgka_traits::StorageError::Capacity(_)) => {
+                    let headroom =
+                        full_database_headroom(directory, &policy, plaintext.len() as u64, 4, 0);
+                    storage.block_attachment_storage(job, headroom, None, now)?;
+                }
                 Ok(AttachmentPublishResult::CapacityBlocked) | Err(_) => {
                     storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
                 }
@@ -487,8 +542,11 @@ pub(super) fn complete_acquired_stored(
         }
         // Disk, not the network, is the blocker: park with the checkpoint until
         // free space covers the reserve or the user retries, never on a timer.
-        Err(AttachmentDownloadFailure::StorageBlocked(headroom)) => {
-            storage.block_attachment_storage(job, headroom)?;
+        Err(AttachmentDownloadFailure::StorageBlocked {
+            headroom,
+            restart_cap,
+        }) => {
+            storage.block_attachment_storage(job, headroom, restart_cap, now)?;
         }
         Err(AttachmentDownloadFailure::Stop(_)) => {
             storage.fail_attachment_acquisition(job, None)?;

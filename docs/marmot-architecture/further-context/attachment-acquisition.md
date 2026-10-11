@@ -350,8 +350,10 @@ stalled server retaining that slot indefinitely. Raising the automatic cap readm
 failures, while integrity failures still require explicit retry. Invalid zero/over-ceiling policy
 values, including a quota smaller than the admission reservation, are rejected before mutation,
 and invalid Rust policy is rejected at runtime start. Disk reserves may intentionally exceed
-current free space; resource pressure is exposed as RetryScheduled with a retry time, without
-spending a transfer attempt or evicting existing bytes.
+current free space; retained-quota pressure is exposed as RetryScheduled with a retry time,
+without spending a transfer attempt or evicting existing bytes, while a body the device cannot
+publish parks as StorageBlocked with its checkpoint until free space covers its recorded
+target or the user retries (see the native attachment access contract).
 
 Release/binding publication, app cache adoption and device benchmarks remain C9. Local tests do
 not establish mobile throughput or background execution entitlement. See the native usage guide.

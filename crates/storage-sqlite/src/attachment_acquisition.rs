@@ -103,6 +103,9 @@ pub struct AttachmentAcquisition {
     pub source_message_id_hex: String,
     pub source_epoch: u64,
     pub slot: serde_json::Value,
+    /// An earlier attempt learned the body exceeds the in-memory bound, so
+    /// this attempt opens the file sink without a header-only probe first.
+    pub file_sink: bool,
     attempt: Vec<u8>,
     digest: Vec<u8>,
 }
@@ -360,7 +363,7 @@ impl SqliteAccountStorage {
                     source_message_id_hex,source_epoch,slot_json,plaintext_digest,expires_at,due,permission_category)
                  VALUES(randomblob(16),?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                  ON CONFLICT(group_id_hex,message_id_hex,attachment_index)
-                 DO UPDATE SET state=0,due=excluded.due,permission_category=excluded.permission_category
+                 DO UPDATE SET state=0,due=excluded.due,permission_category=excluded.permission_category,storage_blocked_headroom=NULL
                  WHERE attachment_acquisition.state=5 AND attachment_acquisition.cancelled=0 AND (attachment_acquisition.automatic_history=0 OR (attachment_acquisition.body_completed=0 AND attachment_acquisition.network_attempts<64 AND attachment_acquisition.acquisition_attempts<4)) AND attachment_acquisition.permission_paused=0",
                 params![
                     group,
@@ -596,7 +599,7 @@ impl SqliteAccountStorage {
             let job = conn
                 .query_row(
                     "SELECT group_id_hex,message_id_hex,attachment_index,source_message_id_hex,
-                    source_epoch,slot_json,attempt,plaintext_digest
+                    source_epoch,slot_json,attempt,plaintext_digest,file_sink
                  FROM attachment_acquisition WHERE token=?1",
                     [&reference.token],
                     |r| {
@@ -609,6 +612,7 @@ impl SqliteAccountStorage {
                             r.get::<_, String>(5)?,
                             r.get::<_, Vec<u8>>(6)?,
                             r.get::<_, Vec<u8>>(7)?,
+                            r.get::<_, bool>(8)?,
                         ))
                     },
                 )
@@ -622,6 +626,7 @@ impl SqliteAccountStorage {
                 source_epoch: job.4,
                 slot: serde_json::from_str(&job.5)
                     .map_err(|_| invalid("invalid stored attachment slot"))?,
+                file_sink: job.8,
                 attempt: job.6,
                 digest: job.7,
             }))
@@ -653,7 +658,7 @@ impl SqliteAccountStorage {
             }
             insert_retained_array(&conn, &job.reference.token, plaintext)?;
             conn.execute(
-                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
+                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0 WHERE token=?1",
                 [&job.reference.token],
             )
             .storage()?;
@@ -740,7 +745,7 @@ impl SqliteAccountStorage {
         }
         Ok(conn
             .execute(
-                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
+                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
              WHERE token=?1 AND state IN (2,4,5)",
                 params![reference.token, u64_to_i64(now)?],
             )
@@ -939,6 +944,23 @@ impl SqliteAccountStorage {
             )
             .storage()
     }
+    /// Cap the account database at its current size plus `slack_pages`, so a
+    /// publication that needs more fails with the backend's capacity error
+    /// while small bookkeeping updates still fit. Test seam only; a large slack
+    /// lifts the cap again.
+    #[doc(hidden)]
+    pub fn limit_database_pages_for_test(&self, slack_pages: u64) -> StorageResult<()> {
+        let conn = self.lock()?;
+        let pages: u64 = conn
+            .query_row("PRAGMA page_count", [], |row| nonnegative(row, 0))
+            .storage()?;
+        conn.execute_batch(&format!(
+            "PRAGMA max_page_count={}",
+            pages.saturating_add(slack_pages)
+        ))
+        .storage()
+    }
+
     pub fn retained_attachment_byte_count(&self) -> StorageResult<u64> {
         self.lock()?
             .query_row(

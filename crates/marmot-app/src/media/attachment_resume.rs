@@ -47,8 +47,22 @@ fn stop(message: &str) -> AttachmentDownloadFailure {
 /// private staging copies). Below that, the job parks as `StorageBlocked` with
 /// its checkpoints instead of re-fetching on a timer. The payload is the
 /// headroom beyond the reserve a retried attempt needs, in the worker's frame.
-fn storage_blocked(headroom: u64) -> AttachmentDownloadFailure {
-    AttachmentDownloadFailure::StorageBlocked(headroom)
+fn storage_blocked(headroom: u64, restart_cap: Option<u64>) -> AttachmentDownloadFailure {
+    AttachmentDownloadFailure::StorageBlocked {
+        headroom,
+        restart_cap,
+    }
+}
+
+/// Free bytes on the volume holding `path`, as every capacity decision and the
+/// worker's readmission measure it. Tests pin a value per account directory so
+/// window tests do not depend on the host's live free space.
+pub(crate) fn available_space(path: &std::path::Path) -> std::io::Result<u64> {
+    #[cfg(test)]
+    if let Some(free) = test_free_space::lookup(path) {
+        return Ok(free);
+    }
+    fs4::available_space(path)
 }
 
 /// Distinguish revocation from transport errors without nesting Result values.
@@ -162,7 +176,7 @@ impl AttachmentResume {
             // Park on disk pressure before recording a completed receipt, so a
             // blocked job never becomes an opted-in body with no retention.
             // Stable retention quota failures after this boundary remain terminal.
-            this.check_publication_capacity(plaintext_len as u64, 0, held)?;
+            this.check_publication_capacity(plaintext_len as u64, 0, held, None)?;
             this.storage
                 .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
                 .map_err(|_| stop("attachment receipt failed"))
@@ -187,39 +201,57 @@ impl AttachmentResume {
     /// measurement (taken once that staging is gone) does not see. A shortage
     /// parks the job with the headroom a retried attempt needs beyond the
     /// reserve: `4 * bytes + ahead + held`. Readmission requires that headroom
-    /// in the worker's frame, so a readmitted attempt sees at least the space
-    /// this check wanted, and a later check that parks again records a
-    /// strictly larger target. Unknown free space is a transient failure.
+    /// in the worker's frame plus a margin wider than the sub-MiB tail a
+    /// checkpointed body still re-requests, so the first check a readmitted
+    /// attempt reaches passes. A check that parks again without saved progress
+    /// records at least the same target (more, once more of an unknown-length
+    /// body is seen); saved progress may lower it, since the next attempt then
+    /// has less left to write. Unknown free space is a transient failure.
     fn check_publication_capacity(
         &self,
         bytes: u64,
         ahead: u64,
         held: u64,
+        restart_cap: Option<u64>,
     ) -> Result<(), AttachmentDownloadFailure> {
         let policy = self
             .storage
             .attachment_download_policy(&self.policy)
             .map_err(|_| retry("attachment publication policy unavailable"))?;
-        let free = fs4::available_space(&self.directory)
-            .map_err(|_| retry("free disk space unavailable"))?;
+        let free =
+            available_space(&self.directory).map_err(|_| retry("free disk space unavailable"))?;
         let needed = bytes.saturating_mul(4).saturating_add(ahead);
         if free < policy.disk_reserve.saturating_add(needed) {
-            return Err(storage_blocked(needed.saturating_add(held)));
+            return Err(storage_blocked(needed.saturating_add(held), restart_cap));
         }
         Ok(())
     }
 
     /// Check publication headroom without recording a completed-body receipt.
-    pub(super) async fn publication_capacity(
+    /// `restart_cap` marks a check whose next attempt restarts from zero.
+    pub(crate) async fn publication_capacity(
         self: &Arc<Self>,
         bytes: u64,
         ahead: u64,
         held: u64,
+        restart_cap: Option<u64>,
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || this.check_publication_capacity(bytes, ahead, held))
-            .await
-            .map_err(|_| retry("attachment capacity task failed"))?
+        tokio::task::spawn_blocking(move || {
+            this.check_publication_capacity(bytes, ahead, held, restart_cap)
+        })
+        .await
+        .map_err(|_| retry("attachment capacity task failed"))?
+    }
+
+    /// Remember that this body needs the file sink, so a readmitted attempt
+    /// skips the in-memory sink's header-only request. Best effort.
+    pub(crate) async fn record_file_sink(&self) {
+        let this = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            this.storage.record_attachment_file_sink(&this.job)
+        })
+        .await;
     }
 
     /// Early in-memory capacity check: a definite shortage parks the job, but
@@ -231,8 +263,8 @@ impl AttachmentResume {
         bytes: u64,
         ahead: u64,
     ) -> Result<(), AttachmentDownloadFailure> {
-        match self.publication_capacity(bytes, ahead, 0).await {
-            Err(blocked @ AttachmentDownloadFailure::StorageBlocked(_)) => Err(blocked),
+        match self.publication_capacity(bytes, ahead, 0, None).await {
+            Err(blocked @ AttachmentDownloadFailure::StorageBlocked { .. }) => Err(blocked),
             _ => Ok(()),
         }
     }
@@ -361,7 +393,7 @@ impl AttachmentResume {
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = self.clone();
         let saved = tokio::task::spawn_blocking(move || {
-            let free = fs4::available_space(&this.directory).unwrap_or(0);
+            let free = available_space(&this.directory).unwrap_or(0);
             if free
                 < this
                     .policy
@@ -403,20 +435,26 @@ impl AttachmentResume {
         let this = self.clone();
         let locator_digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();
         tokio::task::spawn_blocking(move || {
-            let total = this
+            let (total, saved) = this
                 .storage
-                .attachment_partial_total(
+                .attachment_partial_extent(
                     &this.job,
                     crate::unix_now_seconds(),
                     (&this.ciphertext_digest, &locator_digest),
                 )
-                .map_err(|_| retry("partial checkpoint metadata unavailable"))?;
-            // Restoring a checkpoint stages it again, and the download then
-            // grows both the staging file and the checkpoint to the total.
+                .map_err(|_| retry("partial checkpoint metadata unavailable"))?
+                .unwrap_or((0, 0));
+            // Restoring stages the saved prefix again, and the download then
+            // grows both the staging file and the checkpoint from there to the
+            // total: the same frame as the header and mid-transfer checks.
             this.check_publication_capacity(
-                total.unwrap_or(0),
-                total.map(|total| total.saturating_mul(2)).unwrap_or(0),
+                total,
+                total
+                    .saturating_sub(saved)
+                    .saturating_mul(2)
+                    .saturating_add(saved),
                 0,
+                None,
             )?;
             let mut file = super::file_transfer::PrivateMediaFile::create(&directory)?;
             let mut writer = file.writer()?;
@@ -582,6 +620,18 @@ pub(super) async fn read_body(
         if expected_total.is_some_and(|n| size > n) {
             return Err(stop("download exceeds response size bound"));
         }
+        if bytes.capacity() < bytes.len() + chunk.len() {
+            // An undeclared length grows the buffer geometrically but never
+            // past the admitted limit, and a failed reservation never aborts.
+            let wanted = bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(bytes.len() + chunk.len())
+                .min(max as usize);
+            bytes
+                .try_reserve_exact(wanted - bytes.len())
+                .map_err(|_| retry("attachment body buffer unavailable"))?;
+        }
         bytes.extend_from_slice(&chunk);
         if reported.elapsed() >= PROGRESS_INTERVAL {
             context
@@ -639,4 +689,32 @@ async fn checkpoint_tail(
         *saved = bytes.len();
     }
     Ok(())
+}
+
+/// Per-directory free-space pins for tests, read by [`available_space`].
+#[cfg(test)]
+pub(crate) mod test_free_space {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static OVERRIDES: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+    /// Pin the free space reported for `root` and everything beneath it.
+    pub(crate) fn set(root: &Path, free: u64) {
+        OVERRIDES.lock().unwrap().insert(root.to_path_buf(), free);
+    }
+    /// Drop the pin for `root`, returning it to live measurements.
+    pub(crate) fn clear(root: &Path) {
+        OVERRIDES.lock().unwrap().remove(root);
+    }
+    /// The pinned free space of the root that contains `path`, if any.
+    pub(crate) fn lookup(path: &Path) -> Option<u64> {
+        OVERRIDES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(root, _)| path.starts_with(root))
+            .map(|(_, free)| *free)
+    }
 }

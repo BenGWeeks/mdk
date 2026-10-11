@@ -165,7 +165,7 @@ pub(super) fn complete(
         )
         .storage()?;
         conn.execute(
-            "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
+            "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0 WHERE token=?1",
             [&job.reference.token],
         )
         .storage()?;
