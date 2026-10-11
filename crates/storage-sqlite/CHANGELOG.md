@@ -14,7 +14,12 @@
   Migration 0107 adds `attachment_acquisition.storage_blocked_headroom`,
   `storage_park_count`, `storage_park_floor` and `file_sink`, a partial index
   for parked rows, and keeps ciphertext checkpoints for jobs parked on disk
-  space.
+  space. Development databases opened under a pre-release build of this
+  change must be recreated if that build was commit 3ff6ef84 (which created
+  `storage_blocked_bytes` instead) or 1a32f09b (which lacked the last three
+  columns): both report schema 107 with a different shape. A database from
+  fa2b2da0 has the final shape but may hold a doubled park target from that
+  build's restart rule until explicit Retry clears it.
 - `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
   `AttachmentAcquisition` gains the public `file_sink` field.
 
@@ -45,22 +50,27 @@
 
 - `SqliteAccountStorage::block_attachment_storage` parks a live attempt whose
   publication disk reserve the device cannot cover, recording the free space it
-  needs beyond the reserve (doubled across consecutive parks, up to a caller
-  cap, when the next attempt restarts from zero), refreshing its checkpoint's
-  idle expiry, refunding the automatic-history claim, withdrawing a
+  needs beyond the reserve (for an attempt that restarts from zero, the largest
+  need any attempt proved), refreshing its checkpoint's idle expiry, refunding
+  the automatic-history claim and the claim streak, withdrawing a
   completed-body receipt that publication could not use, and advancing a park
-  streak. `readmit_storage_blocked_attachments` requeues up to 64 parked jobs
+  streak; a permission-owned park advances neither the streak nor the floor. `readmit_storage_blocked_attachments` requeues up to 64 parked jobs
   whose target fits the supplied free space less `STORAGE_READMIT_MARGIN_BYTES`
   once admission (`disk_reserve + 4 * transfer_limit`) would pass, delays a
   repeated park by its park streak, refreshes checkpoint expiry, and skips
   automatic rows while automatic acquisition is disabled; its probe is
   read-only until a row fits. Explicit retry, a new claim, cancellation and
-  every permission transition clear the parked marker; size-policy work stays
-  parked, and `prune_attachment_partials` leaves parked (not cancelled)
-  prefixes in place. `attachment_partial_extent` reports a checkpoint's total
-  and saved bytes, `record_attachment_file_sink` remembers a body that needs
-  the file sink, and the doc-hidden `limit_database_pages_for_test` caps the
-  database for capacity tests (mdk#2239).
+  every permission transition clear the parked marker, cancellation also
+  clears the streak and floor, and both explicit retry APIs refresh a parked
+  prefix's idle expiry; size-policy work stays parked, and
+  `prune_attachment_partials` leaves parked (not cancelled) prefixes in place
+  for at most `STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS` (seven days) after the
+  latest park. `attachment_partial_extent` reports a checkpoint's total and
+  saved bytes, and `record_attachment_file_sink` remembers a body that needs
+  the file sink. The new `test-support` feature exposes test hooks to
+  dependents' tests: `limit_database_pages_for_test`,
+  `attachment_partial_bytes_for_test` and `fail_next_storage_parks_for_test`
+  (mdk#2239).
 
 ### Fixed
 

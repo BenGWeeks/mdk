@@ -178,6 +178,7 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
             permits: Arc::new(Semaphore::new(4)),
             prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
             worker_lifetime: watch::channel(()).0,
+            pending_storage_parks: Default::default(),
         },
         rx,
     )

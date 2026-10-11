@@ -734,23 +734,32 @@ impl SqliteAccountStorage {
     }
     /// Explicit retry of an existing failed/parked/delayed job. Ready bytes and active
     /// attempts are not changed; this never clears explicit-removal suppression.
+    /// Retrying a storage-parked job refreshes its prefix's idle expiry, so a
+    /// park longer than a day still resumes from the kept checkpoint.
     pub fn retry_attachment_acquisition(
         &self,
         reference: &AttachmentAssetRef,
         now: u64,
     ) -> StorageResult<bool> {
-        let conn = self.lock()?;
-        if !matches_store(&conn, reference)? {
-            return Ok(false);
-        }
-        Ok(conn
-            .execute(
-                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
-             WHERE token=?1 AND state IN (2,4,5)",
-                params![reference.token, u64_to_i64(now)?],
-            )
-            .storage()?
-            == 1)
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(false);
+            }
+            let parked = partial::storage_parked(&conn, &reference.token)?;
+            let retried = conn
+                .execute(
+                    "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
+                 WHERE token=?1 AND state IN (2,4,5)",
+                    params![reference.token, u64_to_i64(now)?],
+                )
+                .storage()?
+                == 1;
+            if retried && parked {
+                partial::refresh_partial_expiry(&conn, &reference.token, now)?;
+            }
+            Ok(retried)
+        })
     }
 
     /// Suppress this original message slot durably even when it has no bytes yet.
@@ -946,9 +955,9 @@ impl SqliteAccountStorage {
     }
     /// Cap the account database at its current size plus `slack_pages`, so a
     /// publication that needs more fails with the backend's capacity error
-    /// while small bookkeeping updates still fit. Test seam only; a large slack
-    /// lifts the cap again.
-    #[doc(hidden)]
+    /// while small bookkeeping updates still fit. Test support only; a large
+    /// slack lifts the cap again.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn limit_database_pages_for_test(&self, slack_pages: u64) -> StorageResult<()> {
         let conn = self.lock()?;
         let pages: u64 = conn
@@ -1070,7 +1079,10 @@ fn publication_refusal(
 mod tests;
 
 mod partial;
-pub use partial::{ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartial, AttachmentPartialIdentity};
+pub use partial::{
+    ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartial, AttachmentPartialIdentity,
+    STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS,
+};
 
 mod file_import;
 mod file_staging;

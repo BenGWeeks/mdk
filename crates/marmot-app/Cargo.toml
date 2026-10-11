@@ -69,6 +69,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+storage-sqlite = { workspace = true, features = ["test-support"] }
 keyring-core.workspace = true
 marmot-forensics.workspace = true
 nostr-relay-builder.workspace = true

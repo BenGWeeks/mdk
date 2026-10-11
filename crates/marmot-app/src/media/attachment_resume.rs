@@ -47,11 +47,8 @@ fn stop(message: &str) -> AttachmentDownloadFailure {
 /// private staging copies). Below that, the job parks as `StorageBlocked` with
 /// its checkpoints instead of re-fetching on a timer. The payload is the
 /// headroom beyond the reserve a retried attempt needs, in the worker's frame.
-fn storage_blocked(headroom: u64, restart_cap: Option<u64>) -> AttachmentDownloadFailure {
-    AttachmentDownloadFailure::StorageBlocked {
-        headroom,
-        restart_cap,
-    }
+fn storage_blocked(headroom: u64, restarts: bool) -> AttachmentDownloadFailure {
+    AttachmentDownloadFailure::StorageBlocked { headroom, restarts }
 }
 
 /// Free bytes on the volume holding `path`, as every capacity decision and the
@@ -176,7 +173,7 @@ impl AttachmentResume {
             // Park on disk pressure before recording a completed receipt, so a
             // blocked job never becomes an opted-in body with no retention.
             // Stable retention quota failures after this boundary remain terminal.
-            this.check_publication_capacity(plaintext_len as u64, 0, held, None)?;
+            this.check_publication_capacity(plaintext_len as u64, 0, held, false)?;
             this.storage
                 .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
                 .map_err(|_| stop("attachment receipt failed"))
@@ -212,7 +209,7 @@ impl AttachmentResume {
         bytes: u64,
         ahead: u64,
         held: u64,
-        restart_cap: Option<u64>,
+        restarts: bool,
     ) -> Result<(), AttachmentDownloadFailure> {
         let policy = self
             .storage
@@ -222,23 +219,23 @@ impl AttachmentResume {
             available_space(&self.directory).map_err(|_| retry("free disk space unavailable"))?;
         let needed = bytes.saturating_mul(4).saturating_add(ahead);
         if free < policy.disk_reserve.saturating_add(needed) {
-            return Err(storage_blocked(needed.saturating_add(held), restart_cap));
+            return Err(storage_blocked(needed.saturating_add(held), restarts));
         }
         Ok(())
     }
 
     /// Check publication headroom without recording a completed-body receipt.
-    /// `restart_cap` marks a check whose next attempt restarts from zero.
+    /// `restarts` marks a check whose next attempt starts the body over.
     pub(crate) async fn publication_capacity(
         self: &Arc<Self>,
         bytes: u64,
         ahead: u64,
         held: u64,
-        restart_cap: Option<u64>,
+        restarts: bool,
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            this.check_publication_capacity(bytes, ahead, held, restart_cap)
+            this.check_publication_capacity(bytes, ahead, held, restarts)
         })
         .await
         .map_err(|_| retry("attachment capacity task failed"))?
@@ -263,7 +260,7 @@ impl AttachmentResume {
         bytes: u64,
         ahead: u64,
     ) -> Result<(), AttachmentDownloadFailure> {
-        match self.publication_capacity(bytes, ahead, 0, None).await {
+        match self.publication_capacity(bytes, ahead, 0, false).await {
             Err(blocked @ AttachmentDownloadFailure::StorageBlocked { .. }) => Err(blocked),
             _ => Ok(()),
         }
@@ -454,7 +451,7 @@ impl AttachmentResume {
                     .saturating_mul(2)
                     .saturating_add(saved),
                 0,
-                None,
+                false,
             )?;
             let mut file = super::file_transfer::PrivateMediaFile::create(&directory)?;
             let mut writer = file.writer()?;
@@ -621,13 +618,19 @@ pub(super) async fn read_body(
             return Err(stop("download exceeds response size bound"));
         }
         if bytes.capacity() < bytes.len() + chunk.len() {
-            // An undeclared length grows the buffer geometrically but never
-            // past the admitted limit, and a failed reservation never aborts.
-            let wanted = bytes
-                .capacity()
-                .saturating_mul(2)
-                .max(bytes.len() + chunk.len())
-                .min(max as usize);
+            // An undeclared length grows the buffer geometrically up to half
+            // the admitted limit, then once to the limit itself. Growth copies
+            // the old buffer into the new one, so the buffer never exceeds the
+            // limit and the transient peak during a copy never exceeds 1.5
+            // times it. A failed reservation never aborts.
+            let needed = bytes.len() + chunk.len();
+            let limit = max as usize;
+            let half = limit.div_ceil(2);
+            let wanted = if needed <= half {
+                bytes.capacity().saturating_mul(2).max(needed).min(half)
+            } else {
+                limit
+            };
             bytes
                 .try_reserve_exact(wanted - bytes.len())
                 .map_err(|_| retry("attachment body buffer unavailable"))?;
@@ -692,29 +695,95 @@ async fn checkpoint_tail(
 }
 
 /// Per-directory free-space pins for tests, read by [`available_space`].
+///
+/// A modeled pin behaves like a volume holding the account: it reports the
+/// pinned figure less every byte currently staged under the account's media
+/// staging directory and less what the checkpoint table grew by since the pin.
+/// The pinned figure is therefore free space in the worker's frame (no
+/// attempt staging), and an attempt's own staging and checkpoint writes
+/// consume the space its later capacity checks see, as on a real device.
 #[cfg(test)]
 pub(crate) mod test_free_space {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use storage_sqlite::SqliteAccountStorage;
 
-    static OVERRIDES: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
-
-    /// Pin the free space reported for `root` and everything beneath it.
-    pub(crate) fn set(root: &Path, free: u64) {
-        OVERRIDES.lock().unwrap().insert(root.to_path_buf(), free);
+    #[derive(Clone)]
+    struct Model {
+        staging: PathBuf,
+        storage: SqliteAccountStorage,
+        checkpoint_base: u64,
     }
+
+    #[derive(Clone)]
+    struct Pin {
+        free: u64,
+        model: Option<Model>,
+    }
+
+    static PINS: Mutex<BTreeMap<PathBuf, Pin>> = Mutex::new(BTreeMap::new());
+
+    /// Pin a constant free-space figure for `root` and everything beneath it.
+    pub(crate) fn set(root: &Path, free: u64) {
+        PINS.lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Pin { free, model: None });
+    }
+
+    /// Pin `free` in the worker's frame for `root`, charging live staging
+    /// under `staging` and checkpoint growth in `storage` against it.
+    pub(crate) fn set_modeled(
+        root: &Path,
+        free: u64,
+        staging: &Path,
+        storage: &SqliteAccountStorage,
+    ) {
+        let checkpoint_base = storage.attachment_partial_bytes_for_test().unwrap();
+        PINS.lock().unwrap().insert(
+            root.to_path_buf(),
+            Pin {
+                free,
+                model: Some(Model {
+                    staging: staging.to_path_buf(),
+                    storage: storage.clone(),
+                    checkpoint_base,
+                }),
+            },
+        );
+    }
+
     /// Drop the pin for `root`, returning it to live measurements.
     pub(crate) fn clear(root: &Path) {
-        OVERRIDES.lock().unwrap().remove(root);
+        PINS.lock().unwrap().remove(root);
     }
-    /// The pinned free space of the root that contains `path`, if any.
+
+    /// The modeled free space of the pinned root that contains `path`, if any.
     pub(crate) fn lookup(path: &Path) -> Option<u64> {
-        OVERRIDES
+        // Copy the pin out first: the model queries storage and the file
+        // system, and must not do so under this lock.
+        let pin = PINS
             .lock()
             .unwrap()
             .iter()
             .find(|(root, _)| path.starts_with(root))
-            .map(|(_, free)| *free)
+            .map(|(_, pin)| pin.clone())?;
+        let Some(model) = pin.model else {
+            return Some(pin.free);
+        };
+        let staged: u64 = std::fs::read_dir(&model.staging)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum();
+        let grown = model
+            .storage
+            .attachment_partial_bytes_for_test()
+            .unwrap_or(model.checkpoint_base)
+            .saturating_sub(model.checkpoint_base);
+        Some(pin.free.saturating_sub(staged).saturating_sub(grown))
     }
 }

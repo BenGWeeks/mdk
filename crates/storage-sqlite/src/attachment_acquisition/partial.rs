@@ -3,9 +3,44 @@ use super::*;
 
 pub const ATTACHMENT_CHECKPOINT_BYTES: usize = 1024 * 1024;
 /// Idle expiry of a checkpoint, measured from its last progress. Parking a job
-/// for disk space and readmitting it both refresh this deadline, so a prefix
-/// kept through a long park is still loadable when space returns.
+/// for disk space, readmitting it and explicitly retrying it all refresh this
+/// deadline, so a prefix kept through a long park is still loadable when the
+/// job resumes by any of those paths.
 pub(super) const PARTIAL_TTL_SECONDS: u64 = 24 * 60 * 60;
+/// Longest a storage-parked job keeps its prefix, measured from its latest
+/// park. A parked prefix is exempt from the idle expiry until then, so it
+/// survives while the user frees space, but it cannot hold its disk and its
+/// quota reservation forever, for instance while automatic acquisition stays
+/// disabled. Past it, the prefix is pruned and the row stays parked without
+/// one; its next attempt starts the body over.
+pub const STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// Whether the row is storage-parked: the state an explicit retry or a
+/// readmission resumes from with the parked prefix.
+pub(super) fn storage_parked(conn: &Connection, token: &[u8]) -> StorageResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attachment_acquisition WHERE token=?1
+         AND state=4 AND cancelled=0 AND storage_blocked_headroom IS NOT NULL)",
+        [token],
+        |row| row.get(0),
+    )
+    .storage()
+}
+
+/// Give a prefix that is about to be resumed a fresh idle expiry, never a
+/// shorter one.
+pub(super) fn refresh_partial_expiry(
+    conn: &Connection,
+    token: &[u8],
+    now: u64,
+) -> StorageResult<()> {
+    conn.execute(
+        "UPDATE attachment_partial SET expires_at=max(expires_at,?2) WHERE token=?1",
+        params![token, u64_to_i64(now.saturating_add(PARTIAL_TTL_SECONDS))?],
+    )
+    .storage()?;
+    Ok(())
+}
 
 /// HTTP validator is opaque and protected; do not log this identity.
 #[derive(Clone, PartialEq, Eq)]
@@ -554,21 +589,41 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// Storage-parked jobs are exempt: their prefix is what makes readmission
-    /// local work, and parking/readmission refresh its expiry. Cancellation
-    /// clears the parked marker, so a cancelled prefix expires as before.
+    /// Storage-parked jobs are exempt until
+    /// [`STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS`] after their latest park: the
+    /// prefix is what makes readmission local work. A park sets the prefix's
+    /// idle expiry to one TTL past the park, so the exemption ends once that
+    /// expiry is more than the remaining age in the past. Cancellation clears
+    /// the parked marker, so a cancelled prefix expires as before.
     pub fn prune_attachment_partials(&self, now: u64, limit: usize) -> StorageResult<usize> {
         if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
             return Err(invalid("invalid partial prune limit"));
         }
+        let exempt_after = now
+            .saturating_add(PARTIAL_TTL_SECONDS)
+            .saturating_sub(STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS);
         self.lock()?
             .execute(
                 "DELETE FROM attachment_partial WHERE token IN (
                  SELECT p.token FROM attachment_partial p WHERE p.expires_at<=?1
-                 AND NOT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE q.token=p.token
-                     AND q.state=4 AND q.cancelled=0 AND q.storage_blocked_headroom IS NOT NULL)
+                 AND NOT (p.expires_at>?3 AND EXISTS(SELECT 1 FROM attachment_acquisition q
+                     WHERE q.token=p.token AND q.state=4 AND q.cancelled=0
+                     AND q.storage_blocked_headroom IS NOT NULL))
                  ORDER BY p.expires_at,p.token LIMIT ?2)",
-                params![u64_to_i64(now)?, limit as i64],
+                params![u64_to_i64(now)?, limit as i64, u64_to_i64(exempt_after)?],
+            )
+            .storage()
+    }
+
+    /// Bytes currently held in ciphertext checkpoints. Test support for
+    /// free-space models that charge checkpoint growth to the volume.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn attachment_partial_bytes_for_test(&self) -> StorageResult<u64> {
+        self.lock()?
+            .query_row(
+                "SELECT coalesce(sum(length(bytes)),0) FROM attachment_partial_chunk",
+                [],
+                |row| nonnegative(row, 0),
             )
             .storage()
     }

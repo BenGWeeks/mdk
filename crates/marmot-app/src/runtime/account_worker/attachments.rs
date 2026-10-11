@@ -135,6 +135,89 @@ fn retry_at(storage: &SqliteAccountStorage, job: &AttachmentAcquisition, now: u6
     )
 }
 
+/// A storage park the database could not record because the write itself
+/// failed, as it can on a truly full disk. The attempt's lease still fences the
+/// row, so the worker retries the park before it schedules anything else; a
+/// worker restart loses the list, and the reclaimed attempt then parks again at
+/// its first capacity check.
+#[derive(Clone)]
+pub(super) struct PendingStoragePark {
+    job: AttachmentAcquisition,
+    headroom: u64,
+    restarts: bool,
+}
+
+/// Parks awaiting a database write, shared by the worker and its publication
+/// tasks.
+pub(super) type PendingStorageParks = Arc<std::sync::Mutex<Vec<PendingStoragePark>>>;
+
+/// Record a storage park, or keep it for the next tick when the database
+/// cannot take even that write.
+fn park(
+    storage: &SqliteAccountStorage,
+    pending: &PendingStorageParks,
+    job: &AttachmentAcquisition,
+    headroom: u64,
+    restarts: bool,
+    now: u64,
+) -> Result<(), AppError> {
+    match storage.block_attachment_storage(job, headroom, restarts, now) {
+        Ok(_) => Ok(()),
+        Err(cgka_traits::StorageError::Capacity(_) | cgka_traits::StorageError::Busy(_)) => {
+            pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(PendingStoragePark {
+                    job: job.clone(),
+                    headroom,
+                    restarts,
+                });
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Retry parks the database refused earlier. A superseded attempt (its lease
+/// was reclaimed) drops out; a park that still cannot be written stays.
+fn retry_pending_parks(
+    storage: &SqliteAccountStorage,
+    pending: &PendingStorageParks,
+    now: u64,
+) -> Result<bool, AppError> {
+    let parks = std::mem::take(
+        &mut *pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    let mut recorded = false;
+    for entry in parks {
+        match storage.block_attachment_storage(&entry.job, entry.headroom, entry.restarts, now) {
+            Ok(parked) => recorded |= parked,
+            Err(cgka_traits::StorageError::Capacity(_) | cgka_traits::StorageError::Busy(_)) => {
+                pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(entry);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(recorded)
+}
+
+/// The scheduler's clock. Tests may run it ahead of wall time per account
+/// directory to cross readmission backoffs without sleeping; transfers,
+/// leases and publication keep wall time, which only ever lags it.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn scheduler_now(client: &AppClient) -> u64 {
+    #[cfg(test)]
+    let skew = test_clock::skew(&client.app.account_dir(&client.state.label));
+    #[cfg(not(test))]
+    let skew = 0;
+    crate::unix_now_seconds().saturating_add(skew)
+}
+
 pub(super) fn schedule(
     client: &AppClient,
     shared: &RuntimeSharedServices,
@@ -148,7 +231,11 @@ pub(super) fn schedule(
         return Ok(false);
     }
     let storage = client.app.account_storage(&client.state.label)?;
-    let now = crate::unix_now_seconds();
+    let now = scheduler_now(client);
+    // A park the database refused is written before anything is scheduled.
+    if retry_pending_parks(&storage, &http.pending_storage_parks, now)? {
+        shared.attachment_updates.send_modify(|_| {});
+    }
     // Abandoned ciphertext expires even after automatic acquisition is disabled.
     let partials = storage.prune_attachment_partials(now, 64)?;
     let orphan_uploads = storage
@@ -429,6 +516,7 @@ where
 
 pub(super) fn complete_acquired(
     client: &AppClient,
+    pending: &PendingStorageParks,
     job: &AttachmentAcquisition,
     result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
     byte_budget: u64,
@@ -439,6 +527,7 @@ pub(super) fn complete_acquired(
         &storage,
         &fallback,
         &client.app.account_dir(&client.state.label),
+        pending,
         job,
         result,
         byte_budget,
@@ -472,10 +561,12 @@ fn full_database_headroom(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn complete_acquired_stored(
     storage: &SqliteAccountStorage,
     fallback: &storage_sqlite::AttachmentDownloadPolicy,
     directory: &std::path::Path,
+    pending: &PendingStorageParks,
     job: &AttachmentAcquisition,
     result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
     byte_budget: u64,
@@ -505,7 +596,7 @@ pub(super) fn complete_acquired_stored(
                 Err(cgka_traits::StorageError::Capacity(_)) => {
                     let headroom =
                         full_database_headroom(directory, &policy, file.len, 5, file.len);
-                    storage.block_attachment_storage(job, headroom, None, now)?;
+                    park(storage, pending, job, headroom, false, now)?;
                 }
                 _ => {
                     storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
@@ -527,7 +618,7 @@ pub(super) fn complete_acquired_stored(
                 Err(cgka_traits::StorageError::Capacity(_)) => {
                     let headroom =
                         full_database_headroom(directory, &policy, plaintext.len() as u64, 4, 0);
-                    storage.block_attachment_storage(job, headroom, None, now)?;
+                    park(storage, pending, job, headroom, false, now)?;
                 }
                 Ok(AttachmentPublishResult::CapacityBlocked) | Err(_) => {
                     storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
@@ -542,11 +633,8 @@ pub(super) fn complete_acquired_stored(
         }
         // Disk, not the network, is the blocker: park with the checkpoint until
         // free space covers the reserve or the user retries, never on a timer.
-        Err(AttachmentDownloadFailure::StorageBlocked {
-            headroom,
-            restart_cap,
-        }) => {
-            storage.block_attachment_storage(job, headroom, restart_cap, now)?;
+        Err(AttachmentDownloadFailure::StorageBlocked { headroom, restarts }) => {
+            park(storage, pending, job, headroom, restarts, now)?;
         }
         Err(AttachmentDownloadFailure::Stop(_)) => {
             storage.fail_attachment_acquisition(job, None)?;
@@ -567,10 +655,46 @@ fn complete(
 ) -> Result<(), AppError> {
     complete_acquired(
         client,
+        &PendingStorageParks::default(),
         job,
         result.map(crate::client::AcquiredMediaBody::Memory),
         byte_budget,
     )
+}
+
+/// Per-account-directory scheduler clock skew for tests, read by
+/// [`scheduler_now`].
+#[cfg(test)]
+pub(super) mod test_clock {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static SKEWS: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+    /// Run the scheduler for `root` and everything beneath it `seconds` ahead.
+    pub(crate) fn advance(root: &Path, seconds: u64) {
+        let mut skews = SKEWS.lock().unwrap();
+        let skew = skews.entry(root.to_path_buf()).or_default();
+        *skew = skew.saturating_add(seconds);
+    }
+    /// Return `root` to wall time.
+    pub(crate) fn clear(root: &Path) {
+        SKEWS.lock().unwrap().remove(root);
+    }
+    /// The skew applied to `root`, for tests that compute due times.
+    pub(crate) fn skew_for_test(root: &Path) -> u64 {
+        skew(root)
+    }
+    /// The skew of the root that contains `path`, or zero.
+    pub(super) fn skew(path: &Path) -> u64 {
+        SKEWS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(root, _)| path.starts_with(root))
+            .map_or(0, |(_, skew)| *skew)
+    }
 }
 
 #[cfg(test)]

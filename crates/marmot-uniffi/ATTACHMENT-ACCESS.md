@@ -239,23 +239,26 @@ for opted-in jobs, while a full database withdraws the receipt and parks the job
 free-disk check runs as soon as the size is known, as the body grows and again before the
 receipt; a shortage, or a full database during publication, parks the job as `StorageBlocked`
 without recording successful acquisition and keeps its checkpoint, which also keeps its quota
-reservation and is refreshed past the 24-hour idle expiry until retry, removal or completion
-(cancellation lets it expire). When the whole body had already arrived, the in-memory sink
+reservation, for at most seven days after the latest park. Readmission and both explicit Retry
+paths refresh the checkpoint's 24-hour idle expiry, so a park longer than a day still resumes
+from it; cancellation lets it expire, and past seven days it is pruned while the job stays
+parked and later starts the body over. If the database cannot record even the park, the worker
+keeps it in memory and writes it on a later tick. When the whole body had already arrived, the in-memory sink
 checkpoints the complete ciphertext when the server gave a strong validator, so its readmitted
 attempt publishes without another request; a receipt-time park re-requests only the unsaved
 tail, and a body without a validator is fetched again. The file sink keeps every saved
 1 MiB checkpoint when the server gave a strong validator and re-requests at most the unsaved
-tail; without one it starts over, and a body with neither length nor validator doubles its
-recorded target across consecutive parks so it is refetched a logarithmic number of times as
-space creeps up. No timer refetches while parked: the job records the free space it needs
+tail; without one it starts over. A body with neither length nor validator records the largest
+need any attempt proved, never more, so it readmits as soon as that much is free; its restarts
+are bounded in time by the park streak below. No timer refetches while parked: the job records the free space it needs
 beyond the reserve (the body plus the staging and checkpoint bytes a retry occupies; after a
 full database, at least the free space seen at the refusal plus the body, so readmission waits
 until the volume actually gains room), the worker
 readmits it once free space exceeds that by a 4 MiB margin and admission would pass, a job that
 parks again waits out its park streak (15 s, doubling to an hour, reset by explicit Retry,
 checkpoint progress and completion) before it is due, and explicit Retry readmits it
-immediately without inherited delay. Storage parks refund the automatic-history claim they
-consumed. Resource pressure before fetching can defer admission without spending an attempt. If receipt storage fails, the persisted budgets still bound
+immediately without inherited delay. Only storage-owned parks advance the streak. Storage parks
+refund the automatic-history claim and the network-backoff claim streak they consumed. Resource pressure before fetching can defer admission without spending an attempt. If receipt storage fails, the persisted budgets still bound
 subsequent fetches. A size-policy failure remains `PolicyBlocked` even if the budget
 is exhausted; raising the size cap does not replenish that budget, so explicit retry
 may also be needed.

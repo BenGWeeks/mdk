@@ -360,9 +360,9 @@ impl SqliteAccountStorage {
         if !matches_store(&conn, reference)? {
             return Ok(false);
         }
-        // Cancelling clears the storage-park marker, so the kept prefix expires
-        // and is pruned like any other cancelled checkpoint.
-        Ok(conn.execute("UPDATE attachment_acquisition SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0,storage_blocked_headroom=NULL
+        // Cancelling clears the storage-park marker and streak, so the kept
+        // prefix expires and is pruned like any other cancelled checkpoint.
+        Ok(conn.execute("UPDATE attachment_acquisition SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0
             WHERE token=?1 AND state<>3",[&reference.token]).storage()?==1)
     }
 
@@ -470,6 +470,8 @@ impl SqliteAccountStorage {
     }
 
     /// Explicit retry also admits a queued automatic job while automatic work is disabled.
+    /// Retrying a storage-parked job refreshes its prefix's idle expiry, so a
+    /// park longer than a day still resumes from the kept checkpoint.
     pub fn explicitly_retry_attachment(
         &self,
         reference: &AttachmentAssetRef,
@@ -478,9 +480,14 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
             if !matches_store(&conn,reference)? {return Ok(false);}
-            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
+            let parked = partial::storage_parked(&conn, &reference.token)?;
+            let retried = conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
                 WHERE token=?1 AND (state IN(0,1,2,4,5) OR (state=3 AND NOT EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token))) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?2)"),
-                params![reference.token,u64_to_i64(now)?]).storage()?==1)
+                params![reference.token,u64_to_i64(now)?]).storage()?==1;
+            if retried && parked {
+                partial::refresh_partial_expiry(&conn, &reference.token, now)?;
+            }
+            Ok(retried)
         })
     }
 
@@ -581,23 +588,40 @@ impl SqliteAccountStorage {
     /// cover. `headroom` is the free space beyond the policy reserve the next
     /// attempt needs: the check that failed plus this attempt's own staging and
     /// checkpoint bytes, which the worker's free-space frame does not see.
-    /// `restart_cap` is set when the next attempt restarts from zero (no
-    /// checkpoint): the recorded target then doubles across consecutive parks,
-    /// up to the cap, so full refetches grow logarithmically with the body.
+    ///
+    /// `restarts` marks an attempt whose successor starts the body over (no
+    /// length and no validator). Its target is the largest need any attempt
+    /// has proven (`storage_park_floor`), never more: a restart only learns a
+    /// lower bound of the body, so a doubled target could exceed what the body
+    /// needs and block a job that would fit. Refetches of such a body are
+    /// bounded in time by the park streak instead, and each one also needs
+    /// free space past the proven target plus the readmission margin.
+    ///
     /// Partial ciphertext keeps its reservation and gets a fresh idle expiry,
-    /// the claim that parked is refunded to the automatic-history budget, and
-    /// the park streak advances. A receipt recorded before a full database
-    /// refused publication is withdrawn, since no body was retained, so the
-    /// readmitted attempt is not ended as an unretained completed body. A
-    /// permission-paused attempt parks under its permission owner (state 5)
-    /// without a storage target.
+    /// the claim that parked is refunded to the automatic-history budget and
+    /// to the claim streak that drives network-failure backoff, and a receipt
+    /// recorded before a full database refused publication is withdrawn,
+    /// since no body was retained. A permission-paused attempt parks under its
+    /// permission owner (state 5) without a storage target, park streak or
+    /// floor.
+    ///
+    /// The write changes fixed-size columns of one existing row and the
+    /// parked-row index, so it rarely needs a new database page; when even it
+    /// cannot be recorded, the worker keeps the park in memory and retries it.
     pub fn block_attachment_storage(
         &self,
         job: &AttachmentAcquisition,
         headroom: u64,
-        restart_cap: Option<u64>,
+        restarts: bool,
         now: u64,
     ) -> StorageResult<bool> {
+        // Consumed outside the transaction, which the failure rolls back.
+        #[cfg(any(test, feature = "test-support"))]
+        if take_storage_park_fault(&*self.lock()?)? {
+            return Err(StorageError::Capacity(
+                "injected storage park write failure".into(),
+            ));
+        }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if !matches_store(&conn, &job.reference)? {
@@ -606,18 +630,21 @@ impl SqliteAccountStorage {
             let parked = conn
                 .execute(
                     "UPDATE attachment_acquisition SET
-                    storage_park_floor=max(?3,CASE WHEN ?4 IS NULL THEN 0 ELSE min(?4,storage_park_floor*2) END),
+                    storage_park_floor=CASE WHEN permission_paused=1 THEN storage_park_floor
+                        WHEN ?4 THEN max(?3,storage_park_floor) ELSE ?3 END,
                     storage_blocked_headroom=CASE WHEN permission_paused=1 THEN NULL
-                        ELSE max(?3,CASE WHEN ?4 IS NULL THEN 0 ELSE min(?4,storage_park_floor*2) END) END,
+                        WHEN ?4 THEN max(?3,storage_park_floor) ELSE ?3 END,
                     state=CASE WHEN permission_paused=1 THEN 5 ELSE 4 END,due=NULL,attempt=NULL,
-                    storage_park_count=min(storage_park_count+1,2147483647),
+                    storage_park_count=CASE WHEN permission_paused=1 THEN storage_park_count
+                        ELSE min(storage_park_count+1,2147483647) END,
+                    attempts=max(0,attempts-1),
                     acquisition_attempts=max(0,acquisition_attempts-automatic_history),body_completed=0
                     WHERE token=?1 AND state=1 AND attempt=?2",
                     params![
                         job.reference.token,
                         job.attempt,
                         u64_to_i64(headroom)?,
-                        restart_cap.map(u64_to_i64).transpose()?
+                        restarts
                     ],
                 )
                 .storage()?
@@ -634,6 +661,24 @@ impl SqliteAccountStorage {
             }
             Ok(parked)
         })
+    }
+
+    /// Make the next `times` storage-park writes on this connection fail with
+    /// a capacity error, as a truly full disk can. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_storage_parks_for_test(&self, times: u32) -> StorageResult<()> {
+        let conn = self.lock()?;
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS test_storage_park_faults(remaining INTEGER NOT NULL);
+             DELETE FROM temp.test_storage_park_faults;",
+        )
+        .storage()?;
+        conn.execute(
+            "INSERT INTO temp.test_storage_park_faults(remaining) VALUES(?1)",
+            [times],
+        )
+        .storage()?;
+        Ok(())
     }
 
     /// Remember that this body exceeds the in-memory bound, so a readmitted
@@ -927,4 +972,26 @@ pub(super) fn slot_media_type(slot: &str) -> String {
                 .find_map(|field| field.strip_prefix("m ").map(str::to_owned))
         })
         .unwrap_or_default()
+}
+
+/// Consume one injected storage-park write failure, if any are armed.
+#[cfg(any(test, feature = "test-support"))]
+fn take_storage_park_fault(conn: &rusqlite::Connection) -> StorageResult<bool> {
+    let armed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name='test_storage_park_faults')",
+            [],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if !armed {
+        return Ok(false);
+    }
+    Ok(conn
+        .execute(
+            "UPDATE temp.test_storage_park_faults SET remaining=remaining-1 WHERE remaining>0",
+            [],
+        )
+        .storage()?
+        == 1)
 }

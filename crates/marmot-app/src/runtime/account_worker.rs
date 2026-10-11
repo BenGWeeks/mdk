@@ -1668,6 +1668,7 @@ async fn run_app_runtime_account_worker(
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
         worker_lifetime: media_http_worker_lifetime,
+        pending_storage_parks: Default::default(),
     };
     let mut pending = deferred
         .into_iter()
@@ -3828,6 +3829,8 @@ struct MediaHttpContext {
     /// Never sends a value. Dropping the worker-owned sender closes every
     /// receiver and cancels active HTTP futures on every worker exit path.
     worker_lifetime: watch::Sender<()>,
+    /// Storage parks the database could not record yet; retried each tick.
+    pending_storage_parks: attachments::PendingStorageParks,
 }
 
 struct MediaHttpDone {
@@ -4062,6 +4065,7 @@ async fn complete_media_http(
                 let storage = client.app.account_storage(&client.state.label);
                 let fallback = super::attachment_controls::default_policy(&client.app.config);
                 let directory = client.app.account_dir(&client.state.label);
+                let pending = media_http.pending_storage_parks.clone();
                 let tx = media_http.tx.clone();
                 let lifetime = media_http.worker_lifetime.subscribe();
                 let lifecycle = shared.lifecycle();
@@ -4073,6 +4077,7 @@ async fn complete_media_http(
                             &storage,
                             &fallback,
                             &directory,
+                            &pending,
                             &job,
                             Ok(crate::client::AcquiredMediaBody::File(file)),
                             byte_budget,
@@ -4090,7 +4095,15 @@ async fn complete_media_http(
                 });
                 return;
             }
-            if attachments::complete_acquired(client, &job, result, byte_budget).is_err() {
+            if attachments::complete_acquired(
+                client,
+                &media_http.pending_storage_parks,
+                &job,
+                result,
+                byte_budget,
+            )
+            .is_err()
+            {
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
                     "attachment completion failed; durable lease permits recovery");
             }
@@ -8157,6 +8170,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(limit)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 worker_lifetime,
+                pending_storage_parks: Default::default(),
             },
             rx,
         )
@@ -9376,6 +9390,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 worker_lifetime: media_http_worker_lifetime,
+                pending_storage_parks: Default::default(),
             };
             let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
             let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
@@ -10274,6 +10289,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 worker_lifetime,
+                pending_storage_parks: Default::default(),
             };
             let (command_tx, mut commands) = mpsc::channel(4);
             let mut pending = VecDeque::new();

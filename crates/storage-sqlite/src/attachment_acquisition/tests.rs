@@ -2886,7 +2886,7 @@ fn column(store: &SqliteAccountStorage, asset: &AttachmentAssetRef, name: &str) 
 fn park(store: &SqliteAccountStorage, job: &AttachmentAcquisition, headroom: u64, now: u64) {
     assert!(
         store
-            .block_attachment_storage(job, headroom, None, now)
+            .block_attachment_storage(job, headroom, false, now)
             .unwrap()
     );
 }
@@ -2930,7 +2930,7 @@ fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
     park(&store, &job, 8192, 12);
     assert!(
         !store
-            .block_attachment_storage(&job, 8192, None, 12)
+            .block_attachment_storage(&job, 8192, false, 12)
             .unwrap(),
         "only the live attempt parks"
     );
@@ -2955,7 +2955,7 @@ fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
     store.cancel_attachment_acquisition(&cancelled).unwrap();
     assert!(
         !store
-            .block_attachment_storage(&cancelled_job, 1, None, 12)
+            .block_attachment_storage(&cancelled_job, 1, false, 12)
             .unwrap()
     );
     let sized = request(&store, "size");
@@ -3221,8 +3221,8 @@ fn permission_transitions_clear_the_storage_marker() {
     );
     let now = due(&store, &asset).unwrap();
     assert_eq!(
-        now, 57,
-        "the second park's readmission delay survives permission parking"
+        now, 43,
+        "a permission-owned park does not count toward the park streak"
     );
     let job = store
         .claim_attachment_acquisition(&asset, now, now + 100)
@@ -3270,26 +3270,36 @@ fn storage_parks_do_not_spend_the_automatic_history_budget() {
     );
 }
 
-/// A body that restarts from zero doubles its recorded target across
-/// consecutive parks, capped at the sink's largest body, so full refetches
-/// grow logarithmically with the body instead of once per MiB of free space.
+/// A body that starts over on every attempt (no length, no validator) only
+/// proves a lower bound of its need, so its recorded target is the largest
+/// need any attempt proved, never a multiple of it. Free space at the true need
+/// therefore always readmits it: with 440 MiB free, a 100 MiB body that needs
+/// 500 MiB parks twice and must not then ask for 880 MiB. Refetches are
+/// bounded in time instead: each readmission waits out the park streak,
+/// 15 s doubling to an hour.
 #[test]
-fn restart_parks_double_the_recorded_target_up_to_the_cap() {
+fn restart_parks_record_the_largest_proven_need_and_back_off() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "chunked");
     let asset = request(&store, "chunked");
     let mib = 1024 * 1024;
-    let cap = 100 * mib;
     let mut now = 12;
-    let mut expected = vec![];
+    let mut delays = vec![];
+    // Projections in MiB as free space trickles in; a later attempt that
+    // parked earlier (space shrank meanwhile) proves nothing new.
     for (projection, target) in [
-        (5 * mib, 5 * mib),
-        (6 * mib, 10 * mib),
-        (9 * mib, 20 * mib),
-        (45 * mib, 45 * mib),
-        (46 * mib, 90 * mib),
-        (50 * mib, 100 * mib),
-        (51 * mib, 100 * mib),
+        (445, 445),
+        (470, 470),
+        (460, 470),
+        (480, 480),
+        (485, 485),
+        (486, 486),
+        (487, 487),
+        (488, 488),
+        (489, 489),
+        (490, 490),
+        (491, 491),
+        (492, 492),
     ] {
         let job = store
             .claim_attachment_acquisition(&asset, now, now + 100)
@@ -3297,33 +3307,204 @@ fn restart_parks_double_the_recorded_target_up_to_the_cap() {
             .unwrap();
         assert!(
             store
-                .block_attachment_storage(&job, projection, Some(cap), now)
+                .block_attachment_storage(&job, projection * mib, true, now)
                 .unwrap()
         );
-        expected.push(target as i64);
-        assert_eq!(parked_headroom(&store, &asset), Some(target as i64));
-        assert_eq!(readmit(&store, now + 1, 0, u64::MAX, true), 1);
-        now = due(&store, &asset).unwrap() + 1;
+        assert_eq!(parked_headroom(&store, &asset), Some((target * mib) as i64));
+        // The body's true need, 500 MiB, always readmits it.
+        assert!(target <= 500);
+        assert_eq!(readmit(&store, now, 0, fits(target * mib) - 1, true), 0);
+        assert_eq!(readmit(&store, now, 0, fits(500 * mib), true), 1);
+        let next = due(&store, &asset).unwrap();
+        delays.push(next - now);
+        now = next;
     }
-    // A park that can resume does not double, and explicit retry forgets the floor.
+    assert_eq!(
+        delays,
+        [0, 15, 30, 60, 120, 240, 480, 960, 1920, 3600, 3600, 3600],
+        "restarts are spaced by the park streak, never more than one an hour once it saturates"
+    );
+    // A park that can resume records its own need, even below the floor, and
+    // explicit retry forgets the floor and the streak.
     let job = store
         .claim_attachment_acquisition(&asset, now, now + 100)
         .unwrap()
         .unwrap();
-    park(&store, &job, 7 * mib, now);
+    assert!(
+        store
+            .block_attachment_storage(&job, 7 * mib, false, now)
+            .unwrap()
+    );
     assert_eq!(parked_headroom(&store, &asset), Some(7 * mib as i64));
     assert!(store.retry_attachment_acquisition(&asset, now + 1).unwrap());
     assert_eq!(column(&store, &asset, "storage_park_floor"), Some(0));
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
     let job = store
         .claim_attachment_acquisition(&asset, now + 1, now + 200)
         .unwrap()
         .unwrap();
     assert!(
         store
-            .block_attachment_storage(&job, 5 * mib, Some(cap), now + 1)
+            .block_attachment_storage(&job, 5 * mib, true, now + 1)
             .unwrap()
     );
     assert_eq!(parked_headroom(&store, &asset), Some(5 * mib as i64));
+}
+
+/// An explicit Retry of a job parked for longer than the idle expiry resumes
+/// from its kept prefix through either retry API, instead of pruning it and
+/// refetching the body from zero.
+#[test]
+fn retry_after_a_park_longer_than_a_day_keeps_the_prefix() {
+    for explicit in [false, true] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed(&store, "parked");
+        let asset = request(&store, "parked");
+        let job = store
+            .claim_attachment_acquisition(&asset, 12, 100)
+            .unwrap()
+            .unwrap();
+        store
+            .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+            .unwrap();
+        park(&store, &job, 8192, 12);
+        let later = 12 + 72 * 60 * 60;
+        assert_eq!(
+            store.prune_attachment_partials(later, 64).unwrap(),
+            0,
+            "parked prefixes are exempt"
+        );
+        if explicit {
+            assert!(store.explicitly_retry_attachment(&asset, later).unwrap());
+        } else {
+            assert!(store.retry_attachment_acquisition(&asset, later).unwrap());
+        }
+        assert_eq!(
+            store.prune_attachment_partials(later, 64).unwrap(),
+            0,
+            "the next tick prunes nothing once the row is queued"
+        );
+        let job = store
+            .claim_attachment_acquisition(&asset, later, later + 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .attachment_partial_extent(&job, later, (&[1; 32], &[2; 32]))
+                .unwrap(),
+            Some((10, 3)),
+            "explicit={explicit}"
+        );
+        assert_eq!(
+            store
+                .load_attachment_partial(&job, later, 100, Some((&[1; 32], &[2; 32])))
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"abc"
+        );
+    }
+}
+
+/// A storage-parked prefix is kept for at most a week after its latest park:
+/// past that it is pruned and releases its quota reservation, while the row
+/// stays parked and simply starts the body over when it is readmitted.
+#[test]
+fn storage_parked_prefixes_expire_after_the_maximum_parked_age() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "stale");
+    let asset = request(&store, "stale");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    park(&store, &job, 8192, 12);
+    let reserved = |store: &SqliteAccountStorage| -> u64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1",
+                [],
+                |r| nonnegative(r, 0),
+            )
+            .unwrap()
+    };
+    assert_eq!(reserved(&store), 10);
+    let limit = 12 + STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS;
+    assert_eq!(store.prune_attachment_partials(limit - 1, 64).unwrap(), 0);
+    assert_eq!(partial_usage(&store), 3);
+    assert_eq!(store.prune_attachment_partials(limit, 64).unwrap(), 1);
+    assert_eq!(partial_usage(&store), 0);
+    assert_eq!(reserved(&store), 0, "the quota reservation is released");
+    assert_eq!(
+        transfer(&store, "stale", true).state,
+        AttachmentTransferState::StorageBlocked,
+        "the row stays parked without its prefix"
+    );
+    assert_eq!(readmit(&store, limit, 0, u64::MAX, true), 1);
+}
+
+/// A permission-owned park neither advances the storage park streak nor sets
+/// a floor, cancellation clears both, and every park refunds the claim streak
+/// so a later network failure backs off as if the parks never happened.
+#[test]
+fn storage_park_streak_counts_only_storage_owned_parks() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "streak");
+    let asset = request(&store, "streak");
+    for now in [12, 13] {
+        let job = store
+            .claim_attachment_acquisition(&asset, now, now + 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(column(&store, &asset, "attempts"), Some(1));
+        assert!(
+            store
+                .block_attachment_storage(&job, 8192, true, now)
+                .unwrap()
+        );
+        assert_eq!(
+            column(&store, &asset, "attempts"),
+            Some(0),
+            "the park refunds its claim"
+        );
+        assert_eq!(readmit(&store, now, 0, u64::MAX, true), 1);
+        sql(&store, "UPDATE attachment_acquisition SET due=0");
+    }
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(2));
+    assert_eq!(column(&store, &asset, "storage_park_floor"), Some(8192));
+    let job = store
+        .claim_attachment_acquisition(&asset, 14, 100)
+        .unwrap()
+        .unwrap();
+    store.pause_automatic_attachments(14).unwrap();
+    assert!(
+        store
+            .block_attachment_storage(&job, 1 << 20, true, 14)
+            .unwrap()
+    );
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(2));
+    assert_eq!(column(&store, &asset, "storage_park_floor"), Some(8192));
+    assert_eq!(column(&store, &asset, "attempts"), Some(0));
+    assert_eq!(
+        store.resume_permitted_attachments(15, [true; 4]).unwrap(),
+        1
+    );
+    sql(&store, "UPDATE attachment_acquisition SET due=0");
+    // A network failure after the parks backs off from one claim, not four.
+    let job = store
+        .claim_attachment_acquisition(&asset, 15, 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(column(&store, &asset, "attempts"), Some(1));
+    store.fail_attachment_acquisition(&job, Some(30)).unwrap();
+    store.cancel_attachment_acquisition(&asset).unwrap();
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
+    assert_eq!(column(&store, &asset, "storage_park_floor"), Some(0));
 }
 
 /// A verified-body shortage under a revoked automatic permission parks under
@@ -3495,6 +3676,49 @@ fn publication_into_a_full_database_commits_nothing_and_reports_capacity() {
         store.retained_attachment_byte_count().unwrap(),
         body.len() as u64
     );
+}
+
+/// On a database that cannot grow by a single page, a refused publication
+/// still parks: the park rewrites fixed-size columns of an existing row and
+/// the checkpoint's expiry, and needs no new page.
+#[test]
+fn storage_park_needs_no_new_page_after_a_full_publication() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "full");
+    let asset = request(&store, "full");
+    let body: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let digest: [u8; 32] = Sha256::digest(&body).into();
+    sql(
+        &store,
+        &format!(
+            "UPDATE attachment_acquisition SET plaintext_digest=x'{}'",
+            hex::encode(digest)
+        ),
+    );
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    store.limit_database_pages_for_test(0).unwrap();
+    assert!(matches!(
+        store.complete_attachment_acquisition(&job, &body, 13, 1 << 40),
+        Err(StorageError::Capacity(_))
+    ));
+    assert!(
+        store
+            .block_attachment_storage(&job, 4 * body.len() as u64, false, 13)
+            .unwrap(),
+        "the park write fits without a new page"
+    );
+    assert_eq!(
+        transfer(&store, "full", true).state,
+        AttachmentTransferState::StorageBlocked
+    );
+    assert_eq!(partial_usage(&store), 3);
+    store.limit_database_pages_for_test(1 << 30).unwrap();
 }
 
 /// A job that learned it needs the file sink carries that into every later

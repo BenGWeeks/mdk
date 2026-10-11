@@ -3,13 +3,17 @@
 //! readmits once free space covers its recorded target or the user retries.
 //!
 //! Free space is pinned per account directory through the test seam in
-//! `attachment_resume`, so the window tests place it exactly where the first
-//! implementation looped: above the admission reserve and the bare `4 x body`
-//! publication check, but below what the attempt's own staging and
-//! checkpoints add on top. The row must park once and stay parked across
-//! scheduler ticks until space frees.
+//! `attachment_resume`, which models a volume: the pinned figure is free space
+//! in the worker's frame, and an attempt's own staging files and checkpoint
+//! growth consume it as the attempt writes them. The window tests place it
+//! exactly where the first implementation looped: above the admission reserve
+//! and the bare `4 x body` publication check, but below what the attempt's own
+//! staging and checkpoints add on top. The row must park once and stay parked
+//! across scheduler ticks until space frees. The scheduler's clock can run
+//! ahead of wall time, so readmission backoffs are crossed without sleeping.
 use super::*;
 use crate::media::attachment_resume::test_free_space;
+use crate::runtime::account_worker::attachments::test_clock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::{AttachmentTransferState, STORAGE_READMIT_MARGIN_BYTES};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,6 +35,7 @@ struct Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         test_free_space::clear(self._dir.path());
+        test_clock::clear(self._dir.path());
     }
 }
 
@@ -117,23 +122,6 @@ impl Fixture {
             .expect("attachment completion")
             .unwrap()
     }
-    /// Tick until a readmitted row becomes due and its attempt completes; a
-    /// repeated park waits out its park streak first.
-    async fn completion_after_backoff(&mut self) -> MediaHttpDone {
-        let started = tokio::time::Instant::now();
-        loop {
-            self.tick().await;
-            if let Ok(done) =
-                tokio::time::timeout(Duration::from_secs(2), self.completions.recv()).await
-            {
-                return done.unwrap();
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(240),
-                "no completion within the park streak backoff"
-            );
-        }
-    }
     fn status(&self) -> storage_sqlite::AttachmentTransferStatus {
         self.storage
             .attachment_transfer_status(
@@ -150,9 +138,30 @@ impl Fixture {
     fn state(&self) -> AttachmentTransferState {
         self.status().state
     }
-    /// Pin the free space every capacity decision and readmission will see.
+    /// Pin free space in the worker's frame; the attempt's own staging and
+    /// checkpoint growth are charged against it as they happen.
     fn set_free(&self, free: u64) {
-        test_free_space::set(self._dir.path(), free);
+        test_free_space::set_modeled(
+            self._dir.path(),
+            free,
+            &crate::media::file_transfer::media_staging_directory(
+                &self.client.app,
+                &self.client.state.label,
+            ),
+            &self.storage,
+        );
+    }
+    /// Run the scheduler `seconds` ahead, past a readmission backoff.
+    fn advance(&self, seconds: u64) {
+        test_clock::advance(self._dir.path(), seconds);
+    }
+    /// The parked row's readmission due time, in the scheduler's clock.
+    fn due(&self) -> Option<u64> {
+        self.storage
+            .attachment_acquisition_status(&self.status().reference.unwrap())
+            .unwrap()
+            .unwrap()
+            .due
     }
     /// Take the parked completion, then prove the row stays parked and silent
     /// across scheduler ticks. Returns the recorded headroom.
@@ -465,15 +474,17 @@ async fn memory_sink_with_validator_parks_at_the_header_inside_the_loop_window()
     server.await.unwrap();
 }
 
-/// File sink, chunked body with neither length nor validator: the job parks
-/// mid-transfer at the first checkpoint boundary its staging cannot cover and
-/// does not refetch until space frees. Such a body restarts from zero, so each
-/// later park records at least twice the previous target and a disk that
-/// empties exactly as fast as each park asks is refetched a logarithmic number
-/// of times, not once per few MiB.
+/// File sink, chunked body with neither length nor validator, on a disk that
+/// frees exactly what each park asks for. Every attempt starts the body over
+/// and parks a little later. The recorded target is the largest need an
+/// attempt proved, so it never exceeds what the body really needs and the job
+/// publishes as soon as that much is free (a doubled target would demand more
+/// than the body needs and block it). Refetches are bounded in time: each
+/// readmission waits out the park streak, which the test crosses by running
+/// the scheduler's clock ahead instead of sleeping.
 #[tokio::test]
-async fn file_sink_with_unknown_length_restarts_a_logarithmic_number_of_times() {
-    let plain = vec![0x7c; 16 * MIB as usize];
+async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
+    let plain = vec![0x7c; 8 * MIB as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (reference, cipher) = loopback_reference(&listener, &plain);
     let total = cipher.len() as u64;
@@ -490,20 +501,22 @@ async fn file_sink_with_unknown_length_restarts_a_logarithmic_number_of_times() 
         stopped,
     );
     let mut fixture = explicit_fixture(&reference, MIB).await;
-    // Twelve MiB of headroom: the reserve alone passes, the body trips the
-    // staged-bytes check a few checkpoints in.
+    // The reserve alone passes; the staged body trips the check a few MiB in.
     fixture.set_free(12 * MIB);
     fixture.tick().await;
     let mut target = fixture.park_and_hold(&requests).await;
-    assert!(
-        target >= 5 * MIB && target < 5 * total,
-        "the target projects the bytes received so far: {target}"
-    );
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     let mut parks = 1;
+    let mut delays = vec![];
     loop {
-        // One byte short of the recorded target keeps the row parked and
-        // silent, which pins the target the storage layer recorded.
+        // The body needs five of itself (staging plus the publication
+        // reserve); no recorded target may ask for more.
+        assert!(
+            target <= 5 * total,
+            "target {target} exceeds the body's need"
+        );
+        // One byte short of the recorded target keeps the row parked, which
+        // pins the target storage recorded: the attempt's own projection.
         fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES - 1);
         let before = requests.load(Ordering::SeqCst);
         fixture.tick().await;
@@ -512,16 +525,35 @@ async fn file_sink_with_unknown_length_restarts_a_logarithmic_number_of_times() 
         assert_eq!(requests.load(Ordering::SeqCst), before);
         // Free exactly what the last park asked for, as a slowly emptying disk would.
         fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES);
-        let done = fixture.completion_after_backoff().await;
+        schedule(
+            &fixture.client,
+            &fixture.shared,
+            &fixture.http,
+            &mut fixture.admission,
+        )
+        .unwrap();
+        assert_eq!(fixture.state(), AttachmentTransferState::Queued);
+        let now = crate::unix_now_seconds() + test_clock::skew_for_test(fixture._dir.path());
+        let due = fixture.due().unwrap();
+        delays.push(due - now);
+        if due > now {
+            // Not a moment earlier: a tick before the due time fetches nothing.
+            fixture.advance(due - now - 1);
+            fixture.tick().await;
+            assert!(fixture.completions.try_recv().is_err());
+            assert_eq!(requests.load(Ordering::SeqCst), before);
+            fixture.advance(1);
+        }
+        fixture.tick().await;
+        let done = fixture.completion().await;
         match &done.completion {
             MediaHttpCompletion::Attachment {
-                result: Err(AttachmentDownloadFailure::StorageBlocked { headroom, .. }),
+                result: Err(AttachmentDownloadFailure::StorageBlocked { headroom, restarts }),
                 ..
             } => {
-                // This attempt saw more bytes than the last one, and storage
-                // records at least twice the previous target.
+                assert!(restarts, "a body without length or validator starts over");
                 assert!(*headroom > target, "{headroom} after {target}");
-                target = (*headroom).max(2 * target);
+                target = *headroom;
                 parks += 1;
                 complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http)
                     .await;
@@ -546,124 +578,145 @@ async fn file_sink_with_unknown_length_restarts_a_logarithmic_number_of_times() 
             }
             _ => panic!("unexpected completion"),
         }
-        assert!(parks <= 4, "parks must stay logarithmic in the body size");
+        assert!(parks <= 16, "each restart must get further than the last");
     }
-    // Twelve MiB of headroom against a 16 MiB body: targets of 20, 40 and
-    // 80 MiB reach the 64 MiB the body needs in three parks, where recording
-    // only each attempt's own projection (20, 35, 50, 70 MiB) took four.
-    assert_eq!(parks, 3);
+    // Readmissions are spaced by the park streak: the first at once, then
+    // 15 s doubling, so a trickling disk cannot drive refetches faster.
+    let streak: Vec<u64> = (1..=parks as u32)
+        .map(|count| {
+            if count <= 1 {
+                0
+            } else {
+                (15u64 << (count - 2).min(8)).min(3600)
+            }
+        })
+        .collect();
+    assert_eq!(delays, streak);
+    assert!(
+        parks >= 3,
+        "the trickle must exercise the streak: {parks} parks"
+    );
     assert_eq!(
         requests.load(Ordering::SeqCst),
-        2 + parks,
-        "one request per restart after the first probe"
+        1 + parks + 1,
+        "the header probe, one request per park, and the publishing attempt"
     );
     stop.send(()).unwrap();
     server.await.unwrap();
 }
 
-/// File sink with a strong validator and a saved prefix: a job parked by the
-/// mid-transfer check and readmitted at exactly its target plus the margin
-/// restores the prefix, resumes with a Range request and publishes without
-/// parking again.
+/// File sink with a strong validator, end to end: free space drops while the
+/// body is mid-transfer, so the mid-transfer check parks with `6T - S` in the
+/// worker's frame (four bodies, the staging and checkpoint still to grow, and
+/// the staging already held). Readmitted at exactly that target plus the
+/// margin, the attempt restores the saved prefix, finishes with one Range
+/// request and publishes without parking again. A target that dropped the
+/// held staging or the remaining checkpoint growth would re-park here.
 #[tokio::test]
-async fn readmitted_file_checkpoint_resumes_without_parking_again() {
-    use crate::media::attachment_resume::AttachmentResume;
-    use sha2::{Digest, Sha256};
-    let plain = vec![0x5a; 20 * MIB as usize];
+async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
+    let plain = vec![0x5a; 16 * MIB as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (reference, cipher) = loopback_reference(&listener, &plain);
     let total = cipher.len() as u64;
     let requests = Arc::new(AtomicUsize::new(0));
-    let (stop, stopped) = oneshot::channel();
-    let server = serve(
-        listener,
-        cipher.clone(),
-        Framing {
-            etag: true,
-            chunked: false,
-        },
-        Arc::clone(&requests),
-        stopped,
-    );
+    let (proceed, gate) = watch::channel(false);
+    let first = 6 * MIB as usize;
+    let server = {
+        let requests = Arc::clone(&requests);
+        let cipher = cipher.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.fetch_add(1, Ordering::SeqCst);
+                let cipher = cipher.clone();
+                let mut gate = gate.clone();
+                tokio::spawn(async move {
+                    let request = request_headers(&mut socket).await;
+                    let range = request
+                        .lines()
+                        .find_map(|line| line.strip_prefix("range: bytes="))
+                        .and_then(|value| value.trim_end_matches('-').parse::<usize>().ok());
+                    if let Some(start) = range {
+                        let _ = socket
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{}/{}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                                    cipher.len() - start,
+                                    cipher.len() - 1,
+                                    cipher.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let _ = socket.write_all(&cipher[start..]).await;
+                        return;
+                    }
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                                cipher.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    if socket.write_all(&cipher[..first]).await.is_err() {
+                        return;
+                    }
+                    // A little past the last whole checkpoint, then hold the
+                    // rest until released.
+                    if socket
+                        .write_all(&cipher[first..first + 4096])
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let _ = gate.wait_for(|released| *released).await;
+                    let _ = socket.write_all(&cipher[first + 4096..]).await;
+                });
+            }
+        })
+    };
     let mut fixture = explicit_fixture(&reference, MIB).await;
-    let now = crate::unix_now_seconds();
-    let asset = fixture
-        .storage
-        .due_attachment_acquisitions(now, 1)
-        .unwrap()
-        .remove(0);
-    let job = fixture
-        .storage
-        .claim_attachment_acquisition(&asset, now, now + 1200)
-        .unwrap()
-        .unwrap();
-    let digest: [u8; 32] = hex::decode(&reference.ciphertext_sha256)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let identity = storage_sqlite::AttachmentPartialIdentity {
-        ciphertext_digest: digest,
-        locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
-        etag: "\"v1\"".into(),
-        total,
-    };
-    let saved = 16 * MIB;
-    for i in 0..16u64 {
+    fixture.tick().await;
+    // Wait on the saved checkpoints, which track processed bytes exactly,
+    // rather than on throttled progress reports.
+    let started = tokio::time::Instant::now();
+    while fixture.storage.attachment_partial_bytes_for_test().unwrap() < first as u64 {
         assert!(
-            fixture
-                .storage
-                .checkpoint_attachment_partial(
-                    &job,
-                    &identity,
-                    i * MIB,
-                    &cipher[(i * MIB) as usize..((i + 1) * MIB) as usize],
-                    now,
-                    fixture.policy.retained_bytes,
-                )
-                .unwrap()
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            fixture.status()
         );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    // The file sink's mid-transfer check with L bytes staged and S saved.
-    let context = Arc::new(AttachmentResume {
-        explicit_permission: Default::default(),
-        automatic: false,
-        permission: None,
-        finishing: Default::default(),
-        updates: None,
-        storage: fixture.storage.clone(),
-        job: job.clone(),
-        ciphertext_digest: digest,
-        budget: fixture.policy.retained_bytes,
-        directory: fixture.client.app.account_dir(&fixture.client.state.label),
-        policy: fixture.policy.clone(),
-    });
-    let staged = saved + MIB / 2;
-    fixture.set_free(0);
-    let parked = context
-        .publication_capacity(total, (total - staged) + (total - saved), staged, None)
-        .await;
-    let Err(AttachmentDownloadFailure::StorageBlocked { headroom, .. }) = parked else {
-        panic!("expected a park");
-    };
-    assert_eq!(headroom, 6 * total - saved);
-    assert!(
-        fixture
-            .storage
-            .block_attachment_storage(&job, headroom, None, now)
-            .unwrap()
+    // Something else fills the disk: enough left for checkpoint writes, not
+    // for the publication reserve.
+    fixture.set_free(32 * MIB);
+    proceed.send(true).unwrap();
+    let done = fixture.completion().await;
+    let headroom = parked_headroom(&done);
+    let saved = fixture.storage.attachment_partial_bytes_for_test().unwrap();
+    assert!(saved >= 6 * MIB && saved < total, "saved {saved}");
+    assert_eq!(
+        headroom,
+        6 * total - saved,
+        "four bodies, the staging and checkpoint growth, and the held staging"
     );
+    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
+    let before = requests.load(Ordering::SeqCst);
     // Exactly the recorded target plus the margin, in the worker's frame.
     fixture.set_free(headroom + STORAGE_READMIT_MARGIN_BYTES);
     fixture.tick().await;
     fixture.publish_file(&plain).await;
     assert_eq!(
         requests.load(Ordering::SeqCst),
-        1,
-        "the checkpoint gate selects the file sink and one Range request finishes the body"
+        before + 1,
+        "the remembered file sink restores the prefix and one Range request finishes the body"
     );
-    stop.send(()).unwrap();
-    server.await.unwrap();
+    server.abort();
 }
 
 /// Space shrinks after the whole body has arrived: the in-memory sink
@@ -851,9 +904,10 @@ async fn file_publication_into_a_full_database_parks_until_room_returns() {
     .await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
     assert_eq!(fixture.storage.retained_attachment_byte_count().unwrap(), 0);
-    // Measured with the decrypted file still on disk, which the worker's
-    // frame gets back once the attempt drops it.
-    let target = free + 2 * plain.len() as u64;
+    // The refusal saw the pinned space less the decrypted file it held; the
+    // worker's frame gets that file back, so the target is the refusal's own
+    // free space plus one more body.
+    let target = free + plain.len() as u64;
     fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES - 1);
     fixture.tick().await;
     assert!(fixture.completions.try_recv().is_err());
@@ -867,6 +921,61 @@ async fn file_publication_into_a_full_database_parks_until_room_returns() {
     fixture.tick().await;
     fixture.publish_file(&plain).await;
     assert_eq!(requests.load(Ordering::SeqCst), 3);
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+/// On a truly full disk even the park write can fail. The worker keeps the
+/// park in memory while the attempt's lease fences the row, records it on the
+/// next tick, and nothing is refetched in between.
+#[tokio::test]
+async fn a_park_the_database_refuses_is_recorded_on_the_next_tick() {
+    let plain = vec![0x46; (2 * MIB + 9) as usize];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (reference, cipher) = loopback_reference(&listener, &plain);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let (stop, stopped) = oneshot::channel();
+    let server = serve(
+        listener,
+        cipher,
+        Framing {
+            etag: false,
+            chunked: false,
+        },
+        Arc::clone(&requests),
+        stopped,
+    );
+    let mut fixture = explicit_fixture(&reference, 4 * MIB).await;
+    fixture.set_free(16 * MIB);
+    fixture.tick().await;
+    let done = fixture.completion().await;
+    fixture.storage.limit_database_pages_for_test(16).unwrap();
+    fixture.storage.fail_next_storage_parks_for_test(1).unwrap();
+    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    assert_eq!(
+        fixture.state(),
+        AttachmentTransferState::VerifyingPlaintext,
+        "the refused park leaves the leased attempt in place"
+    );
+    assert_eq!(fixture.storage.retained_attachment_byte_count().unwrap(), 0);
+    let mut updates = fixture.shared.attachment_updates.subscribe();
+    updates.borrow_and_update();
+    fixture.tick().await;
+    assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
+    assert!(
+        updates.has_changed().unwrap(),
+        "the recorded park wakes subscribers"
+    );
+    assert!(fixture.completions.try_recv().is_err());
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "nothing was refetched");
+    fixture
+        .storage
+        .limit_database_pages_for_test(1 << 30)
+        .unwrap();
+    fixture.set_free(PLENTY);
+    fixture.tick().await;
+    fixture.publish_memory(&plain).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
     stop.send(()).unwrap();
     server.await.unwrap();
 }
@@ -1001,60 +1110,94 @@ async fn a_remembered_file_sink_never_routes_automatic_work() {
 }
 
 /// An automatic body with no declared length grows its buffer geometrically
-/// but never past the transfer limit, instead of doubling to twice the limit.
-#[tokio::test]
-async fn automatic_unknown_length_body_never_grows_past_the_transfer_limit() {
-    let plain = vec![0x55; 3 * MIB as usize];
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (reference, cipher) = loopback_reference(&listener, &plain);
-    let requests = Arc::new(AtomicUsize::new(0));
-    let (stop, stopped) = oneshot::channel();
-    let server = serve(
-        listener,
-        cipher,
-        Framing {
-            etag: false,
-            chunked: true,
-        },
-        Arc::clone(&requests),
-        stopped,
-    );
-    // Unbounded doubling would land on 4 MiB for a 3 MiB body; the limit sits
-    // just above the body so the bound is observable.
-    let limit = 3 * MIB + 128 * 1024;
-    let mut fixture = fixture(&reference, limit, false).await;
-    fixture.tick().await;
-    let capacity = fixture.publish_memory(&plain).await;
-    assert!(
-        capacity as u64 <= limit,
-        "capacity {capacity} exceeds the transfer limit {limit}"
-    );
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
-    stop.send(()).unwrap();
-    server.await.unwrap();
+/// to half the transfer limit and then once to the limit: the buffer never
+/// exceeds the limit, and the copy while it grows never holds more than 1.5
+/// times it. Plain doubling would hold a 4 MiB buffer and its 4.125 MiB
+/// successor at once here, about twice the limit.
+#[test]
+fn automatic_unknown_length_body_stays_within_its_growth_bound() {
+    crate::tests::alloc_audit::measure(async {
+        use crate::tests::alloc_audit;
+        let plain = vec![0x55; (4 * MIB + 32 * 1024) as usize];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (reference, cipher) = loopback_reference(&listener, &plain);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (stop, stopped) = oneshot::channel();
+        let server = serve(
+            listener,
+            cipher,
+            Framing {
+                etag: false,
+                chunked: true,
+            },
+            Arc::clone(&requests),
+            stopped,
+        );
+        let limit = 4 * MIB + 128 * 1024;
+        let mut fixture = fixture(&reference, limit, false).await;
+        let baseline = alloc_audit::live();
+        alloc_audit::reset_peak();
+        fixture.tick().await;
+        let capacity = fixture.publish_memory(&plain).await;
+        let peak = alloc_audit::peak().saturating_sub(baseline).max(0) as u64;
+        eprintln!(
+            "MDK_BENCH attachment_unknown_length_growth limit={limit} rust_peak_bytes={peak}"
+        );
+        assert!(
+            capacity as u64 <= limit,
+            "capacity {capacity} exceeds the transfer limit {limit}"
+        );
+        // 1.5 times the limit for the growth copy, plus 1 MiB for the HTTP
+        // client's own buffers.
+        assert!(
+            peak <= limit * 3 / 2 + MIB,
+            "growth held {peak} bytes against a {limit} byte limit"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    });
 }
 
-/// mdk#2241: receiving through the in-memory sink holds about one body. The
-/// Rust heap peak of this test's own threads during an explicit 100 MiB
-/// download (reserve, checkpoint copies, in-place decryption, verification and
-/// publication) is the body plus a bounded allowance. SQLite's own peak for
-/// the publication step is measured by the storage-sqlite test binary.
+/// mdk#2241: an automatic download at the transfer limit (32 MiB here) holds
+/// one body plus a bounded allowance in the in-memory sink: the buffer is
+/// reserved once, decrypted in place and published through bounded BLOB
+/// writes. SQLite's own peak is measured by the storage-sqlite binary.
 #[test]
+fn automatic_receive_at_the_transfer_limit_holds_about_one_body() {
+    crate::tests::alloc_audit::measure(receive_peak(32 * MIB - 16, 32 * MIB, false, Sink::Memory));
+}
+
+/// mdk#2241: an explicit download above the transfer limit streams through the
+/// file sink and holds no body-sized buffer: staging, checkpoints, decryption
+/// and publication all run in bounded chunks.
+#[test]
+fn explicit_file_sink_receive_holds_no_body_sized_buffer() {
+    crate::tests::alloc_audit::measure(receive_peak(32 * MIB, 16 * MIB, true, Sink::File));
+}
+
+/// mdk#2241 acceptance size: an explicit 100 MiB body through the in-memory
+/// sink (transfer limit raised to 128 MiB). Ignored by default for its run
+/// time; the 32 MiB measurement covers the same path in the regular suite.
+#[test]
+#[ignore = "receives a 100 MiB body; run explicitly to measure"]
 fn explicit_in_memory_receive_of_one_hundred_mib_holds_about_one_body() {
     crate::tests::alloc_audit::measure(receive_peak(100 * MIB, 128 * MIB, true, Sink::Memory));
 }
 
-/// mdk#2241: an automatic download at the transfer limit holds about one body.
+/// mdk#2241 acceptance size: an automatic download at the default 64 MiB
+/// transfer limit. Ignored by default for its run time.
 #[test]
-fn automatic_receive_at_the_transfer_limit_holds_about_one_body() {
+#[ignore = "receives a 64 MiB body; run explicitly to measure"]
+fn automatic_receive_at_the_default_transfer_limit_holds_about_one_body() {
     crate::tests::alloc_audit::measure(receive_peak(64 * MIB - 16, 64 * MIB, false, Sink::Memory));
 }
 
-/// mdk#2241: with the default 64 MiB transfer limit, an explicit 100 MiB
-/// download streams through the file sink and holds no body-sized buffer at
-/// any point: staging, checkpoints, decryption and publication all run in
-/// bounded chunks.
+/// mdk#2241 acceptance size: with the default 64 MiB transfer limit, an
+/// explicit 100 MiB body streams through the file sink. Ignored by default for
+/// its run time and disk use.
 #[test]
+#[ignore = "receives a 100 MiB body; run explicitly to measure"]
 fn explicit_file_sink_receive_of_one_hundred_mib_holds_no_body_sized_buffer() {
     crate::tests::alloc_audit::measure(receive_peak(100 * MIB, 64 * MIB, true, Sink::File));
 }

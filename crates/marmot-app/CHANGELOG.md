@@ -103,22 +103,29 @@
   Retry readmits at once. With a strong validator, the in-memory sink
   checkpoints a body that had already arrived, so readmission publishes
   without another request, and the file sink re-requests at most its unsaved
-  sub-MiB tail; without one both restart, and a body with neither length nor
-  validator doubles its recorded target across consecutive parks so restarts
-  stay logarithmic. A full database records at least the free space seen at
+  sub-MiB tail; without one both restart. A body with neither length nor
+  validator records the largest need any attempt proved, never more, so it
+  readmits as soon as that much is free; its restarts are bounded in time by
+  the park streak. A full database records at least the free space seen at
   the refusal plus the body and withdraws the completed-body receipt, so the
   job readmits only once the volume gains room and automatic history is not
-  ended as an unretained body. Parked checkpoints keep their quota
-  reservation and are refreshed past the 24-hour idle expiry; cancellation
-  lets them expire. Storage parks refund the automatic-history claim they
-  consumed. Explicit bodies
+  ended as an unretained body; when the database cannot take even the park
+  write, the worker keeps the park in memory and records it on a later tick.
+  Parked checkpoints keep their quota reservation for at most seven days after
+  the latest park, and readmission and both explicit Retry paths refresh
+  their 24-hour idle expiry, so a park longer than a day still resumes from
+  the checkpoint; cancellation lets them expire. Storage parks refund the
+  automatic-history claim and the claim streak they consumed, and only
+  storage-owned parks advance the park streak. Explicit bodies
   between the transfer limit and 512 MiB now take the file sink and need the
   reserve plus five bodies free (six with a strong validator) instead of
   about four, because their staging and checkpoint copies are counted (#2239).
 - Receiving an attachment no longer holds several copies of it in native
   memory. The body buffer is reserved once from the declared length (an
-  undeclared length grows geometrically but never past the transfer limit,
-  and a failed reservation is a transient failure, not an abort), decrypted
+  undeclared length grows geometrically to half the transfer limit and then
+  once to the limit, so the buffer never exceeds the limit and the copy while
+  it grows holds at most 1.5 times it; a failed reservation is a transient
+  failure, not an abort), decrypted
   in place, explicit downloads above the automatic transfer limit stream
   through the existing private file sink, and in-memory publication writes
   the row at its final length through bounded incremental BLOB writes so

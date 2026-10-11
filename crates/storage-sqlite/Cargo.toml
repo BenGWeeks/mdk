@@ -31,3 +31,6 @@ storage-format-benchmarks = []
 test-conformance-replay = []
 # Copy in-memory test databases from one migrated template per process.
 test-migrated-template = ["rusqlite/backup"]
+# Test-only hooks for dependents' tests: database page caps, checkpoint byte
+# counts and injected storage-park write failures. Never enable in releases.
+test-support = []
