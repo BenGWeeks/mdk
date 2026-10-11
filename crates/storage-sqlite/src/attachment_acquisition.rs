@@ -632,8 +632,9 @@ impl SqliteAccountStorage {
     /// verifies the parser-supplied plaintext hash, but cannot authenticate AEAD.
     /// Quota counts retained plaintext bytes, not SQLite/WAL filesystem overhead;
     /// runtime disk-pressure admission must reserve that overhead separately.
-    /// Publication binds the complete plaintext and SQLite may copy it; the
-    /// runtime must budget full-object memory, unlike incremental local reads.
+    /// Publication reserves the row at its final length and copies the caller's
+    /// buffer through incremental BLOB writes of `ATTACHMENT_STAGING_CHUNK_BYTES`,
+    /// so SQLite never binds, records or trigger-rewrites a second plaintext copy.
     pub fn complete_attachment_acquisition(
         &self,
         job: &AttachmentAcquisition,
@@ -650,11 +651,7 @@ impl SqliteAccountStorage {
             {
                 return Ok(refused);
             }
-            conn.execute(
-                "INSERT INTO retained_attachment_bytes(token,bytes) VALUES(?1,?2)",
-                params![job.reference.token, plaintext],
-            )
-            .storage()?;
+            insert_retained_array(&conn, &job.reference.token, plaintext)?;
             conn.execute(
                 "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
                 [&job.reference.token],
@@ -743,7 +740,7 @@ impl SqliteAccountStorage {
         }
         Ok(conn
             .execute(
-                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
+                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_bytes=NULL,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
              WHERE token=?1 AND state IN (2,4,5)",
                 params![reference.token, u64_to_i64(now)?],
             )
@@ -951,6 +948,47 @@ impl SqliteAccountStorage {
             )
             .storage()
     }
+}
+
+/// Insert a legacy array body without materializing it inside SQLite. The row is
+/// created at its final `byte_len` over a `zeroblob`, so the insert trigger
+/// charges the quota from the declared length instead of rewriting the row, and
+/// the bytes arrive through bounded incremental BLOB writes that bypass both the
+/// statement bind copy and the update trigger. The enclosing transaction rolls
+/// the reservation back if any chunk fails.
+fn insert_retained_array(conn: &Connection, token: &[u8], plaintext: &[u8]) -> StorageResult<()> {
+    if plaintext.is_empty() {
+        conn.execute(
+            "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,0,x'')",
+            [token],
+        )
+        .storage()?;
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,?2,zeroblob(?2))",
+        params![token, u64_to_i64(plaintext.len() as u64)?],
+    )
+    .storage()?;
+    let row_id: i64 = conn
+        .query_row(
+            "SELECT rowid FROM retained_attachment_bytes WHERE token=?1",
+            [token],
+            |r| r.get(0),
+        )
+        .storage()?;
+    let mut blob = conn
+        .blob_open("main", "retained_attachment_bytes", "bytes", row_id, false)
+        .storage()?;
+    if blob.len() != plaintext.len() {
+        return Err(invalid("retained attachment length changed"));
+    }
+    for (index, chunk) in plaintext.chunks(ATTACHMENT_STAGING_CHUNK_BYTES).enumerate() {
+        blob.write_at(chunk, index * ATTACHMENT_STAGING_CHUNK_BYTES)
+            .storage()?;
+    }
+    blob.close().storage()?;
+    Ok(())
 }
 
 /// Shared publication admission: store, attempt, lease, source, acceptance and

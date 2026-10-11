@@ -105,8 +105,9 @@ missing or otherwise permanently unusable, the job reports `Failed` at once. Oth
 timeouts and connection failures stay retryable. When the group's decryption key for the
 attachment's source epoch is not available locally, the job waits as `RetryScheduled` without
 spending an attempt (15 seconds, doubling) and reports `Failed` on the sixth consecutive miss,
-about eight minutes after the first. Disk-reserve and retained-quota pressure still defer without
-that limit. `Failed` survives restart and repeated demand; render a download action. Explicit
+about eight minutes after the first. Retained-quota pressure still defers without
+that limit; disk-reserve pressure parks the job as `StorageBlocked` (below). `Failed`
+survives restart and repeated demand; render a download action. Explicit
 work (Retry, download-again) starts a fresh window and derives a missing key from the group's
 retained MLS state for that epoch (the newest five epochs), so Retry recovers attachments whose
 key was never cached.
@@ -128,11 +129,15 @@ its deliberate Retry or Download again action. Observation alone conveys no inte
 `attachmentDownloadPolicy` / `setAttachmentDownloadPolicy` read/write a durable per-account
 policy. In `NativeAutomatic` mode automatic acquisition defaults on: 2 GiB retained quota, 256 MiB free-disk reserve plus
 SQLite/WAL headroom, 64 MiB automatic ciphertext ceiling, one runtime-wide acquisition at a time.
-Explicit queued downloads use the existing 512 MiB hard limit and 15-minute transfer deadline.
-Initial disk/quota admission reserves the automatic cap (64 MiB by default), then checkpoint
-and publication checks enforce actual capacity. Automatic transfers have a two-minute deadline.
-Policy requires retained quota at least equal to the automatic cap. Resource pressure appears
-as `RetryScheduled` with a retry time; an intentionally high disk reserve can pause work.
+Explicit queued downloads keep the existing 512 MiB hard limit and 15-minute transfer deadline;
+bodies above the automatic cap stream through a private file sink instead of a whole-file
+array, so receiving never buffers more than the automatic cap in memory. Initial disk/quota
+admission reserves the automatic cap (64 MiB by default). As soon as a response declares the
+body size, and again before publication, the job needs the disk reserve plus four times the
+body free. Automatic transfers have a two-minute deadline. Policy requires retained quota at
+least equal to the automatic cap. Retained-quota pressure appears as `RetryScheduled` with a
+retry time; a body the device cannot publish parks as `StorageBlocked` (see the state table);
+an intentionally high disk reserve can pause work.
 Disable stops active automatic work and pauses automatic queues; explicit work and cached files
 remain. Re-enable preserves individual cancellations/removals. No automatic retained-byte eviction.
 Raising the cap readmits size-policy failures with remaining retry budget, never cryptographic failures. The legacy
@@ -208,6 +213,7 @@ cancellation, retry deadlines, progress, budgets and their opaque reference.
 | PreviouslyAcquiredUnavailable | Previously published bytes are gone; no automatic reacquisition. |
 | CompletedUnretained | A verified body could not be published, or the process stopped after recording its receipt; no automatic reacquisition. |
 | RetryExhausted | The durable acquisition or network budget is spent; no automatic retry. |
+| StorageBlocked | Free disk cannot cover the publication reserve for this body. Checkpointed ciphertext is kept; the worker readmits the job once free space covers the reserve, and Retry readmits it at once. Render a storage prompt, not a retry timer. |
 | Failed / Cancelled / Removed | Preserves terminal state or suppression. |
 | Unavailable | Source is obsolete, hidden, expired, rejected or otherwise unusable. |
 
@@ -226,10 +232,13 @@ replenish these budgets. A deliberate explicit Retry/download-again starts a new
 bounded cycle when not already fetching. Explicit retries of an opted-in job bypass
 automatic permission, not its budget. A completed verified body has one receipt owner
 before publication; insufficient retention capacity or publication failure is terminal
-for opted-in jobs. The free-disk check runs before the receipt; a transient shortage
-there schedules a bounded retry without recording successful acquisition. Resource pressure
-before fetching can defer admission without
-spending an attempt. If receipt storage fails, the persisted budgets still bound
+for opted-in jobs. The free-disk check runs as soon as the size is known and again before
+the receipt; a shortage parks the job as `StorageBlocked` without recording successful
+acquisition and keeps its checkpoint (the complete ciphertext when the body had already
+arrived), so the readmitted attempt publishes without fetching the body again. No retry
+timer runs while parked: the worker readmits the job once free space covers its reserve,
+and explicit Retry readmits it immediately. Resource pressure before fetching can defer
+admission without spending an attempt. If receipt storage fails, the persisted budgets still bound
 subsequent fetches. A size-policy failure remains `PolicyBlocked` even if the budget
 is exhausted; raising the size cap does not replenish that budget, so explicit retry
 may also be needed.

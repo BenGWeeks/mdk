@@ -213,6 +213,10 @@ pub(super) fn schedule(
         return Ok(more);
     }
     let free = fs4::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
+    // Jobs parked for disk space rejoin the due page only once the device can
+    // publish them; their checkpoints make the readmitted attempt local work.
+    let readmitted = storage.readmit_storage_blocked_attachments(now, policy.disk_reserve, free)?;
+    let more = more || readmitted == ATTACHMENT_ACQUISITION_BATCH_LIMIT;
     let candidates = storage.attachment_transfer_candidates(now, 32, policy.automatic)?;
     if candidates.is_empty() {
         admission.waiting = None;
@@ -467,6 +471,11 @@ pub(super) fn complete_acquired_stored(
         }
         Err(AttachmentDownloadFailure::SizeLimit(_, limit)) => {
             storage.block_attachment_size_policy(job, limit, now)?;
+        }
+        // Disk, not the network, is the blocker: park with the checkpoint until
+        // free space covers the reserve or the user retries, never on a timer.
+        Err(AttachmentDownloadFailure::StorageBlocked(required)) => {
+            storage.block_attachment_storage(job, required)?;
         }
         Err(AttachmentDownloadFailure::Stop(_)) => {
             storage.fail_attachment_acquisition(job, None)?;

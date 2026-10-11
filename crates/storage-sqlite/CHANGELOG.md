@@ -11,6 +11,9 @@
   canonical source tags in the page snapshot without a history backfill.
 - Migrations 0103 through 0107 advance account storage to schema 107 on first
   open. Older binaries reject the upgraded database; downgrade is unsupported.
+  Migration 0107 adds `attachment_acquisition.storage_blocked_bytes` and keeps
+  ciphertext checkpoints for jobs parked on disk space.
+- `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
 
 ### Added
 
@@ -37,8 +40,18 @@
   retained bodies and ciphertext checkpoints while widening file-backed
   representation bounds, without increasing user quotas. (#2175)
 
+- `SqliteAccountStorage::block_attachment_storage` parks a live attempt whose
+  publication disk reserve the device cannot cover, and
+  `readmit_storage_blocked_attachments` requeues up to 64 parked jobs whose
+  reserve fits the supplied free space. Explicit retry clears the parked
+  marker; cancelled and size-policy work stays parked (mdk#2239).
+
 ### Fixed
 
+- `complete_attachment_acquisition` reserves the retained row at its final
+  `byte_len` over a `zeroblob` and copies the plaintext through 64 KiB
+  incremental BLOB writes, so the insert trigger no longer rewrites the row
+  and SQLite holds no bind or record copy of the body (mdk#2241).
 - Outgoing promotion defers file bodies bound after its verification snapshot
   without quarantining them or hiding a verified same-slot sibling. Source
   expiry admission includes time spent verifying and waiting for storage.

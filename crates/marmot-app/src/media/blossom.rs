@@ -848,7 +848,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                 total.unwrap_or(limit + 1),
             ));
         }
-        observation.file_capacity(total.unwrap_or(0)).await?;
+        observation.publication_capacity(total.unwrap_or(0)).await?;
         let identity =
             etag.zip(total)
                 .map(|(etag, total)| storage_sqlite::AttachmentPartialIdentity {
@@ -950,7 +950,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
             // Bodies without validators cannot checkpoint, but still consume
             // private disk space and must preserve the same reserve.
             if output.len - capacity_checked >= storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES as u64 {
-                observation.file_capacity(output.len).await?;
+                observation.publication_capacity(output.len).await?;
                 capacity_checked = output.len;
             }
             for part in chunk.chunks(super::file_transfer::FILE_TRANSFER_BUFFER_BYTES) {
@@ -1305,7 +1305,7 @@ where
                     && resume
                         .checkpoint_total(&current)
                         .await?
-                        .is_some_and(|total| total > max_body_bytes)
+                        .is_some_and(|total| total > resume.memory_sink_limit())
                 {
                     return Err(AttachmentDownloadFailure::FileRequired);
                 }
@@ -1508,7 +1508,7 @@ where
                     && prefix.is_none()
                     && response
                         .content_length()
-                        .is_none_or(|length| length > MAX_ENCRYPTED_MEDIA_BLOB_BYTES)
+                        .is_none_or(|length| length > context.memory_sink_limit())
                 {
                     return Err(AttachmentDownloadFailure::FileRequired);
                 }

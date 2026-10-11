@@ -2865,6 +2865,184 @@ fn attachment_idle_permission_resume_is_read_only() {
     );
 }
 
+/// mdk#2239: a storage-parked job keeps its checkpoint, never rejoins the due
+/// page on its own, readmits exactly when the reserve fits, and clears on retry.
+#[test]
+fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for m in ["disk", "cancel", "size"] {
+        seed(&store, m);
+    }
+    let asset = request(&store, "disk");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    assert!(store.block_attachment_storage(&job, 2048).unwrap());
+    assert!(
+        !store.block_attachment_storage(&job, 2048).unwrap(),
+        "only the live attempt parks"
+    );
+    assert_eq!(
+        transfer(&store, "disk", true).state,
+        AttachmentTransferState::StorageBlocked
+    );
+    assert_eq!(transfer(&store, "disk", true).retry_at, None);
+    assert_eq!(partial_usage(&store), 3, "checkpoints survive parking");
+    assert!(
+        store
+            .attachment_transfer_candidates(20, 64, true)
+            .unwrap()
+            .is_empty()
+    );
+    // Cancelled and size-blocked work stays parked whatever the free space.
+    let cancelled = request(&store, "cancel");
+    let cancelled_job = store
+        .claim_attachment_acquisition(&cancelled, 12, 100)
+        .unwrap()
+        .unwrap();
+    store.cancel_attachment_acquisition(&cancelled).unwrap();
+    assert!(!store.block_attachment_storage(&cancelled_job, 1).unwrap());
+    let sized = request(&store, "size");
+    let sized_job = store
+        .claim_attachment_acquisition(&sized, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .block_attachment_size_policy(&sized_job, 64, 13)
+        .unwrap();
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(21, 1000, 1000 + 4 * 2048 - 1)
+            .unwrap(),
+        0,
+        "one byte short of the reserve keeps the job parked"
+    );
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(21, 1000, 999)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(21, 1000, 1000 + 4 * 2048)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        transfer(&store, "disk", true).state,
+        AttachmentTransferState::Queued
+    );
+    assert_eq!(
+        store.attachment_transfer_candidates(22, 64, true).unwrap(),
+        vec![asset.clone()]
+    );
+    assert_eq!(partial_usage(&store), 3, "readmission keeps the prefix");
+    assert_eq!(
+        transfer(&store, "cancel", true).state,
+        AttachmentTransferState::Cancelled
+    );
+    assert_eq!(
+        transfer(&store, "size", true).state,
+        AttachmentTransferState::PolicyBlocked
+    );
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(23, 0, u64::MAX)
+            .unwrap(),
+        0,
+        "nothing else is storage-parked"
+    );
+    // Explicit retry readmits at once, both through the native and the host path.
+    let job = store
+        .claim_attachment_acquisition(&asset, 24, 100)
+        .unwrap()
+        .unwrap();
+    assert!(store.block_attachment_storage(&job, 2048).unwrap());
+    assert!(store.retry_attachment_acquisition(&asset, 25).unwrap());
+    assert_eq!(
+        transfer(&store, "disk", true).state,
+        AttachmentTransferState::Queued
+    );
+    let job = store
+        .claim_attachment_acquisition(&asset, 26, 100)
+        .unwrap()
+        .unwrap();
+    assert!(store.block_attachment_storage(&job, 2048).unwrap());
+    assert!(store.explicitly_retry_attachment(&asset, 27).unwrap());
+    assert_eq!(
+        transfer(&store, "disk", false).state,
+        AttachmentTransferState::Queued
+    );
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(28, 0, u64::MAX)
+            .unwrap(),
+        0,
+        "retry cleared the parked marker"
+    );
+}
+
+/// mdk#2241: legacy array publication declares `byte_len` on insert and copies
+/// through incremental BLOB writes, so the insert trigger charges the quota
+/// without rewriting the row and SQLite never binds a second plaintext copy.
+#[test]
+fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "array");
+    let asset = request(&store, "array");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let before = store.lock().unwrap().total_changes();
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&job, BODY, 12, 10000)
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    // Exactly the row insert, the usage charge and the job state change: the
+    // `byte_len<0` normalizing UPDATE in the insert trigger matched no row.
+    assert_eq!(store.lock().unwrap().total_changes() - before, 3);
+    let (byte_len, stored_len): (i64, i64) = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT byte_len,length(bytes) FROM retained_attachment_bytes WHERE token=?1",
+            [&asset.token],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (byte_len, stored_len),
+        (BODY.len() as i64, BODY.len() as i64)
+    );
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        BODY.len() as u64
+    );
+    assert_eq!(read(&store, &asset), BODY);
+    // The retired bind-the-whole-body form pays the trigger rewrite as a fourth
+    // row change, which is the copy the publication path no longer makes.
+    seed(&store, "legacy");
+    let legacy = request(&store, "legacy");
+    let before = store.lock().unwrap().total_changes();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO retained_attachment_bytes(token,bytes) VALUES(?1,?2)",
+            params![legacy.token, BODY],
+        )
+        .unwrap();
+    assert_eq!(store.lock().unwrap().total_changes() - before, 3);
+}
+
 mod outgoing;
 mod outgoing_files;
 mod promotion;

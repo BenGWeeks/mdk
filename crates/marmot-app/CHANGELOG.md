@@ -84,6 +84,23 @@
   is missing than one comparison pass fetches, the pass narrows to the oldest
   part that fits, so commits no longer arrive ahead of older messages and move
   a member's epoch past messages it can then never read (#2086).
+- An explicit attachment download the device lacks room to publish no longer
+  retries forever. The publication reserve (disk reserve plus four times the
+  plaintext) is checked as soon as a response declares the size and again
+  before the completed-body receipt; a shortage parks the job as
+  `AttachmentTransferState::StorageBlocked` with its ciphertext checkpoint
+  instead of scheduling a timer. The worker readmits parked jobs once free
+  space covers their reserve, explicit Retry readmits them at once, and a body
+  that had already arrived is checkpointed whole so readmission publishes
+  without another request. Automatic history keeps its caps (#2239).
+- Receiving an attachment no longer holds several copies of it in native
+  memory. The body buffer is reserved once from the declared length and
+  decrypted in place, explicit downloads above the automatic transfer limit
+  stream through the existing private file sink, and in-memory publication
+  writes the row at its final length through bounded incremental BLOB writes
+  so SQLite keeps no bind, record or trigger-rewrite copy. Integrity checks,
+  resume and retention behavior are unchanged; an explicit body above the
+  limit spends one header-only request before the file sink reopens it (#2241).
 - Catch-up downloads missed group history in far fewer round trips. Each
   comparison pass now fetches up to 256 events (1 MiB), across all relays, in
   batched requests instead of 16 one-at-a-time requests, so a backlog of a few hundred

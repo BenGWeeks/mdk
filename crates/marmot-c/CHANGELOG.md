@@ -57,6 +57,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- `MarmotAttachmentTransferState` appends
+  `MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED`; existing discriminants
+  are unchanged. Recompile against the regenerated `marmot.h` with the matching
+  library and handle the new value as "free up storage", not as a retry timer.
 - Relay-repair C preview content, tag fields and optional endpoints use JSON
   string literals to preserve embedded NULs and all UTF-8 bytes. Decode once
   with a length-aware parser before consent or editing. Pointer layouts and

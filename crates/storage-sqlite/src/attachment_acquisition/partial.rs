@@ -459,7 +459,9 @@ impl SqliteAccountStorage {
                 )
                 .storage()?;
             let mut rows = stmt.query([&job.reference.token]).storage()?;
-            let mut bytes = Vec::new();
+            // Size the prefix for the complete representation once, so neither
+            // this reassembly nor the resumed body grows it by doubling.
+            let mut bytes = Vec::with_capacity(total as usize);
             let mut corrupt = false;
             while let Some(row) = rows.next().storage()? {
                 let offset = nonnegative(row, 0).storage()?;

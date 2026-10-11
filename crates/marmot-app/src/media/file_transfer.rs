@@ -852,6 +852,8 @@ pub(crate) async fn download_file(
                     super::AttachmentDownloadFailure::SizeLimit(_, size) => {
                         size_failure = Some(*size)
                     }
+                    // Disk pressure is not locator-specific; park with the checkpoint.
+                    super::AttachmentDownloadFailure::StorageBlocked(_) => return Err(error),
                     _ => {}
                 }
                 failures.push(format!(
@@ -863,7 +865,7 @@ pub(crate) async fn download_file(
             }
         };
         observation
-            .file_capacity(encrypted.len.saturating_sub(MEDIA_AEAD_TAG_BYTES))
+            .publication_capacity(encrypted.len.saturating_sub(MEDIA_AEAD_TAG_BYTES))
             .await?;
         let decryption_directory = directory.clone();
         let decryption_control = control.clone();

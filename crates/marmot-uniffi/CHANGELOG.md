@@ -9,6 +9,12 @@
   and `ModerationReportRateLimited`. Regenerate bindings with the matching
   library and update exhaustive Swift `switch` / Kotlin `when` handling.
 
+- `AttachmentTransferStateFfi` adds `StorageBlocked`: free disk cannot cover
+  the publication reserve for the body, checkpoints are kept, and the job
+  readmits once space frees or on explicit Retry. Update exhaustive
+  Swift/Kotlin handling and regenerate bindings with the matching native
+  library; render a storage prompt rather than a retry timer. See
+  [the attachment access contract](ATTACHMENT-ACCESS.md).
 - `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
   a binding default. Regenerate matching Swift/Kotlin bindings and pass `nil`
   (Swift) or `null` (Kotlin) in host record initializers without a typed preview.

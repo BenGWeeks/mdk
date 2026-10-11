@@ -426,7 +426,20 @@ async fn download_without_engine_and_retain(
         "queued plaintext still owns global capacity"
     );
     let asset = match &done.completion {
-        MediaHttpCompletion::Attachment { job, .. } => job.reference.clone(),
+        MediaHttpCompletion::Attachment { job, result, .. } => {
+            // The body buffer is reserved once from Content-Length (mdk#2241):
+            // decrypting in place leaves only the AEAD tag as spare capacity.
+            let Ok(crate::client::AcquiredMediaBody::Memory(body)) = result else {
+                panic!("small bodies publish through the in-memory sink");
+            };
+            assert!(
+                body.plaintext.capacity() <= body.plaintext.len() + 16,
+                "capacity {} for {} plaintext bytes",
+                body.plaintext.capacity(),
+                body.plaintext.len()
+            );
+            job.reference.clone()
+        }
         _ => panic!("attachment"),
     };
     if explicit {
@@ -920,6 +933,7 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on(
 }
 
 mod resume;
+mod storage_block;
 
 #[tokio::test]
 async fn attachment_worker_disk_pause_does_not_consume_attempts() {

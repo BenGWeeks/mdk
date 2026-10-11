@@ -43,6 +43,12 @@ fn retry(message: &str) -> AttachmentDownloadFailure {
 fn stop(message: &str) -> AttachmentDownloadFailure {
     AttachmentDownloadFailure::Stop(AppError::BlobStore(message.into()))
 }
+/// Publishing `plaintext_len` bytes needs `disk_reserve + 4 * plaintext_len` free
+/// (SQLite row, WAL and private staging copies). Below that, the job parks as
+/// `StorageBlocked` with its checkpoints instead of re-fetching on a timer.
+fn storage_blocked(plaintext_len: u64) -> AttachmentDownloadFailure {
+    AttachmentDownloadFailure::StorageBlocked(plaintext_len)
+}
 
 /// Distinguish revocation from transport errors without nesting Result values.
 pub(crate) enum NetworkPollError<E> {
@@ -147,20 +153,10 @@ impl AttachmentResume {
         self.finishing.store(true, Ordering::Release);
         let this = self.clone();
         let recorded = tokio::task::spawn_blocking(move || {
-            // Defer transient disk pressure before recording a completed receipt.
+            // Park on disk pressure before recording a completed receipt, so a
+            // blocked job never becomes an opted-in body with no retention.
             // Stable retention quota failures after this boundary remain terminal.
-            let policy = this
-                .storage
-                .attachment_download_policy(&this.policy)
-                .map_err(|_| retry("attachment publication policy unavailable"))?;
-            let free = fs4::available_space(&this.directory).unwrap_or(0);
-            if free
-                < policy
-                    .disk_reserve
-                    .saturating_add((plaintext_len as u64).saturating_mul(4))
-            {
-                return Err(retry("insufficient disk space for attachment publication"));
-            }
+            this.check_publication_capacity(plaintext_len as u64)?;
             this.storage
                 .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
                 .map_err(|_| stop("attachment receipt failed"))
@@ -173,27 +169,53 @@ impl AttachmentResume {
         Ok(())
     }
 
-    fn check_file_capacity(&self, bytes: u64) -> Result<(), AttachmentDownloadFailure> {
+    /// The durable policy's reserve plus four times `bytes` must be free. Both
+    /// sinks apply this as soon as a size is known, again as a body grows
+    /// without a validator, and once more before the completed-body receipt.
+    fn check_publication_capacity(&self, bytes: u64) -> Result<(), AttachmentDownloadFailure> {
         let policy = self
             .storage
             .attachment_download_policy(&self.policy)
             .map_err(|_| retry("attachment publication policy unavailable"))?;
         let free = fs4::available_space(&self.directory).unwrap_or(0);
         if free < policy.disk_reserve.saturating_add(bytes.saturating_mul(4)) {
-            return Err(retry("insufficient disk space for attachment publication"));
+            return Err(storage_blocked(bytes));
         }
         Ok(())
     }
 
-    /// Check staging headroom without recording a completed-body receipt.
-    pub(super) async fn file_capacity(
+    /// Check publication headroom without recording a completed-body receipt.
+    pub(super) async fn publication_capacity(
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || this.check_file_capacity(bytes))
+        tokio::task::spawn_blocking(move || this.check_publication_capacity(bytes))
             .await
             .map_err(|_| retry("attachment capacity task failed"))?
+    }
+
+    /// Early in-memory capacity check: a definite shortage parks the job, but
+    /// an unobservable policy must not mask a later cryptographic verdict. The
+    /// completed-body receipt repeats the check authoritatively.
+    async fn early_publication_capacity(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<(), AttachmentDownloadFailure> {
+        match self.publication_capacity(bytes).await {
+            Err(blocked @ AttachmentDownloadFailure::StorageBlocked(_)) => Err(blocked),
+            _ => Ok(()),
+        }
+    }
+
+    /// Largest ciphertext body an explicit acquisition buffers in memory: the
+    /// same bound automatic work already has. Larger explicit bodies stream
+    /// through the private file sink, so receiving never holds a whole-file
+    /// array beyond the configured transfer limit.
+    pub(super) fn memory_sink_limit(&self) -> u64 {
+        self.policy
+            .transfer_limit
+            .min(super::blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES)
     }
 
     pub(crate) async fn progress(
@@ -360,7 +382,7 @@ impl AttachmentResume {
                     (&this.ciphertext_digest, &locator_digest),
                 )
                 .map_err(|_| retry("partial checkpoint metadata unavailable"))?;
-            this.check_file_capacity(total.unwrap_or(0))?;
+            this.check_publication_capacity(total.unwrap_or(0))?;
             let mut file = super::file_transfer::PrivateMediaFile::create(&directory)?;
             let mut writer = file.writer()?;
             let part = this
@@ -468,6 +490,16 @@ pub(super) async fn read_body(
             max,
         ));
     }
+    if let Some(total) = expected_total {
+        // The size is known now: refuse before fetching a body the device
+        // cannot publish, and reserve the buffer once so it never doubles.
+        context
+            .early_publication_capacity(
+                total.saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES),
+            )
+            .await?;
+        bytes.reserve_exact((total as usize).saturating_sub(bytes.len()));
+    }
     context
         .progress(bytes.len() as u64, expected_total, true)
         .await?;
@@ -529,6 +561,19 @@ pub(super) async fn read_body(
             checkpoint_tail(context, identity, &bytes, &mut saved).await?;
         }
         return Err(retry("incomplete media body"));
+    }
+    // Space may have shrunk during the transfer. Keep the complete ciphertext
+    // checkpointed, so readmission verifies it locally without another request.
+    if let Err(error) = context
+        .early_publication_capacity(
+            (bytes.len() as u64).saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES),
+        )
+        .await
+    {
+        if let Some(identity) = &identity {
+            let _ = checkpoint_tail(context, identity, &bytes, &mut saved).await;
+        }
+        return Err(error);
     }
     // Complete bodies go straight to verification/publication. Do not write a
     // final tiny checkpoint only to delete it on success.
