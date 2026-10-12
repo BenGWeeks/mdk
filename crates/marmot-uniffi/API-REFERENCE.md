@@ -4496,7 +4496,7 @@ pub fn change_since( &self, previous: Arc<AccountAttachmentVersion>, ) -> Attach
 
 Compare a freshly read account version with the original loaded-page baseline. RestartRequired discards loaded rows; Additions offers a head refresh while old-page cursors remain valid. The opaque value is not a row count; retain it in memory only.
 
-[Source](src/conversions/account_attachment_history.rs#L33)
+[Source](src/conversions/account_attachment_history.rs#L35)
 
 ### `Marmot::account_attachment_history_page`
 
@@ -4517,5 +4517,30 @@ pub async fn account_attachment_history_version( &self, account_ref: String, ) -
 Read the constant-work local account attachment change token, including after exhaustion. No network, acquisition or decryption starts. Keep the original loaded-page baseline and compare it using change_since; replace rows on RestartRequired and offer refresh on Additions.
 
 [Source](src/commands/account_attachment_history.rs#L26)
+
+</details>
+
+<details>
+<summary>Native startup diagnostics</summary>
+
+### `Marmot::set_startup_diagnostics_enabled`
+
+```rust
+pub fn set_startup_diagnostics_enabled(&self, enabled: bool) -> Result<(), MarmotKitError>
+```
+
+Explicitly enable or revoke bounded native progress for a diagnostic investigation. Capture is off by default and shared by clones of this app handle. It does not change database content, diagnostic-sharing/upload consent, network behavior or cryptographic settings. Re-enabling an already-enabled capture preserves its history; disabling clears it and fences in-flight observations from later captures. Enable before the first account policy read when diagnosing account opening.
+
+[Source](src/commands/startup_diagnostics.rs#L6)
+
+### `Marmot::startup_diagnostics_snapshot`
+
+```rust
+pub fn startup_diagnostics_snapshot(&self) -> Result<NativeStartupSnapshotFfi, MarmotKitError>
+```
+
+Synchronously clone fixed native phases, monotonic durations and migration progress from independent memory. This does not query account storage or the keystore, and remains usable before `start` or while an account-opening future is blocked. At most 16 active scopes and 96 events are retained; drop counters expose truncation. Tokens are anonymous process-local scope numbers. No identifiers, paths, call arguments/results, keys or error messages are returned. Bound serialized host exports separately and collect only in an explicitly enabled diagnostic flow.
+
+[Source](src/commands/startup_diagnostics.rs#L11)
 
 </details>

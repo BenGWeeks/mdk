@@ -30,17 +30,17 @@ impl CFree for MarmotAccountAttachmentCursor {
 impl CFree for MarmotAccountAttachmentVersion {
     unsafe fn free_in_place(&mut self) {}
 }
-/// Borrowed arrays, at most100 entries each. Empty means all; has_after/has_before are uint8_t flags.
+/// Borrowed arrays, at most 100 entries each. Empty means all; has_min_timeline_at/has_max_timeline_at are uint8_t flags.
 #[repr(C)]
 pub struct MarmotAccountAttachmentQuery {
     pub groups: *const *const c_char,
     pub groups_len: usize,
     pub senders: *const *const c_char,
     pub senders_len: usize,
-    pub has_after: u8,
-    pub after: u64,
-    pub has_before: u8,
-    pub before: u64,
+    pub has_min_timeline_at: u8,
+    pub min_timeline_at: u64,
+    pub has_max_timeline_at: u8,
+    pub max_timeline_at: u64,
 }
 impl MarmotAccountAttachmentQuery {
     unsafe fn to_ffi(&self) -> Result<AccountAttachmentQueryFfi, MarmotStatus> {
@@ -50,8 +50,8 @@ impl MarmotAccountAttachmentQuery {
         Ok(AccountAttachmentQueryFfi {
             groups: unsafe { str_array(self.groups, self.groups_len) }?,
             senders: unsafe { str_array(self.senders, self.senders_len) }?,
-            after: (self.has_after != 0).then_some(self.after),
-            before: (self.has_before != 0).then_some(self.before),
+            min_timeline_at: (self.has_min_timeline_at != 0).then_some(self.min_timeline_at),
+            max_timeline_at: (self.has_max_timeline_at != 0).then_some(self.max_timeline_at),
         })
     }
 }
@@ -63,7 +63,6 @@ pub struct MarmotAccountAttachmentPage {
     pub entries_len: usize,
     pub version: *mut MarmotAccountAttachmentVersion,
     pub next_cursor: *mut MarmotAccountAttachmentCursor,
-    pub has_more: bool,
     pub has_next_expiry: bool,
     pub next_expiry: u64,
 }
@@ -75,7 +74,6 @@ impl From<AccountAttachmentPageFfi> for MarmotAccountAttachmentPage {
             entries_len,
             version: boxed(v.version.into()),
             next_cursor: boxed_opt(v.next_cursor.map(Into::into)),
-            has_more: v.has_more,
             has_next_expiry: v.next_expiry.is_some(),
             next_expiry: v.next_expiry.unwrap_or(0),
         }
@@ -97,7 +95,6 @@ pub enum MarmotAccountAttachmentPageRead {
     CursorMismatch,
     InvalidQuery,
     InvalidLimit,
-    ResponseTooLarge,
 }
 impl From<AccountAttachmentPageReadFfi> for MarmotAccountAttachmentPageRead {
     fn from(v: AccountAttachmentPageReadFfi) -> Self {
@@ -107,7 +104,6 @@ impl From<AccountAttachmentPageReadFfi> for MarmotAccountAttachmentPageRead {
             AccountAttachmentPageReadFfi::CursorMismatch => Self::CursorMismatch,
             AccountAttachmentPageReadFfi::InvalidQuery => Self::InvalidQuery,
             AccountAttachmentPageReadFfi::InvalidLimit => Self::InvalidLimit,
-            AccountAttachmentPageReadFfi::ResponseTooLarge => Self::ResponseTooLarge,
         }
     }
 }
@@ -153,7 +149,7 @@ pub unsafe extern "C" fn marmot_account_attachment_version_clone(
         MarmotStatus::Ok
     })
 }
-/// Blocking local read; call off the UI thread. Limit is1..=100 candidates, not a filtered row target.
+/// Blocking local read; call off the UI thread. Limit is 1..=100 candidates, not a filtered row target.
 /// # Safety
 /// Client, strings and query arrays must be valid, cursor NULL or live, and out writable.
 #[unsafe(no_mangle)]
@@ -270,10 +266,10 @@ mod tests {
             groups_len: 101,
             senders: std::ptr::null(),
             senders_len: 0,
-            has_after: 0,
-            after: 0,
-            has_before: 0,
-            before: 0,
+            has_min_timeline_at: 0,
+            min_timeline_at: 0,
+            has_max_timeline_at: 0,
+            max_timeline_at: 0,
         };
         assert!(matches!(
             unsafe { input.to_ffi() },

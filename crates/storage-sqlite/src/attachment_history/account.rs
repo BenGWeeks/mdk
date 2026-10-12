@@ -6,8 +6,8 @@ use super::*;
 pub struct AccountAttachmentQuery {
     pub groups: Vec<String>,
     pub senders: Vec<String>,
-    pub after: Option<u64>,
-    pub before: Option<u64>,
+    pub min_timeline_at: Option<u64>,
+    pub max_timeline_at: Option<u64>,
 }
 impl std::fmt::Debug for AccountAttachmentQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -19,9 +19,9 @@ impl AccountAttachmentQuery {
     fn canonical(&self) -> Result<Self, AccountAttachmentHistoryError> {
         if self.groups.len() > 100
             || self.senders.len() > 100
-            || self.after.is_some_and(|v| v > i64::MAX as u64)
-            || self.before.is_some_and(|v| v > i64::MAX as u64)
-            || matches!((self.after,self.before),(Some(a),Some(b)) if a>b)
+            || self.min_timeline_at.is_some_and(|v| v > i64::MAX as u64)
+            || self.max_timeline_at.is_some_and(|v| v > i64::MAX as u64)
+            || matches!((self.min_timeline_at,self.max_timeline_at),(Some(a),Some(b)) if a>b)
         {
             return Err(AccountAttachmentHistoryError::InvalidQuery);
         }
@@ -123,8 +123,6 @@ pub enum AccountAttachmentHistoryError {
     CursorMismatch,
     #[error("attachment history changed; restart")]
     RestartRequired,
-    #[error("attachment metadata exceeds response bounds")]
-    ResponseTooLarge,
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
@@ -139,6 +137,13 @@ fn version(
     now: u64,
 ) -> Result<AccountAttachmentVersion, AccountAttachmentHistoryError> {
     let now = i64::try_from(now).map_err(|_| AccountAttachmentHistoryError::InvalidQuery)?;
+    let (revision, additions) = conn
+        .query_row_cached(
+            "SELECT revision, additions FROM account_attachment_history_version WHERE id=1",
+            [],
+            |row| Ok((row.get("revision")?, row.get("additions")?)),
+        )
+        .storage()?;
     Ok(AccountAttachmentVersion {
         store_epoch: conn
             .query_row_cached(
@@ -147,20 +152,8 @@ fn version(
                 |r| r.get(0),
             )
             .storage()?,
-        revision: conn
-            .query_row_cached(
-                "SELECT revision FROM account_attachment_history_version WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
-            .storage()?,
-        additions: conn
-            .query_row_cached(
-                "SELECT additions FROM account_attachment_history_version WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
-            .storage()?,
+        revision,
+        additions,
         expiry_watermark: conn.query_row_cached("SELECT max(retention_expires_at) FROM attachment_history WHERE visible=1 AND retention_expires_at IS NOT NULL AND retention_expires_at<=?1",[now],|r|r.get::<_,Option<i64>>(0)).storage()?.map(|v|u64::try_from(v).map_err(|_|AccountAttachmentHistoryError::InvalidQuery)).transpose()?,
         next_expiry: conn.query_row_cached("SELECT min(retention_expires_at) FROM attachment_history WHERE visible=1 AND retention_expires_at IS NOT NULL AND retention_expires_at>?1",[now],|r|r.get::<_,Option<i64>>(0)).storage()?.map(|v|u64::try_from(v).map_err(|_|AccountAttachmentHistoryError::InvalidQuery)).transpose()?,
     })
@@ -173,12 +166,12 @@ fn sql(seek: bool) -> String {
     } else {
         ""
     };
-    format!("SELECT 0,timeline_at,0,timeline_at,message_id_hex,attachment_order,
-        attachment_index,source_message_id_hex,source_epoch,sender,timeline_at,received_at,
-        substr(slot_json,1,32769),substr((SELECT json_group_array(json(e.value)) FROM message_timeline t,
+    format!("SELECT timeline_at,message_id_hex,attachment_order,
+        attachment_index,source_message_id_hex,source_epoch,sender,received_at,
+        substr(slot_json,1,32769) AS slot_json,substr((SELECT json_group_array(json(e.value)) FROM message_timeline t,
             json_each(CASE WHEN json_valid(t.tags_json) THEN CASE WHEN json_type(t.tags_json)='array' THEN t.tags_json ELSE '[]' END ELSE '[]' END)e
             WHERE t.group_id_hex=h.group_id_hex AND t.message_id_hex=h.message_id_hex
-            AND CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END),1,32769),group_id_hex,retention_expires_at
+            AND CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END),1,32769) AS emoji_tags_json,group_id_hex,retention_expires_at
         FROM attachment_history h INDEXED BY idx_account_attachment_history_page
         WHERE visible=1 AND timeline_at>=?1 AND timeline_at<=?2{seek}
         ORDER BY timeline_at DESC,group_id_hex DESC,message_id_hex DESC,attachment_order DESC LIMIT ?3")
@@ -202,9 +195,6 @@ impl SqliteAccountStorage {
         limit: usize,
         cursor: Option<&AccountAttachmentCursor>,
     ) -> Result<AccountAttachmentPage, AccountAttachmentHistoryError> {
-        if !(1..=100).contains(&limit) {
-            return Err(AccountAttachmentHistoryError::InvalidLimit);
-        }
         let now = clock()?;
         self.account_attachment_history_page_at(query, limit, cursor, now)
     }
@@ -231,8 +221,8 @@ impl SqliteAccountStorage {
                 }
             }
             let mut values = vec![
-                Value::Integer(query.after.unwrap_or(0) as i64),
-                Value::Integer(query.before.unwrap_or(i64::MAX as u64) as i64),
+                Value::Integer(query.min_timeline_at.unwrap_or(0) as i64),
+                Value::Integer(query.max_timeline_at.unwrap_or(i64::MAX as u64) as i64),
                 Value::Integer((limit + 1) as i64),
             ];
             if let Some(cursor) = cursor {
@@ -257,23 +247,23 @@ impl SqliteAccountStorage {
                     break;
                 }
                 seen += 1;
-                let group: String = row.get(14).storage()?;
-                let sender: String = row.get(9).storage()?;
+                let group: String = row.get("group_id_hex").storage()?;
+                let sender: String = row.get("sender").storage()?;
                 let current_key = (
-                    row.get(1).storage()?,
+                    row.get("timeline_at").storage()?,
                     group.clone(),
-                    row.get(4).storage()?,
-                    row.get(5).storage()?,
+                    row.get("message_id_hex").storage()?,
+                    row.get("attachment_order").storage()?,
                 );
-                let expiry: Option<i64> = row.get(15).storage()?;
+                let expiry: Option<i64> = row.get("retention_expires_at").storage()?;
                 if expiry.is_some_and(|v| v < 0 || v as u64 <= now)
                     || !query.accepts(&group, &sender)
                 {
                     key = Some(current_key);
                     continue;
                 }
-                let slot: String = row.get(12).storage()?;
-                let emojis: String = row.get(13).storage()?;
+                let slot: String = row.get("slot_json").storage()?;
+                let emojis: String = row.get("emoji_tags_json").storage()?;
                 let metadata_limited = slot.len() > MAX_SLOT_BYTES || emojis.len() > MAX_SLOT_BYTES;
                 let cost = if metadata_limited {
                     group.len() + sender.len() + 256
