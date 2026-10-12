@@ -308,17 +308,17 @@ mod tests {
             (
                 MarmotKitError::ChatSelectionClosed,
                 MarmotStatus::ChatSelectionClosed,
-                96,
+                101,
             ),
             (
                 MarmotKitError::ChatSelectionStale,
                 MarmotStatus::ChatSelectionStale,
-                97,
+                102,
             ),
             (
                 MarmotKitError::ChatSelectionInvalidPage,
                 MarmotStatus::ChatSelectionInvalidPage,
-                98,
+                103,
             ),
         ] {
             assert_eq!(status_from_error(&error), status);
