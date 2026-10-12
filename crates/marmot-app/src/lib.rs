@@ -5218,6 +5218,22 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
         method: &'static str,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        self.fetch_validated_account_key_package_records_with_tags(
+            label,
+            bootstrap_relays,
+            method,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_validated_account_key_package_records_with_tags(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        method: &'static str,
+        references: Option<Vec<(char, String)>>,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
 
@@ -5264,9 +5280,21 @@ impl MarmotApp {
             ]));
         }
 
-        let mut relay_records = self
-            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
-            .await?;
+        let mut relay_records = match references {
+            None => {
+                self.fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
+                    .await?
+            }
+            Some(references) => {
+                self.fetch_key_package_events_for_account_id_with_tags(
+                    &account_id_hex,
+                    &source_relays,
+                    12,
+                    Some(references),
+                )
+                .await?
+            }
+        };
         sort_directory_records(&mut relay_records);
         let mut packages = Vec::new();
         for record in relay_records {

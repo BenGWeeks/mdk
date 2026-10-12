@@ -675,33 +675,50 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             }
             request.queries.iter().any(|query| query.matches(event))
         };
+        let select = |events: &[NostrTransportEvent], endpoints: Vec<TransportEndpoint>| {
+            let mut records = Vec::new();
+            for query in &request.queries {
+                let mut matching = events
+                    .iter()
+                    .filter(|event| matches_query(event) && query.matches(event))
+                    .collect::<Vec<_>>();
+                matching.sort_by(|a, b| {
+                    b.created_at
+                        .cmp(&a.created_at)
+                        .then_with(|| b.id.cmp(&a.id))
+                });
+                let mut seen = std::collections::BTreeSet::new();
+                records.extend(
+                    matching
+                        .into_iter()
+                        .filter(|event| seen.insert(&event.id))
+                        .take(query.limit)
+                        .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                            endpoints: endpoints.clone(),
+                            event: event.clone(),
+                        }),
+                );
+            }
+            records
+        };
         let endpoint_events = self.events_by_endpoint.lock().unwrap();
         if endpoint_events.is_empty() {
-            return Ok(self
-                .events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|event| matches_query(event))
-                .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
-                    endpoints: request.endpoints.clone(),
-                    event: event.clone(),
-                })
-                .collect());
+            return Ok(select(
+                &self.events.lock().unwrap(),
+                request.endpoints.clone(),
+            ));
         }
         Ok(request
             .endpoints
             .iter()
             .flat_map(|endpoint| {
-                endpoint_events
-                    .get(&endpoint.0)
-                    .into_iter()
-                    .flatten()
-                    .filter(|event| matches_query(event))
-                    .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
-                        endpoints: vec![endpoint.clone()],
-                        event: event.clone(),
-                    })
+                select(
+                    endpoint_events
+                        .get(&endpoint.0)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    vec![endpoint.clone()],
+                )
             })
             .collect())
     }
