@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `MarmotKitError` gains `ObsoleteKeyPackage { account }` and
+  `MemberDiscoveryIncomplete { account }`; update exhaustive Swift/Kotlin error
+  switches. Recipient fields support focused recovery guidance; Display omits
+  identity.
+
 ## 0.13.0 - 2026-10-12
 
 Regenerate Swift/Kotlin bindings with the matching native library. See the
@@ -20,10 +27,6 @@ Regenerate Swift/Kotlin bindings with the matching native library. See the
   `InvalidModerationReportConfig`, `InvalidReportedPublicKey`, `CannotReportSelf`
   and `ModerationReportRateLimited`. Regenerate bindings with the matching
   library and update exhaustive Swift `switch` / Kotlin `when` handling.
-- `MarmotKitError` gains `ObsoleteKeyPackage { account }` and
-  `MemberDiscoveryIncomplete { account }`; update exhaustive Swift/Kotlin error
-  switches. Recipient fields support focused recovery guidance; Display omits
-  identity.
 
 - `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
   a binding default. Regenerate matching Swift/Kotlin bindings and pass `nil`

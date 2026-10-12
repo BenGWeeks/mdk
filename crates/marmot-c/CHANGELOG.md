@@ -7,6 +7,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Append invitation diagnostic statuses `MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` (101) and `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` (102). Existing status values remain unchanged; detail strings omit recipient identity.
+
 ## [0.13.0] - 2026-10-12
 
 Recompile against the matching `marmot.h` and library: several record layouts changed and new event, Markdown and
@@ -45,7 +49,6 @@ status values are appended. See the [client upgrade guide](../../docs/integratio
   `marmot_media_file_transfer_control_*` and
   `marmot_max_file_media_ciphertext_bytes`. New symbols and borrowed input records require
   matching headers/libraries; existing byte-array APIs retain their bounds.
-- Append invitation diagnostic statuses `MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` (101) and `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` (102). Existing status values remain unchanged; detail strings omit recipient identity.
 
 - Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
   preview records. `MarmotOnboardingRepairProposal` gains an optional
