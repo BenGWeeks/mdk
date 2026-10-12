@@ -144,7 +144,9 @@ pub enum MarmotStatus {
     CannotReportSelf = 99,
     /// Local per-account moderation-report cap; retry later.
     ModerationReportRateLimited = 100,
+    /// Completed discovery found only validated obsolete KeyPackages.
     ObsoleteKeyPackage = 101,
+    /// Bounded member discovery could not establish missing or obsolete-only packages.
     MemberDiscoveryIncomplete = 102,
 }
 
