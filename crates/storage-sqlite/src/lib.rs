@@ -168,7 +168,6 @@ pub use attachment_acquisition::{
 };
 
 pub use attachment_acquisition::{
-    AttachmentCancellationBatch, AttachmentCancellationCursor, AttachmentJobActionToken,
     AttachmentJobCounts, AttachmentJobCursor, AttachmentJobEntry, AttachmentJobOrigin,
     AttachmentJobPage, AttachmentJobQuery, AttachmentJobView, AttachmentManagementFrame,
     AttachmentManagementVersion,

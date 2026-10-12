@@ -1,4 +1,4 @@
-//! Source-bound, bounded management over the authoritative acquisition store.
+//! Bounded per-chat health reads over the authoritative acquisition store.
 use super::*;
 use crate::{AccountAttachmentVersion, AttachmentHistoryEntry};
 
@@ -31,7 +31,6 @@ pub enum AttachmentJobView {
     All,
     Active,
     NeedsAttention,
-    Ready,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AttachmentJobOrigin {
@@ -42,19 +41,20 @@ pub enum AttachmentJobOrigin {
 }
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct AttachmentJobQuery {
-    pub group_id_hex: Option<String>,
+    pub group_id_hex: String,
     pub view: AttachmentJobView,
     pub origin: AttachmentJobOrigin,
 }
 impl AttachmentJobQuery {
     fn canonical(&self) -> StorageResult<Self> {
         let mut q = self.clone();
-        if let Some(g) = &mut q.group_id_hex {
-            if g.is_empty() || g.len() > 512 || hex::decode(&*g).is_err() {
-                return Err(invalid("invalid attachment management group"));
-            }
-            g.make_ascii_lowercase();
+        if q.group_id_hex.is_empty()
+            || q.group_id_hex.len() > 512
+            || hex::decode(&q.group_id_hex).is_err()
+        {
+            return Err(invalid("invalid attachment health group"));
         }
+        q.group_id_hex.make_ascii_lowercase();
         Ok(q)
     }
     fn accepts(&self, explicit: bool, state: AttachmentTransferState) -> bool {
@@ -69,7 +69,6 @@ impl AttachmentJobQuery {
             AttachmentJobView::All => true,
             AttachmentJobView::Active => active(state),
             AttachmentJobView::NeedsAttention => attention(state),
-            AttachmentJobView::Ready => state == AttachmentTransferState::Ready,
         }
     }
 }
@@ -102,18 +101,11 @@ pub struct AttachmentJobCursor {
     before: i64,
 }
 #[derive(Clone, PartialEq, Eq)]
-pub struct AttachmentJobActionToken {
-    history: AccountAttachmentVersion,
-    reference: AttachmentAssetRef,
-    sequence: i64,
-}
-#[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentJobEntry {
     pub group_id_hex: String,
     pub source: AttachmentHistoryEntry,
     pub explicit: bool,
     pub status: AttachmentTransferStatus,
-    pub action: AttachmentJobActionToken,
 }
 #[derive(Clone, Debug)]
 pub struct AttachmentJobPage {
@@ -134,31 +126,10 @@ pub struct AttachmentJobCounts {
     /// False means these are lower bounds from at most1024 current job candidates.
     pub complete: bool,
 }
-#[derive(Clone)]
-pub struct AttachmentCancellationCursor {
-    identity: Vec<u8>,
-    group: Option<String>,
-    automatic_only: bool,
-    cutoff: i64,
-    after: i64,
-}
-#[derive(Clone, Debug)]
-pub struct AttachmentCancellationBatch {
-    pub visited: u32,
-    pub requested: u32,
-    pub preserved: u32,
-    pub next_cursor: Option<AttachmentCancellationCursor>,
-}
 macro_rules! private_formatter {
-    ($($ty:ty),*)=>{$(impl std::fmt::Debug for $ty {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.debug_struct(stringify!($ty)).finish_non_exhaustive()}})*};
+    ($($ty:ty),* $(,)?)=>{$(impl std::fmt::Debug for $ty {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.debug_struct(stringify!($ty)).finish_non_exhaustive()}})*};
 }
-private_formatter!(
-    AttachmentJobQuery,
-    AttachmentJobCursor,
-    AttachmentJobActionToken,
-    AttachmentJobEntry,
-    AttachmentCancellationCursor
-);
+private_formatter!(AttachmentJobQuery, AttachmentJobCursor, AttachmentJobEntry,);
 
 fn history(s: &SqliteAccountStorage, now: u64) -> StorageResult<AccountAttachmentVersion> {
     s.account_attachment_history_version_at(now)
@@ -167,74 +138,40 @@ fn history(s: &SqliteAccountStorage, now: u64) -> StorageResult<AccountAttachmen
             _ => invalid("attachment management history unavailable"),
         })
 }
-fn current_sequence(conn: &Connection) -> StorageResult<i64> {
-    conn.query_row_cached(
-        "SELECT value FROM attachment_management_sequence WHERE id=1",
-        [],
-        |r| r.get(0),
-    )
-    .storage()
+fn current_row(conn: &Connection, group: &str) -> StorageResult<i64> {
+    Ok(conn
+        .query_row_cached(
+            "SELECT rowid FROM attachment_acquisition INDEXED BY attachment_management_group_work
+         WHERE group_id_hex=?1 AND management_ready=0 ORDER BY rowid DESC LIMIT 1",
+            [group],
+            |r| r.get(0),
+        )
+        .optional()
+        .storage()?
+        .unwrap_or(0))
 }
-/// Index seek visits limit+1 job candidates before source, visibility and UI filtering.
+/// The group partial index stores rowid as its implicit tie-breaker.
 type Candidate = (i64, Vec<u8>, String, String, String, u32, bool);
 fn candidates(
     conn: &Connection,
-    group: Option<&str>,
+    group: &str,
     low: i64,
     high: i64,
-    descending: bool,
     limit: usize,
-    exclude_ready: bool,
 ) -> StorageResult<Vec<Candidate>> {
-    let index = match (group.is_some(), exclude_ready) {
-        (true, true) => "attachment_management_group_work",
-        (false, true) => "attachment_management_work",
-        (true, false) => "attachment_management_group_sequence",
-        (false, false) => "attachment_management_sequence_index",
-    };
-    let work = if exclude_ready {
-        " AND management_ready=0"
-    } else {
-        ""
-    };
-    let filter = if group.is_some() {
-        " AND group_id_hex=?4"
-    } else {
-        ""
-    };
-    let order = if descending { "DESC" } else { "ASC" };
-    let sql = format!(
-        "SELECT management_sequence,token,group_id_hex,message_id_hex,source_message_id_hex,attachment_index,explicit_request FROM attachment_acquisition INDEXED BY {index} WHERE management_sequence>?1 AND management_sequence<=?2{filter}{work} ORDER BY management_sequence {order} LIMIT ?3"
-    );
-    let mut values = vec![
-        rusqlite::types::Value::Integer(low),
-        rusqlite::types::Value::Integer(high),
-        rusqlite::types::Value::Integer(limit as i64),
-    ];
-    if let Some(g) = group {
-        values.push(g.to_owned().into());
-    }
-    conn.prepare_cached(&sql)
-        .storage()?
-        .query_map(rusqlite::params_from_iter(values), |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-            ))
-        })
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()
+    conn.prepare_cached(
+        "SELECT rowid,token,group_id_hex,message_id_hex,source_message_id_hex,attachment_index,explicit_request
+         FROM attachment_acquisition INDEXED BY attachment_management_group_work
+         WHERE group_id_hex=?4 AND management_ready=0 AND rowid>?1 AND rowid<=?2
+         ORDER BY rowid DESC LIMIT ?3"
+    ).storage()?.query_map(params![low,high,limit as i64,group], |r| {
+        Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))
+    }).storage()?.collect::<Result<Vec<_>,_>>().storage()
 }
 
 impl SqliteAccountStorage {
     /// Indexed live candidate paging, at most50 candidates plus lookahead. Empty filtered pages can continue.
-    /// Cursors are process-local and privacy-fenced; new intents are offered by a head refresh.
+    /// Cursors are process-local and privacy-fenced; state remains live and a head refresh shows newer work.
     pub fn attachment_jobs_page(
         &self,
         query: &AttachmentJobQuery,
@@ -260,20 +197,15 @@ impl SqliteAccountStorage {
                 }
                 (c.cutoff, c.before)
             } else {
-                let cutoff = current_sequence(&conn)?;
+                let cutoff = current_row(&conn, &query.group_id_hex)?;
                 (cutoff, cutoff.saturating_add(1))
             };
             let rows = candidates(
                 &conn,
-                query.group_id_hex.as_deref(),
+                &query.group_id_hex,
                 0,
                 cutoff.min(before - 1),
-                true,
                 limit + 1,
-                matches!(
-                    query.view,
-                    AttachmentJobView::Active | AttachmentJobView::NeedsAttention
-                ),
             )?;
             drop(conn);
             let more = rows.len() > limit;
@@ -311,14 +243,6 @@ impl SqliteAccountStorage {
                     source: entry,
                     explicit,
                     status,
-                    action: AttachmentJobActionToken {
-                        history: h.clone(),
-                        reference: AttachmentAssetRef {
-                            store_epoch: identity.clone(),
-                            token,
-                        },
-                        sequence,
-                    },
                 });
             }
             Ok(AttachmentJobPage {
@@ -339,26 +263,23 @@ impl SqliteAccountStorage {
     /// Bounded non-ready counts. Retained completed downloads are history, not unhealthy work.
     pub fn attachment_job_counts(
         &self,
-        group: Option<&str>,
+        group: &str,
         now: u64,
         permission: AttachmentManagementPermission,
     ) -> StorageResult<AttachmentJobCounts> {
         let q = AttachmentJobQuery {
-            group_id_hex: group.map(str::to_owned),
+            group_id_hex: group.to_owned(),
             ..Default::default()
         }
         .canonical()?;
         self.connection.with_read_snapshot(|| {
             let conn = self.lock()?;
             let identity = epoch(&conn)?;
-            let (index, group_filter) = if q.group_id_hex.is_some() {
-                ("attachment_management_group_work", " AND group_id_hex=?3")
-            } else { ("attachment_management_work", "") };
             // The materialized index seek fixes candidate work before privacy/source
             // joins. Stream rows rather than preparing four statements per candidate.
             let sql = format!("WITH candidates AS MATERIALIZED (
-                SELECT * FROM attachment_acquisition INDEXED BY {index}
-                WHERE management_ready=0{group_filter} ORDER BY management_sequence DESC LIMIT ?1)
+                SELECT * FROM attachment_acquisition INDEXED BY attachment_management_group_work
+                WHERE management_ready=0 AND group_id_hex=?3 ORDER BY rowid DESC LIMIT ?1)
                 SELECT {},CASE WHEN length(CAST(h.slot_json AS BLOB))<=16384 THEN h.slot_json ELSE '[]' END,
                 h.visible=1 AND length(CAST(h.slot_json AS BLOB))<=16384 AND h.source_message_id_hex=q.source_message_id_hex
                 AND h.source_epoch=q.source_epoch AND h.slot_json=q.slot_json
@@ -368,7 +289,7 @@ impl SqliteAccountStorage {
                 LEFT JOIN app_events a ON a.group_id_hex=q.group_id_hex AND a.message_id_hex=q.message_id_hex
                 LEFT JOIN account_groups g ON g.group_id_hex=q.group_id_hex", super::controls::TRANSFER_STATUS_COLUMNS);
             let mut values = vec![rusqlite::types::Value::Integer((ATTACHMENT_MANAGEMENT_COUNT_LIMIT+1) as i64), rusqlite::types::Value::Integer(u64_to_i64(now)?)];
-            if let Some(group) = q.group_id_hex.as_deref() { values.push(group.to_owned().into()); }
+            values.push(q.group_id_hex.clone().into());
             let mut statement = conn.prepare_cached(&sql).storage()?;
             let mut rows = statement.query(rusqlite::params_from_iter(values)).storage()?;
             let mut visited = 0;
@@ -390,63 +311,6 @@ impl SqliteAccountStorage {
                 }}
             }
             Ok(counts)
-        })
-    }
-    /// Read-only capture of old intent membership. Later inserts, explicit promotions and retries are excluded.
-    pub fn begin_attachment_cancellation(
-        &self,
-        group: Option<&str>,
-        automatic_only: bool,
-    ) -> StorageResult<AttachmentCancellationCursor> {
-        let q = AttachmentJobQuery {
-            group_id_hex: group.map(str::to_owned),
-            ..Default::default()
-        }
-        .canonical()?;
-        let conn = self.lock()?;
-        Ok(AttachmentCancellationCursor {
-            identity: epoch(&conn)?,
-            group: q.group_id_hex,
-            automatic_only,
-            cutoff: current_sequence(&conn)?,
-            after: 0,
-        })
-    }
-    /// At most64 candidates, durable cancellation before worker signalling. Ready bytes and newer intent survive.
-    /// Counts acknowledge requests, never connection termination. Replaying a batch is safe for newer user intent.
-    pub fn cancel_attachment_batch(
-        &self,
-        cursor: &AttachmentCancellationCursor,
-        now: u64,
-    ) -> StorageResult<AttachmentCancellationBatch> {
-        self.connection.with_transaction(|| {
-            let conn=self.lock()?;
-            if epoch(&conn)?!=cursor.identity{return Err(invalid("attachment cancellation account mismatch"));}
-            let rows=candidates(&conn,cursor.group.as_deref(),cursor.after,cursor.cutoff,false,65,false)?;
-            let more=rows.len()>64;let mut next=cursor.clone();let mut visited=0;let mut requested=0;
-            for (seq,token,_,_,_,_,_) in rows.into_iter().take(64) {
-                visited+=1;next.after=seq;
-                let changed=conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0 WHERE token=?1 AND management_sequence=?2 AND state<>3 AND cancelled=0 AND (?3=0 OR explicit_request=0) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?4)"),params![token,seq,cursor.automatic_only,u64_to_i64(now)?]).storage()? as u32;
-                if changed != 0 { advance_intent(&conn,&token)?; }
-                requested+=changed;
-            }
-            Ok(AttachmentCancellationBatch{visited,requested,preserved:visited-requested,next_cursor:more.then_some(next)})
-        })
-    }
-    /// Reject stale intent/action generations before invoking the existing cancel/retry engine.
-    pub fn control_managed_attachment(
-        &self,
-        token: &AttachmentJobActionToken,
-        retry: bool,
-        now: u64,
-    ) -> StorageResult<bool> {
-        self.connection.with_transaction(|| {
-            if history(self,now)?.requires_restart_since(&token.history){return Ok(false);}
-            let conn=self.lock()?;
-            if !matches_store(&conn,&token.reference)?{return Ok(false);}
-            let current:bool=conn.query_row_cached(&format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE token=?1 AND management_sequence=?2 AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?3))"),params![token.reference.token,token.sequence,u64_to_i64(now)?],|r|r.get(0)).storage()?;drop(conn);
-            if !current{return Ok(false);}
-            if retry{self.explicitly_retry_attachment(&token.reference,now)}else{self.cancel_attachment_acquisition(&token.reference)}
         })
     }
 }
@@ -496,13 +360,16 @@ impl SqliteAccountStorage {
         let q = query.canonical()?;
         self.connection.with_read_snapshot(|| {
             let conn=self.lock()?;
-            let available=if let Some(g)=q.group_id_hex.as_deref(){conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM account_groups WHERE group_id_hex=?1 AND pending_confirmation=0)",[g],|r|r.get(0)).storage()?}else{true};
+            let available = conn.query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM account_groups WHERE group_id_hex=?1 AND pending_confirmation=0)",
+                [&q.group_id_hex], |r| r.get(0),
+            ).storage()?;
             let identity=epoch(&conn)?;
             drop(conn);
-            let group=q.group_id_hex.as_deref().map(hex::decode).transpose().map_err(|_|invalid("invalid management group"))?;
-            let failure=if available{group.as_ref().map(|g|self.automatic_recovery_failed(&cgka_traits::GroupId::new(g.clone()))).transpose()?}else{None};
-            let (notices,notices_complete)=if available{self.bounded_parked_recovery_notices(group.as_deref(),50)?}else{(Vec::new(),true)};
-            let counts=if available{self.attachment_job_counts(q.group_id_hex.as_deref(),now,permission)?}else{AttachmentJobCounts::default()};
+            let group = hex::decode(&q.group_id_hex).map_err(|_|invalid("invalid health group"))?;
+            let failure = if available { Some(self.automatic_recovery_failed(&cgka_traits::GroupId::new(group.clone()))?) } else { None };
+            let (notices,notices_complete) = if available { self.bounded_parked_recovery_notices(Some(&group),50)? } else { (Vec::new(),true) };
+            let counts = if available { self.attachment_job_counts(&q.group_id_hex,now,permission)? } else { AttachmentJobCounts::default() };
             let page=self.attachment_jobs_page(&q,50,None,now,permission)?;
             let version = AttachmentManagementVersion {
                 identity,
@@ -521,15 +388,4 @@ impl SqliteAccountStorage {
             Ok(AttachmentManagementFrame{available,automatic_recovery_failed:failure,notices,notices_complete,counts,page,version})
         })
     }
-}
-
-/// Intent advances independently of wall clocks, progress and SQLite rowid reuse.
-pub(super) fn advance_intent(conn: &Connection, token: &[u8]) -> StorageResult<()> {
-    conn.execute(
-        "UPDATE attachment_management_sequence SET value=value+1 WHERE id=1",
-        [],
-    )
-    .storage()?;
-    conn.execute("UPDATE attachment_acquisition SET management_sequence=(SELECT value FROM attachment_management_sequence WHERE id=1) WHERE token=?1",[token]).storage()?;
-    Ok(())
 }

@@ -1,9 +1,8 @@
-//! Shared global/chat download management and independently observed recovery health.
+//! Bounded per-chat attachment and qualified recovery health.
 use super::{MarmotAppRuntime, attachment_history::present, wait_for_runtime_shutdown};
 use crate::{AppError, HistoryNotice};
 use std::{sync::Arc, time::Duration};
 pub use storage_sqlite::{
-    AttachmentCancellationBatch, AttachmentCancellationCursor, AttachmentJobActionToken,
     AttachmentJobCounts, AttachmentJobCursor, AttachmentJobOrigin, AttachmentJobQuery,
     AttachmentJobView, AttachmentManagementVersion,
 };
@@ -14,7 +13,6 @@ pub struct ManagedAttachmentEntry {
     pub entry: super::AttachmentEntry,
     pub explicit: bool,
     pub status: super::AttachmentTransferStatus,
-    pub action: AttachmentJobActionToken,
 }
 impl std::fmt::Debug for ManagedAttachmentEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -32,7 +30,7 @@ pub struct ManagedAttachmentPage {
 #[derive(Clone)]
 pub struct AttachmentManagementSnapshot {
     pub available: bool,
-    /// None for account scope or an unavailable group, never evidence of successful synchronization.
+    /// None for an unavailable group, never evidence of successful synchronization.
     pub automatic_recovery_failed: Option<bool>,
     pub notices: Vec<HistoryNotice>,
     pub notices_complete: bool,
@@ -68,7 +66,6 @@ fn present_page(
                     entry: present(e.source, loopback)?,
                     explicit: e.explicit,
                     status: e.status,
-                    action: e.action,
                 })
             })
             .collect::<Result<_, AppError>>()?,
@@ -166,44 +163,6 @@ impl MarmotAppRuntime {
             Ok(result)
         })
         .await
-    }
-    pub async fn begin_attachment_cancellation(
-        &self,
-        account: &str,
-        group: Option<String>,
-        automatic_only: bool,
-    ) -> Result<AttachmentCancellationCursor, AppError> {
-        self.attachment_read(account, move |s, _| {
-            Ok(s.begin_attachment_cancellation(group.as_deref(), automatic_only)?)
-        })
-        .await
-    }
-    pub async fn cancel_attachment_batch(
-        &self,
-        account: &str,
-        cursor: AttachmentCancellationCursor,
-    ) -> Result<AttachmentCancellationBatch, AppError> {
-        let result = self
-            .attachment_read(account, move |s, _| {
-                Ok(s.cancel_attachment_batch(&cursor, crate::unix_now_seconds())?)
-            })
-            .await?;
-        self.wake_attachment_work();
-        Ok(result)
-    }
-    pub async fn control_managed_attachment(
-        &self,
-        account: &str,
-        action: AttachmentJobActionToken,
-        retry: bool,
-    ) -> Result<bool, AppError> {
-        let result = self
-            .attachment_read(account, move |s, _| {
-                Ok(s.control_managed_attachment(&action, retry, crate::unix_now_seconds())?)
-            })
-            .await?;
-        self.wake_attachment_work();
-        Ok(result)
     }
     /// Event-driven head replacements, at most4Hz. Explicit continuation pages remain pull-based.
     pub async fn subscribe_attachment_management(

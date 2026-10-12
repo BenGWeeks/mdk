@@ -98,7 +98,7 @@ async fn group_health_projection_keeps_accounts_actions_feed_and_diagnostics_sco
     let rt = app.runtime();
     seed(&s, 1);
     let q = AttachmentJobQuery {
-        group_id_hex: Some("aa".into()),
+        group_id_hex: "aa".into(),
         ..Default::default()
     };
     let f = rt
@@ -121,11 +121,15 @@ async fn group_health_projection_keeps_accounts_actions_feed_and_diagnostics_sco
         assert!(!diagnostics.contains(value));
     }
     assert!(!format!("{f:?}").contains("secret"));
-    let action = f.page.entries[0].action.clone();
+    let action = f.page.entries[0].status.reference.clone().unwrap();
     assert!(
-        !rt.control_managed_attachment("bob", action.clone(), false)
-            .await
-            .unwrap()
+        !rt.control_attachment(
+            "bob",
+            action.clone(),
+            super::super::AttachmentControl::Cancel
+        )
+        .await
+        .unwrap()
     );
     let sub = rt
         .subscribe_attachment_management("alice", q.clone())
@@ -148,14 +152,13 @@ async fn group_health_projection_keeps_accounts_actions_feed_and_diagnostics_sco
     sub.state.lock().await.last = tokio::time::Instant::now() + Duration::from_secs(1);
 
     assert!(
-        rt.control_managed_attachment("alice", action.clone(), true)
-            .await
-            .unwrap()
-    );
-    assert!(
-        !rt.control_managed_attachment("alice", action, false)
-            .await
-            .unwrap()
+        rt.control_attachment(
+            "alice",
+            action.clone(),
+            super::super::AttachmentControl::Retry
+        )
+        .await
+        .unwrap()
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(20), sub.next())
@@ -176,17 +179,11 @@ async fn group_health_projection_keeps_accounts_actions_feed_and_diagnostics_sco
     assert!(!next.version.same_as(&f.version));
     sub.close();
     assert!(sub.next().await.unwrap().is_none());
-    let cursor = rt
-        .begin_attachment_cancellation("alice", Some("aa".into()), false)
-        .await
-        .unwrap();
     assert!(
-        rt.cancel_attachment_batch("bob", cursor.clone())
+        rt.control_attachment("alice", action, super::super::AttachmentControl::Cancel)
             .await
-            .is_err()
+            .unwrap()
     );
-    let cancelled = rt.cancel_attachment_batch("alice", cursor).await.unwrap();
-    assert_eq!(cancelled.requested, 1);
     let missing = rt.attachment_management_snapshot("bob", q).await.unwrap();
     assert!(!missing.available);
     assert_eq!(missing.automatic_recovery_failed, None);

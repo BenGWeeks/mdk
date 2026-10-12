@@ -994,7 +994,6 @@ typedef enum MarmotAttachmentJobView {
   MARMOT_ATTACHMENT_JOB_VIEW_ALL,
   MARMOT_ATTACHMENT_JOB_VIEW_ACTIVE,
   MARMOT_ATTACHMENT_JOB_VIEW_NEEDS_ATTENTION,
-  MARMOT_ATTACHMENT_JOB_VIEW_READY,
 } MarmotAttachmentJobView;
 
 typedef enum MarmotAttachmentJobOrigin {
@@ -1235,13 +1234,9 @@ typedef struct MarmotAgentPublisher MarmotAgentPublisher;
  */
 typedef struct MarmotAgentStreamSubscription MarmotAgentStreamSubscription;
 
-typedef struct MarmotAttachmentCancellationCursor MarmotAttachmentCancellationCursor;
-
 typedef struct MarmotAttachmentHistoryCursor MarmotAttachmentHistoryCursor;
 
 typedef struct MarmotAttachmentHistoryVersion MarmotAttachmentHistoryVersion;
-
-typedef struct MarmotAttachmentJobActionToken MarmotAttachmentJobActionToken;
 
 typedef struct MarmotAttachmentJobCursor MarmotAttachmentJobCursor;
 
@@ -5685,7 +5680,7 @@ typedef struct MarmotConversationWindowSnapshot {
 } MarmotConversationWindowSnapshot;
 
 /**
- * Nullable group selects account scope; enums are checked integer discriminants.
+ * The group is required; enums are checked integer discriminants.
  */
 typedef struct MarmotAttachmentJobQuery {
   const char *group_id_hex;
@@ -5708,7 +5703,6 @@ typedef struct MarmotManagedAttachmentEntry {
   struct MarmotAttachmentEntry entry;
   bool explicit_;
   struct MarmotAttachmentTransferStatus status;
-  struct MarmotAttachmentJobActionToken *action;
 } MarmotManagedAttachmentEntry;
 
 typedef struct MarmotManagedAttachmentPage {
@@ -5764,13 +5758,6 @@ typedef struct MarmotAttachmentAutomaticPermissionInput {
   uint8_t audio;
   uint8_t files;
 } MarmotAttachmentAutomaticPermissionInput;
-
-typedef struct MarmotAttachmentCancellationBatch {
-  uint32_t visited;
-  uint32_t requested;
-  uint32_t preserved;
-  struct MarmotAttachmentCancellationCursor *next_cursor;
-} MarmotAttachmentCancellationBatch;
 
 #ifdef __cplusplus
 extern "C" {
@@ -12483,38 +12470,6 @@ MarmotStatus marmot_attachment_management_snapshot(const struct MarmotClient *cl
                                                    struct MarmotAttachmentManagementSnapshot **out);
 
 /**
- * Capture old account/chat intent without changing it. Nonzero automatic_only excludes explicit requests.
- * # Safety
- * Client/account live; group NULL or live; out writable.
- */
-MarmotStatus marmot_begin_attachment_cancellation(const struct MarmotClient *client,
-                                                  const char *account_ref,
-                                                  const char *group_id_hex,
-                                                  uint8_t automatic_only,
-                                                  struct MarmotAttachmentCancellationCursor **out);
-
-/**
- * Request at most64 old cancellations. Preserves ready files and newer intent; does not confirm network stopped.
- * # Safety
- * Inputs live, cursor borrowed and out writable before any mutation.
- */
-MarmotStatus marmot_cancel_attachment_batch(const struct MarmotClient *client,
-                                            const char *account_ref,
-                                            const struct MarmotAttachmentCancellationCursor *cursor,
-                                            struct MarmotAttachmentCancellationBatch **out);
-
-/**
- * Cancel or retry an observed intent generation; nonzero retry selects retry. False means stale/unavailable.
- * # Safety
- * Inputs/action live and out writable; action borrowed.
- */
-MarmotStatus marmot_control_managed_attachment(const struct MarmotClient *client,
-                                               const char *account_ref,
-                                               const struct MarmotAttachmentJobActionToken *action,
-                                               uint8_t retry,
-                                               bool *out);
-
-/**
  * Compare replacement generations. False means replace the snapshot, not a diagnosis.
  * # Safety
  * Both borrowed handles live; out writable.
@@ -12536,22 +12491,6 @@ MarmotStatus marmot_attachment_job_cursor_clone(const struct MarmotAttachmentJob
  * # Safety
  * Value live and out writable.
  */
-MarmotStatus marmot_attachment_job_action_token_clone(const struct MarmotAttachmentJobActionToken *value,
-                                                      struct MarmotAttachmentJobActionToken **out);
-
-/**
- * Clone a live borrowed handle into independent ownership.
- * # Safety
- * Value live and out writable.
- */
-MarmotStatus marmot_attachment_cancellation_cursor_clone(const struct MarmotAttachmentCancellationCursor *value,
-                                                         struct MarmotAttachmentCancellationCursor **out);
-
-/**
- * Clone a live borrowed handle into independent ownership.
- * # Safety
- * Value live and out writable.
- */
 MarmotStatus marmot_attachment_management_version_clone(const struct MarmotAttachmentManagementVersion *value,
                                                         struct MarmotAttachmentManagementVersion **out);
 
@@ -12561,20 +12500,6 @@ MarmotStatus marmot_attachment_management_version_clone(const struct MarmotAttac
  * Value NULL or library-owned, unfreed and with no outstanding borrows.
  */
 void marmot_attachment_job_cursor_free(struct MarmotAttachmentJobCursor *value);
-
-/**
- * Deep-free an independently owned root or clone. NULL is a no-op; embedded handles are borrowed.
- * # Safety
- * Value NULL or library-owned, unfreed and with no outstanding borrows.
- */
-void marmot_attachment_job_action_token_free(struct MarmotAttachmentJobActionToken *value);
-
-/**
- * Deep-free an independently owned root or clone. NULL is a no-op; embedded handles are borrowed.
- * # Safety
- * Value NULL or library-owned, unfreed and with no outstanding borrows.
- */
-void marmot_attachment_cancellation_cursor_free(struct MarmotAttachmentCancellationCursor *value);
 
 /**
  * Deep-free an independently owned root or clone. NULL is a no-op; embedded handles are borrowed.
@@ -12596,13 +12521,6 @@ void marmot_managed_attachment_page_free(struct MarmotManagedAttachmentPage *val
  * Value NULL or library-owned, unfreed and with no outstanding borrows.
  */
 void marmot_attachment_management_snapshot_free(struct MarmotAttachmentManagementSnapshot *value);
-
-/**
- * Deep-free an independently owned root or clone. NULL is a no-op; embedded handles are borrowed.
- * # Safety
- * Value NULL or library-owned, unfreed and with no outstanding borrows.
- */
-void marmot_attachment_cancellation_batch_free(struct MarmotAttachmentCancellationBatch *value);
 
 #ifdef __cplusplus
 }  // extern "C"

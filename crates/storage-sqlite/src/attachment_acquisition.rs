@@ -737,24 +737,18 @@ impl SqliteAccountStorage {
         reference: &AttachmentAssetRef,
         now: u64,
     ) -> StorageResult<bool> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            if !matches_store(&conn, reference)? {
-                return Ok(false);
-            }
-            let changed = conn
-                .execute(
-                    "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
+        let conn = self.lock()?;
+        if !matches_store(&conn, reference)? {
+            return Ok(false);
+        }
+        Ok(conn
+            .execute(
+                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
              WHERE token=?1 AND state IN (2,4,5)",
-                    params![reference.token, u64_to_i64(now)?],
-                )
-                .storage()?
-                == 1;
-            if changed {
-                management::advance_intent(&conn, &reference.token)?;
-            }
-            Ok(changed)
-        })
+                params![reference.token, u64_to_i64(now)?],
+            )
+            .storage()?
+            == 1)
     }
 
     /// Suppress this original message slot durably even when it has no bytes yet.

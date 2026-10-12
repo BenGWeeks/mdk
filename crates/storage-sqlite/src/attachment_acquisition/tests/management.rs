@@ -1,3 +1,9 @@
+fn chat_query() -> AttachmentJobQuery {
+    AttachmentJobQuery {
+        group_id_hex: GROUP.into(),
+        ..Default::default()
+    }
+}
 use super::*;
 use crate::attachment_acquisition::management::*;
 fn permitted(automatic: bool) -> AttachmentManagementPermission {
@@ -15,7 +21,7 @@ fn managed_download_paging_counts_and_filters_are_local_bounded_and_source_bound
         seed(&s, &m);
         request(&s, &m);
     }
-    let query = AttachmentJobQuery::default();
+    let query = chat_query();
     let mut cursor = None;
     let mut seen = 0;
     loop {
@@ -30,12 +36,12 @@ fn managed_download_paging_counts_and_filters_are_local_bounded_and_source_bound
         }
     }
     assert_eq!(seen, 73);
-    let counts = s.attachment_job_counts(None, 12, permitted(true)).unwrap();
+    let counts = s.attachment_job_counts(GROUP, 12, permitted(true)).unwrap();
     assert!(counts.complete);
     assert_eq!(counts.active, 73);
     let q = AttachmentJobQuery {
-        view: AttachmentJobView::Ready,
-        ..Default::default()
+        view: AttachmentJobView::NeedsAttention,
+        ..chat_query()
     };
     let empty = s
         .attachment_jobs_page(&q, 1, None, 12, permitted(true))
@@ -66,8 +72,8 @@ fn managed_download_paging_counts_and_filters_are_local_bounded_and_source_bound
     let f = s
         .attachment_management_frame(
             &AttachmentJobQuery {
-                group_id_hex: Some(GROUP.into()),
-                ..Default::default()
+                group_id_hex: GROUP.into(),
+                ..chat_query()
             },
             12,
             permitted(true),
@@ -76,77 +82,6 @@ fn managed_download_paging_counts_and_filters_are_local_bounded_and_source_bound
     assert!(!f.available);
     assert!(f.page.entries.is_empty());
     assert_eq!(f.automatic_recovery_failed, None);
-}
-
-#[test]
-fn cancellation_freezes_old_intent_and_preserves_promotions_new_work_and_ready_bytes() {
-    let s = SqliteAccountStorage::in_memory().unwrap();
-    for n in 0..130 {
-        let m = format!("job-{n}");
-        seed(&s, &m);
-        request(&s, &m);
-    }
-    let old = s.begin_attachment_cancellation(None, true).unwrap();
-    let promote = request(&s, "job-0");
-    assert!(s.promote_attachment_demand(&promote, 12).unwrap());
-    let ready = request(&s, "job-1");
-    publish(&s, &ready);
-    seed(&s, "new");
-    let new = request(&s, "new");
-    let other = SqliteAccountStorage::in_memory().unwrap();
-    assert!(other.cancel_attachment_batch(&old, 12).is_err());
-    let mut cursor = Some(old.clone());
-    let mut requested = 0;
-    let mut visited = 0;
-    while let Some(c) = cursor {
-        let batch = s.cancel_attachment_batch(&c, 12).unwrap();
-        assert!(batch.visited <= 64);
-        requested += batch.requested;
-        visited += batch.visited;
-        cursor = batch.next_cursor;
-    }
-    assert_eq!(requested, 128);
-    assert_eq!(visited, 129);
-    assert_eq!(read(&s, &ready), BODY);
-    for r in [&promote, &new] {
-        assert_eq!(
-            s.attachment_acquisition_status(r).unwrap().unwrap().state,
-            AttachmentAcquisitionState::Queued
-        );
-    }
-    let before = s
-        .attachment_jobs_page(
-            &AttachmentJobQuery::default(),
-            50,
-            None,
-            12,
-            permitted(true),
-        )
-        .unwrap();
-    let token = before
-        .entries
-        .iter()
-        .find(|e| e.source.message_id_hex == "job-129")
-        .unwrap()
-        .action
-        .clone();
-    assert!(s.control_managed_attachment(&token, true, 13).unwrap());
-    assert!(!s.control_managed_attachment(&token, false, 13).unwrap());
-    let replay = s.cancel_attachment_batch(&old, 13).unwrap();
-    assert_eq!(replay.requested, 0);
-    // Retry is a new intent even when an explicit queued request is retried again.
-    let fresh = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 13, permitted(true))
-        .unwrap()
-        .entries[0]
-        .action
-        .clone();
-    let newer_cancel = s.begin_attachment_cancellation(None, false).unwrap();
-    assert!(s.control_managed_attachment(&fresh, true, 14).unwrap());
-    assert!(!s.control_managed_attachment(&fresh, false, 14).unwrap());
-    s.cancel_attachment_batch(&newer_cancel, 14).unwrap();
-    let counts = s.attachment_job_counts(None, 14, permitted(true)).unwrap();
-    assert!(counts.active >= 1);
 }
 
 #[test]
@@ -165,27 +100,27 @@ fn counts_are_explicit_lower_bounds_and_queries_seek_management_indexes() {
         .unwrap();
     let start = std::time::Instant::now();
     let frame = s
-        .attachment_management_frame(&AttachmentJobQuery::default(), 12, permitted(true))
+        .attachment_management_frame(&chat_query(), 12, permitted(true))
         .unwrap();
     eprintln!(
         "management_frame_1027_jobs_us={}",
         start.elapsed().as_micros()
     );
     assert_eq!(frame.page.entries.len(), 50);
-    let counts = s.attachment_job_counts(None, 12, permitted(true)).unwrap();
+    let counts = s.attachment_job_counts(GROUP, 12, permitted(true)).unwrap();
     assert!(!counts.complete);
     assert_eq!(counts.active, 1024);
     // Ready lifetime history must never spend the health/count or attention-page budget.
     sql(&s, "UPDATE attachment_acquisition SET state=3,due=NULL WHERE message_id_hex<>'job-0';
         INSERT INTO retained_attachment_bytes(token,bytes) SELECT token,x'00' FROM attachment_acquisition WHERE state=3;
         UPDATE attachment_acquisition SET state=4,due=NULL WHERE message_id_hex='job-0';");
-    let health = s.attachment_job_counts(None, 12, permitted(true)).unwrap();
+    let health = s.attachment_job_counts(GROUP, 12, permitted(true)).unwrap();
     assert!(health.complete);
     assert_eq!(health.needs_attention, 1);
     assert_eq!(health.active, 0);
     let attention_query = AttachmentJobQuery {
         view: AttachmentJobView::NeedsAttention,
-        ..Default::default()
+        ..chat_query()
     };
     let attention_page = s
         .attachment_jobs_page(&attention_query, 1, None, 12, permitted(true))
@@ -196,24 +131,14 @@ fn counts_are_explicit_lower_bounds_and_queries_seek_management_indexes() {
         &s,
         "DELETE FROM retained_attachment_bytes WHERE token=(SELECT token FROM attachment_acquisition WHERE message_id_hex='job-1');",
     );
-    let health = s.attachment_job_counts(None, 12, permitted(true)).unwrap();
+    let health = s.attachment_job_counts(GROUP, 12, permitted(true)).unwrap();
     assert!(health.complete);
     assert_eq!(health.needs_attention, 2);
     let c = s.lock().unwrap();
-    for (sql, index) in [
-        (
-            "EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition INDEXED BY attachment_management_sequence_index WHERE management_sequence>0 AND management_sequence<=99999 ORDER BY management_sequence DESC LIMIT 51",
-            "attachment_management_sequence_index",
-        ),
-        (
-            "EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition INDEXED BY attachment_management_group_sequence WHERE group_id_hex='abababababababababababababababab' AND management_sequence>0 AND management_sequence<=99999 ORDER BY management_sequence DESC LIMIT 51",
-            "attachment_management_group_sequence",
-        ),
-        (
-            "EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition INDEXED BY attachment_management_work WHERE management_ready=0 ORDER BY management_sequence DESC LIMIT 51",
-            "attachment_management_work",
-        ),
-    ] {
+    for (sql, index) in [(
+        "EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition INDEXED BY attachment_management_group_work WHERE group_id_hex='abababababababababababababababab' AND management_ready=0 AND rowid>0 AND rowid<=99999 ORDER BY rowid DESC LIMIT 51",
+        "attachment_management_group_work",
+    )] {
         let plan = c
             .prepare(sql)
             .unwrap()
@@ -226,13 +151,6 @@ fn counts_are_explicit_lower_bounds_and_queries_seek_management_indexes() {
         assert!(!plan.contains("TEMP B-TREE"));
     }
     drop(c);
-    assert!(
-        !format!(
-            "{:?}",
-            s.begin_attachment_cancellation(None, false).unwrap()
-        )
-        .contains(GROUP)
-    );
 }
 
 #[test]
@@ -270,8 +188,8 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
         );
     }
     let q = AttachmentJobQuery {
-        group_id_hex: Some(GROUP.into()),
-        ..Default::default()
+        group_id_hex: GROUP.into(),
+        ..chat_query()
     };
     let f = s
         .attachment_management_frame(&q, 12, permitted(true))
@@ -318,7 +236,7 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
         .attachment_jobs_page(
             &AttachmentJobQuery {
                 origin: AttachmentJobOrigin::Automatic,
-                ..Default::default()
+                ..chat_query()
             },
             50,
             None,
@@ -333,10 +251,10 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
             .all(|e| e.status.state != AttachmentTransferState::Cancelled)
     );
 
-    let global = s
-        .attachment_management_frame(&AttachmentJobQuery::default(), 12, permitted(true))
-        .unwrap();
-    assert!(!global.version.same_as(&f.version));
+    assert!(
+        s.attachment_management_frame(&AttachmentJobQuery::default(), 12, permitted(true))
+            .is_err()
+    );
     let filtered = s
         .attachment_management_frame(
             &AttachmentJobQuery {
@@ -381,58 +299,6 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
 }
 
 #[test]
-fn cancelling_intent_invalidates_old_actions_without_deleting_ready_bytes() {
-    let s = SqliteAccountStorage::in_memory().unwrap();
-    seed(&s, "one");
-    request(&s, "one");
-    let old = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, permitted(true))
-        .unwrap()
-        .entries[0]
-        .action
-        .clone();
-    let cursor = s.begin_attachment_cancellation(None, false).unwrap();
-    assert_eq!(s.cancel_attachment_batch(&cursor, 12).unwrap().requested, 1);
-    assert!(!s.control_managed_attachment(&old, true, 13).unwrap());
-    let page = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 13, permitted(true))
-        .unwrap();
-    assert_eq!(
-        page.entries[0].status.state,
-        AttachmentTransferState::Cancelled
-    );
-    assert!(
-        s.control_managed_attachment(&page.entries[0].action, true, 13)
-            .unwrap()
-    );
-    assert_eq!(s.cancel_attachment_batch(&cursor, 13).unwrap().requested, 0);
-}
-
-#[test]
-fn action_tokens_require_refresh_after_visibility_is_reallowed() {
-    let s = SqliteAccountStorage::in_memory().unwrap();
-    seed(&s, "one");
-    request(&s, "one");
-    let old = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, permitted(true))
-        .unwrap()
-        .entries[0]
-        .action
-        .clone();
-    sql(&s, "INSERT INTO user_blocks VALUES('author',0,0);");
-    assert!(!s.control_managed_attachment(&old, false, 12).unwrap());
-    sql(&s, "DELETE FROM user_blocks WHERE public_key='author';");
-    assert!(!s.control_managed_attachment(&old, false, 12).unwrap());
-    let current = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, permitted(true))
-        .unwrap();
-    assert!(
-        s.control_managed_attachment(&current.entries[0].action, false, 12)
-            .unwrap()
-    );
-}
-
-#[test]
 fn management_expiry_replaces_the_frame_once_without_database_writes() {
     let s = SqliteAccountStorage::in_memory().unwrap();
     seed(&s, "one");
@@ -441,7 +307,7 @@ fn management_expiry_replaces_the_frame_once_without_database_writes() {
         &s,
         "UPDATE app_events SET retention_expires_at=13 WHERE message_id_hex='one';",
     );
-    let q = AttachmentJobQuery::default();
+    let q = chat_query();
     let before = s
         .attachment_management_frame(&q, 12, permitted(true))
         .unwrap();
@@ -458,4 +324,29 @@ fn management_expiry_replaces_the_frame_once_without_database_writes() {
         .unwrap();
     assert!(later.version.same_as(&after.version));
     assert_eq!(later.page.next_expiry, None);
+}
+
+#[test]
+fn health_references_reuse_existing_account_scoped_controls() {
+    let s = SqliteAccountStorage::in_memory().unwrap();
+    seed(&s, "one");
+    request(&s, "one");
+    let reference = s
+        .attachment_jobs_page(&chat_query(), 1, None, 12, permitted(true))
+        .unwrap()
+        .entries[0]
+        .status
+        .reference
+        .clone()
+        .unwrap();
+    let other = SqliteAccountStorage::in_memory().unwrap();
+    assert!(!other.cancel_attachment_acquisition(&reference).unwrap());
+    assert!(s.cancel_attachment_acquisition(&reference).unwrap());
+    assert!(s.explicitly_retry_attachment(&reference, 13).unwrap());
+    assert_eq!(
+        s.attachment_job_counts(GROUP, 13, permitted(true))
+            .unwrap()
+            .active,
+        1
+    );
 }

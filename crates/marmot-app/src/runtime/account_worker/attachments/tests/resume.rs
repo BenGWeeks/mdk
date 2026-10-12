@@ -1745,16 +1745,12 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
                 .set_attachment_download_policy(&policy, crate::unix_now_seconds())
                 .unwrap();
         } else if mode == 2 {
-            let cursor = runtime
-                .begin_attachment_cancellation("alice", Some(GROUP.into()), false)
-                .await
-                .unwrap();
-            let batch = runtime
-                .cancel_attachment_batch("alice", cursor)
-                .await
-                .unwrap();
-            assert_eq!(batch.requested, 1);
-            assert!(batch.next_cursor.is_none());
+            assert!(
+                runtime
+                    .control_attachment("alice", asset.clone(), crate::AttachmentControl::Cancel)
+                    .await
+                    .unwrap()
+            );
         } else {
             store.cancel_attachment_acquisition(&asset).unwrap();
         }

@@ -469,7 +469,7 @@ diff-gates the checked-in header.
 
 ## Download management and chat health
 
-Use the [download management contract](../marmot-uniffi/ATTACHMENT-MANAGEMENT.md) for global/chat transfer visibility, explicit partial totals, intent-fenced cancellation and independently observed recovery health. Replacement feeds use existing native invalidations with no idle polling. Queries and embedded handles are borrowed; C results have deep-free roots and independently cloneable continuations/actions.
+Use the [per-chat health contract](../marmot-uniffi/ATTACHMENT-MANAGEMENT.md) for per-chat transfer visibility, explicit partial totals and independently observed recovery health. Replacement feeds use existing native invalidations with no idle polling. Queries and embedded handles are borrowed; C results have deep-free roots and independently cloneable continuations and versions.
 
 ## Account attachment history
 

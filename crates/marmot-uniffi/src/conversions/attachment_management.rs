@@ -8,7 +8,6 @@ pub enum AttachmentJobViewFfi {
     All,
     Active,
     NeedsAttention,
-    Ready,
 }
 #[derive(Clone, Copy, Debug, Default, uniffi::Enum)]
 pub enum AttachmentJobOriginFfi {
@@ -19,7 +18,7 @@ pub enum AttachmentJobOriginFfi {
 }
 #[derive(Clone, uniffi::Record)]
 pub struct AttachmentJobQueryFfi {
-    pub group_id_hex: Option<String>,
+    pub group_id_hex: String,
     pub view: AttachmentJobViewFfi,
     pub origin: AttachmentJobOriginFfi,
 }
@@ -31,7 +30,6 @@ impl From<AttachmentJobQueryFfi> for app::AttachmentJobQuery {
                 AttachmentJobViewFfi::All => app::AttachmentJobView::All,
                 AttachmentJobViewFfi::Active => app::AttachmentJobView::Active,
                 AttachmentJobViewFfi::NeedsAttention => app::AttachmentJobView::NeedsAttention,
-                AttachmentJobViewFfi::Ready => app::AttachmentJobView::Ready,
             },
             origin: match q.origin {
                 AttachmentJobOriginFfi::Any => app::AttachmentJobOrigin::Any,
@@ -50,11 +48,6 @@ macro_rules! opaque_object {
     };
 }
 opaque_object!(AttachmentJobCursor, app::AttachmentJobCursor);
-opaque_object!(AttachmentJobActionToken, app::AttachmentJobActionToken);
-opaque_object!(
-    AttachmentCancellationCursor,
-    app::AttachmentCancellationCursor
-);
 opaque_object!(
     AttachmentManagementVersion,
     app::AttachmentManagementVersion
@@ -72,7 +65,6 @@ pub struct ManagedAttachmentEntryFfi {
     pub entry: AttachmentEntryFfi,
     pub explicit: bool,
     pub status: AttachmentTransferStatusFfi,
-    pub action: Arc<AttachmentJobActionToken>,
 }
 #[derive(Clone, uniffi::Record)]
 pub struct ManagedAttachmentPageFfi {
@@ -91,12 +83,7 @@ impl From<app::ManagedAttachmentPage> for ManagedAttachmentPageFfi {
                     group_id_hex: e.group_id_hex,
                     entry: e.entry.into(),
                     explicit: e.explicit,
-                    status: {
-                        let mut status: AttachmentTransferStatusFfi = Some(e.status).into();
-                        status.reference = None;
-                        status
-                    },
-                    action: Arc::new(AttachmentJobActionToken { inner: e.action }),
+                    status: Some(e.status).into(),
                 })
                 .collect(),
             next_cursor: p
@@ -156,31 +143,11 @@ impl From<app::AttachmentManagementSnapshot> for AttachmentManagementSnapshotFfi
         }
     }
 }
-#[derive(Clone, Debug, uniffi::Record)]
-pub struct AttachmentCancellationBatchFfi {
-    pub visited: u32,
-    pub requested: u32,
-    pub preserved: u32,
-    pub next_cursor: Option<Arc<AttachmentCancellationCursor>>,
-}
-impl From<app::AttachmentCancellationBatch> for AttachmentCancellationBatchFfi {
-    fn from(b: app::AttachmentCancellationBatch) -> Self {
-        Self {
-            visited: b.visited,
-            requested: b.requested,
-            preserved: b.preserved,
-            next_cursor: b
-                .next_cursor
-                .map(|inner| Arc::new(AttachmentCancellationCursor { inner })),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn partial_totals_and_cancellation_acknowledgements_cross_the_boundary() {
+    fn partial_totals_and_chat_scope_cross_the_boundary() {
         let counts: AttachmentJobCountsFfi = app::AttachmentJobCounts {
             active: 1024,
             complete: false,
@@ -193,17 +160,8 @@ mod tests {
         assert!(!counts.complete);
         assert_eq!(counts.paused, 3);
         assert_eq!(counts.policy_blocked, 7);
-        let batch: AttachmentCancellationBatchFfi = app::AttachmentCancellationBatch {
-            visited: 64,
-            requested: 59,
-            preserved: 5,
-            next_cursor: None,
-        }
-        .into();
-        assert_eq!(batch.visited, batch.requested + batch.preserved);
-        assert!(batch.next_cursor.is_none());
         let q: app::AttachmentJobQuery = AttachmentJobQueryFfi {
-            group_id_hex: Some("aa".into()),
+            group_id_hex: "aa".into(),
             view: AttachmentJobViewFfi::NeedsAttention,
             origin: AttachmentJobOriginFfi::Explicit,
         }

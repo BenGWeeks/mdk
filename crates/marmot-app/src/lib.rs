@@ -8037,7 +8037,6 @@ pub use runtime::{
 };
 
 pub use runtime::{
-    AttachmentCancellationBatch, AttachmentCancellationCursor, AttachmentJobActionToken,
     AttachmentJobCounts, AttachmentJobCursor, AttachmentJobOrigin, AttachmentJobQuery,
     AttachmentJobView, AttachmentManagementSnapshot, AttachmentManagementVersion,
     ManagedAttachmentEntry, ManagedAttachmentPage, RuntimeAttachmentManagementSubscription,

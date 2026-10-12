@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add bounded account/chat download management, old-intent cancellation and independently observed recovery health. Shared bindings require matching artifacts and C layouts require the generated matching header.
+- Add bounded per-chat attachment and qualified recovery health with event-driven local observations and existing per-item controls. Shared bindings require matching artifacts and C layouts require the generated matching header.
 
 ### Added
 

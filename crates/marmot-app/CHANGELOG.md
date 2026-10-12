@@ -4,7 +4,7 @@
 
 ### Added
 
-- Add bounded account/chat download management, old-intent cancellation and independently observed recovery health. Shared bindings require matching artifacts and C layouts require the generated matching header.
+- Add bounded per-chat attachment and qualified recovery health with event-driven local observations and existing per-item controls. Shared bindings require matching artifacts and C layouts require the generated matching header.
 - Account-wide local attachment pages expose bounded typed metadata, group/sender/date selection, continuation cursors and retention deadlines. Reads start no acquisition or relay activity.
 
 ## 0.13.0 - 2026-10-12

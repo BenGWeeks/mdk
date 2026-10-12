@@ -88,7 +88,7 @@ screen API exists. The method reference marks explicit alternatives individually
 | Reaction details | `messageReactions` for complete effective participants | Window references contain bounded previews only. See [complete reaction details](CONVERSATION-WINDOW.md#complete-reaction-details). |
 | Composer | `selectedMessageDraft`, revision-conditional save/clear/attachment reads, `sendMessageDraft` | Unconditional `messageDraft` / `saveMessageDraft` / `deleteMessageDraft` for older single-owner flows; new concurrent composers should use revisions. `sendText` and other direct send methods remain supported. |
 | Visible avatars | `requestAvatarAssets` then `readAvatarAssets` using screen metadata | `downloadProfileImage` / `downloadGroupBlossomImage` for explicit low-level downloads; new screens should use MDK's durable cache. |
-| Download management and chat health | `attachmentManagementSnapshot`, `managedAttachmentPage` and `subscribeAttachmentManagement` | Explicit-target transfer snapshots remain supported; new global/chat managers use intent-fenced controls and clearly labelled partial totals. |
+| Download management and chat health | `attachmentManagementSnapshot`, `managedAttachmentPage` and `subscribeAttachmentManagement` | Explicit-target transfer snapshots remain supported; per-chat health uses existing per-item controls and clearly labelled partial totals. |
 | Media library | `attachmentHistoryPage` / `attachmentHistoryVersion` | `listMedia` is the older accepted-only listing; it omits rejected source slots and lacks the new cursor/version contract. |
 | Display received media | `attachmentLocalAssets` then `readAttachmentAsset`, plus transfer observation/controls | `downloadMedia` is a supported one-shot network download returning full transient bytes. It is not a retained-cache read. |
 | KeyPackage settings | `localAccountKeyPackages`, then `refreshAccountKeyPackages` | `accountKeyPackages` for the existing network-oriented inventory; `accountKeyPackageRelayEvents` remains useful for observed publication history. |
@@ -1142,7 +1142,7 @@ integration changes, and unresolved release questions.
 
 ## Download management and chat health
 
-Use the [download management contract](../marmot-uniffi/ATTACHMENT-MANAGEMENT.md) for global/chat transfer visibility, explicit partial totals, intent-fenced cancellation and independently observed recovery health. Replacement feeds use existing native invalidations with no idle polling. Swift/Kotlin records carry opaque managed cursor/action/version objects; C consumers use borrowed inputs, deep-free roots and independent handle clones.
+Use the [per-chat health contract](../marmot-uniffi/ATTACHMENT-MANAGEMENT.md) for per-chat transfer visibility, explicit partial totals and independently observed recovery health. Replacement feeds use existing native invalidations with no idle polling. Swift/Kotlin records carry opaque managed cursor/version objects; C consumers use borrowed inputs, deep-free roots and independent handle clones.
 
 ## Account attachment history
 

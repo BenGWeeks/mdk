@@ -349,14 +349,12 @@ impl SqliteAccountStorage {
         &self,
         reference: &AttachmentAssetRef,
     ) -> StorageResult<bool> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            if !matches_store(&conn, reference)? { return Ok(false); }
-            let previous: Option<bool> = conn.query_row_cached("SELECT cancelled FROM attachment_acquisition WHERE token=?1",[&reference.token],|r|r.get(0)).optional().storage()?;
-            let changed=conn.execute("UPDATE attachment_acquisition SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0 WHERE token=?1 AND state<>3",[&reference.token]).storage()?==1;
-            if changed && previous == Some(false) { super::management::advance_intent(&conn,&reference.token)?; }
-            Ok(changed)
-        })
+        let conn = self.lock()?;
+        if !matches_store(&conn, reference)? {
+            return Ok(false);
+        }
+        Ok(conn.execute("UPDATE attachment_acquisition SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0
+            WHERE token=?1 AND state<>3",[&reference.token]).storage()?==1)
     }
 
     /// Upgrade live demand without resetting retry budgets, backoff or an active
@@ -373,7 +371,7 @@ impl SqliteAccountStorage {
             if !matches_store(&conn, reference)? {
                 return Ok(false);
             }
-            let changed=conn
+            Ok(conn
                 .execute(
                     &format!(
                         "UPDATE attachment_acquisition AS q SET
@@ -393,9 +391,7 @@ impl SqliteAccountStorage {
                     params![reference.token, u64_to_i64(now)?],
                 )
                 .storage()?
-                == 1;
-            if changed { super::management::advance_intent(&conn,&reference.token)?; }
-            Ok(changed)
+                == 1)
         })
     }
 
@@ -473,11 +469,9 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
             if !matches_store(&conn,reference)? {return Ok(false);}
-            let changed=conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
+            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
                 WHERE token=?1 AND (state IN(0,1,2,4,5) OR (state=3 AND NOT EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token))) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?2)"),
-                params![reference.token,u64_to_i64(now)?]).storage()?==1;
-            if changed {super::management::advance_intent(&conn,&reference.token)?;}
-            Ok(changed)
+                params![reference.token,u64_to_i64(now)?]).storage()?==1)
         })
     }
 
