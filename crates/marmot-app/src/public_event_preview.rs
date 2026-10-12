@@ -2179,10 +2179,49 @@ impl MarmotApp {
         self.account_dir(label).join("public-events-v1.sqlite3")
     }
 
+    pub(crate) fn public_event_cache_gate(&self, label: &str) -> Arc<std::sync::Mutex<()>> {
+        let mut gates = self
+            .public_event_cache_gates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        gates.retain(|_, gate| gate.strong_count() != 0);
+        if let Some(gate) = gates.get(label).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        gates.insert(label.to_owned(), Arc::downgrade(&gate));
+        gate
+    }
+
     pub(crate) fn public_event_cache_for_account(
         &self,
         account: &AccountSummary,
     ) -> Result<PublicEventCache, AppError> {
+        self.public_event_cache_for_account_if_current(account, || true)?
+            .ok_or(AppError::TransportClosed)
+    }
+
+    /// Revalidate under the account's cache-opening fence. Removal first marks
+    /// the account tearing down, then takes this same fence before cache eviction.
+    pub(crate) fn public_event_cache_for_account_if_current(
+        &self,
+        account: &AccountSummary,
+        is_current: impl FnOnce() -> bool,
+    ) -> Result<Option<PublicEventCache>, AppError> {
+        let gate = self.public_event_cache_gate(&account.label);
+        let _opening = gate.lock().unwrap_or_else(|p| p.into_inner());
+        self.public_event_cache_for_account_under_gate(account, is_current)
+    }
+
+    /// Caller holds `public_event_cache_gate` through its complete local operation.
+    pub(crate) fn public_event_cache_for_account_under_gate(
+        &self,
+        account: &AccountSummary,
+        is_current: impl FnOnce() -> bool,
+    ) -> Result<Option<PublicEventCache>, AppError> {
+        if !is_current() {
+            return Ok(None);
+        }
         self.ensure_storage_open("public event cache")?;
         if let Some(cache) = self
             .public_event_caches
@@ -2191,7 +2230,7 @@ impl MarmotApp {
             .get(&account.label)
             .cloned()
         {
-            return Ok(cache);
+            return Ok(Some(cache));
         }
         let _lifecycle = self.begin_storage_open("public event cache")?;
         let _span = tracing::debug_span!(
@@ -2210,7 +2249,7 @@ impl MarmotApp {
             .get(&account.label)
             .cloned()
         {
-            return Ok(cache);
+            return Ok(Some(cache));
         }
         let key = if account.local_signing {
             let keys = self.account_home().load_signing_keys(&account.label)?;
@@ -2235,10 +2274,12 @@ impl MarmotApp {
             .public_event_caches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(caches
-            .entry(account.label.clone())
-            .or_insert_with(|| cache.clone())
-            .clone())
+        Ok(Some(
+            caches
+                .entry(account.label.clone())
+                .or_insert_with(|| cache.clone())
+                .clone(),
+        ))
     }
 
     /// Whether `cache` is still the published handle for `label`. Removal,

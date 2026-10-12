@@ -10,8 +10,9 @@
 //! deadline, a raw wire-byte budget charged below TLS/WebSocket parsing and an
 //! item budget charged on decoded messages before the SDK verifies or
 //! deduplicates anything. A phase meter is a child of the caller's
-//! request-wide meter, so the totals hold across relays and phases. Each phase
-//! owns its sockets and force-closes them when it ends or is cancelled.
+//! request-wide meter, so the totals hold across relays and phases. Sockets
+//! belong to the request and are reused when connected; each phase retries
+//! disconnected original endpoints within its deadline. Cancellation closes all.
 //! Nothing here verifies, persists or logs event data; callers own admission.
 
 use std::sync::Arc;
@@ -26,8 +27,8 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use super::public_event_transport::{
-    CloseSocketsOnDrop, PinnedPublicEventTransport, PublicEventSocketRegistry,
-    PublicEventTrafficLimits, PublicEventTrafficMeter,
+    CloseSocketsOnDrop, PinnedPublicEventTransport, PublicEventPhaseRoute,
+    PublicEventSocketRegistry, PublicEventTrafficLimits, PublicEventTrafficMeter,
 };
 use super::{DIRECTORY_RELAY_CONNECT_WAIT, RelaySafetyPolicy};
 
@@ -144,10 +145,9 @@ pub(crate) struct PublicEventQuerySession {
     client: NostrSdkClient,
     sockets: Arc<PublicEventSocketRegistry>,
     _close_sockets: CloseSocketsOnDrop,
-    route: Arc<PublicEventTrafficMeter>,
+    route: Arc<PublicEventPhaseRoute>,
     request: Arc<PublicEventTrafficMeter>,
-    urls: Option<Vec<RelayUrl>>,
-    connected: Vec<RelayUrl>,
+    urls: Vec<RelayUrl>,
     deadline: Instant,
 }
 
@@ -166,7 +166,7 @@ impl PublicEventQuerySession {
         urls.dedup();
         urls.truncate(PUBLIC_EVENT_QUERY_MAX_RELAYS);
         let sockets = PublicEventSocketRegistry::new();
-        let route = PublicEventTrafficMeter::routed(request);
+        let route = PublicEventPhaseRoute::new(request);
         let client = NostrSdkClient::builder()
             .websocket_transport(PinnedPublicEventTransport::new(
                 policy,
@@ -181,8 +181,7 @@ impl PublicEventQuerySession {
             sockets,
             route,
             request: request.clone(),
-            urls: Some(urls),
-            connected: Vec::new(),
+            urls,
             deadline,
         }
     }
@@ -215,17 +214,9 @@ impl PublicEventQuerySession {
             },
         );
         self.route.route_to(&phase);
-        if let Some(urls) = self.urls.take() {
-            self.connected = connect(&self.client, urls, deadline).await;
-        }
-        let mut connected = Vec::with_capacity(self.connected.len());
-        for url in &self.connected {
-            if let Ok(Some(relay)) = self.client.relay(url.clone()).await
-                && relay.status().is_connected()
-            {
-                connected.push(url.clone());
-            }
-        }
+        // Switching to the fresh phase precedes reconnection: exhaustion of the
+        // target share must not prevent acquisition of reserved deletion evidence.
+        let connected = connect(&self.client, self.urls.clone(), deadline).await;
         let _ = timeout_at(
             deadline,
             acquire(
@@ -463,7 +454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_relay_disconnected_between_phases_does_not_reduce_the_live_budget() {
+    async fn a_relay_disconnected_between_phases_is_reconnected_for_evidence() {
         let (_live, live, ids) = published_notes(3).await;
         let (_other, other, _) = published_notes(1).await;
         let request = request_meter();
@@ -494,18 +485,135 @@ mod tests {
             .query(
                 id_filters(&ids),
                 PublicEventQueryBudget {
-                    max_items: 3,
+                    max_items: 6,
+                    max_bytes: 1024 * 1024,
+                },
+                deadline,
+            )
+            .await;
+        let reconnected = session
+            .client
+            .relay(RelayUrl::parse(other.as_str()).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .status()
+            .is_connected();
+        session.shutdown().await;
+        assert!(
+            reconnected,
+            "the evidence phase retries every disconnected original endpoint"
+        );
+        assert_eq!(
+            evidence.events_json.len(),
+            3,
+            "all requested evidence remains available after reconnection"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_target_phase_reconnects_for_reserved_evidence() {
+        use futures::{SinkExt, StreamExt};
+        let keys = Keys::generate();
+        let note = EventBuilder::new(Kind::TextNote, "evidence")
+            .finalize(&keys)
+            .unwrap();
+        let id = note.id.to_hex();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for connection in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = pinned_tokio_tungstenite::accept_async(socket)
+                    .await
+                    .unwrap();
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
+                        continue;
+                    };
+                    if frame[0] != "REQ" {
+                        continue;
+                    }
+                    let subscription = frame[1].as_str().unwrap();
+                    if connection == 0 {
+                        for _ in 0..9 {
+                            let junk = serde_json::json!(["EVENT", subscription, {}]);
+                            if ws
+                                .send(pinned_tokio_tungstenite::tungstenite::Message::text(
+                                    junk.to_string(),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                    let event = serde_json::json!([
+                        "EVENT",
+                        subscription,
+                        serde_json::from_str::<serde_json::Value>(&note.as_json()).unwrap()
+                    ]);
+                    ws.send(pinned_tokio_tungstenite::tungstenite::Message::text(
+                        event.to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    ws.send(pinned_tokio_tungstenite::tungstenite::Message::text(
+                        serde_json::json!(["EOSE", subscription]).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    while ws.next().await.is_some() {}
+                    return;
+                }
+            }
+        });
+        let request = request_meter();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut session = PublicEventQuerySession::new(
+            RelaySafetyPolicy::with_allow_loopback(true),
+            vec![endpoint],
+            &request,
+            deadline,
+        );
+        let target = session
+            .query(
+                id_filters(std::slice::from_ref(&id)),
+                PublicEventQueryBudget {
+                    max_items: 1,
+                    max_bytes: 1024 * 1024,
+                },
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await;
+        assert!(target.received_items > 1, "junk exhausts the target share");
+        assert!(
+            !request.is_exhausted(),
+            "the request retains reserved evidence capacity"
+        );
+        let evidence = session
+            .query(
+                id_filters(std::slice::from_ref(&id)),
+                PublicEventQueryBudget {
+                    max_items: 8,
                     max_bytes: 1024 * 1024,
                 },
                 deadline,
             )
             .await;
         session.shutdown().await;
+        server.abort();
         assert_eq!(
             evidence.events_json.len(),
-            3,
-            "a no-longer-connected relay receives no share of the evidence budget"
+            1,
+            "fresh-phase reconnection recovers the signed evidence"
         );
+        assert!(evidence.events_json[0].contains(&id));
     }
 
     #[tokio::test]

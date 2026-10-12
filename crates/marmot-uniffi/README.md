@@ -643,7 +643,7 @@ including duplicates, each with its canonical key and a state:
 | `Present` | `preview`: signed event JSON, admission time, freshness, optional cached author profile | Render immediately, including offline. |
 | `AuthoritativeDeleted` | `deletion`: the author's signed NIP-09 request | Render as deleted. |
 | `Missing` | none | Nothing is known locally; resolve it. Never durable "not found". |
-| `Busy` | none | Account lifecycle work is running, or the account was removed, wiped, reimported or closed during the request; retry shortly. Never treat as a miss. |
+| `Busy` | none | Account lifecycle work or a local cache operation for this account is running, or the account was removed, wiped, reimported or closed during the request; retry shortly. Never treat as a miss. |
 
 Run local reads on the host's I/O dispatcher to keep encrypted storage access and retained-evidence verification off
 the UI thread.
@@ -661,8 +661,8 @@ original hostname; no proxy is used. The byte budget counts raw received wire by
 handshakes and every WebSocket frame and fragment, before they are parsed; the event budget counts every relay
 event message, including duplicates and invalid events. Every connection is closed at the request deadline, even
 when a relay stops reading or sending mid-message. It never follows references inside
-fetched content. Concurrent calls for one reference share a request, and an attempted refresh is not repeated for
-30 seconds. A failed or empty refresh keeps prior content, so never replace a rendered hit with Loading. Results that
+fetched content. Concurrent calls for one reference share a request. A refresh that reaches persistence starts a 30-second
+cooldown; cancellation during network acquisition starts none. A failed or empty refresh keeps prior content, so never replace a rendered hit with Loading. Results that
 arrive after the account was removed, wiped, reimported or closed are discarded and reported as `Busy`.
 
 Hosts that already hold signed events can call `cachePublicEventPreview(accountRef, reference, candidates)` with up to

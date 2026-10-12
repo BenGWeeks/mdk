@@ -138,7 +138,6 @@ fn saturating_add(counter: &AtomicUsize, amount: usize) -> usize {
 #[derive(Debug)]
 pub(crate) struct PublicEventTrafficMeter {
     parent: Option<Arc<PublicEventTrafficMeter>>,
-    route: Option<Arc<StdMutex<Arc<PublicEventTrafficMeter>>>>,
     limits: PublicEventTrafficLimits,
     items: AtomicUsize,
     bytes: AtomicUsize,
@@ -150,7 +149,6 @@ impl PublicEventTrafficMeter {
     pub(crate) fn new(limits: PublicEventTrafficLimits) -> Arc<Self> {
         Arc::new(Self {
             parent: None,
-            route: None,
             limits,
             items: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
@@ -162,7 +160,6 @@ impl PublicEventTrafficMeter {
     pub(crate) fn child(parent: &Arc<Self>, limits: PublicEventTrafficLimits) -> Arc<Self> {
         Arc::new(Self {
             parent: Some(parent.clone()),
-            route: None,
             limits,
             items: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
@@ -171,54 +168,20 @@ impl PublicEventTrafficMeter {
         })
     }
 
-    /// A request-owned transport route. Each phase supplies a fresh child
-    /// meter, while existing sockets keep charging the same request parent.
-    pub(crate) fn routed(initial: &Arc<Self>) -> Arc<Self> {
-        let mut routed = Self::new(initial.limits);
-        Arc::get_mut(&mut routed)
-            .expect("new meter is exclusively owned")
-            .route = Some(Arc::new(StdMutex::new(initial.clone())));
-        routed
-    }
-
-    pub(crate) fn route_to(&self, phase: &Arc<Self>) {
-        if let Some(route) = &self.route {
-            *route.lock().unwrap_or_else(|p| p.into_inner()) = phase.clone();
-        }
-    }
-
-    fn routed_phase(&self) -> Option<Arc<Self>> {
-        self.route
-            .as_ref()
-            .map(|route| route.lock().unwrap_or_else(|p| p.into_inner()).clone())
-    }
-
     pub(crate) fn items(&self) -> usize {
-        if let Some(phase) = self.routed_phase() {
-            return phase.items();
-        }
         self.items.load(Ordering::SeqCst)
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        if let Some(phase) = self.routed_phase() {
-            return phase.bytes();
-        }
         self.bytes.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
     pub(crate) fn messages(&self) -> usize {
-        if let Some(phase) = self.routed_phase() {
-            return phase.messages();
-        }
         self.messages.load(Ordering::SeqCst)
     }
 
     pub(crate) fn is_exhausted(&self) -> bool {
-        if let Some(phase) = self.routed_phase() {
-            return phase.is_exhausted();
-        }
         self.exhausted.load(Ordering::SeqCst)
             || self
                 .parent
@@ -245,9 +208,6 @@ impl PublicEventTrafficMeter {
     }
 
     fn charge_counts(&self, bytes: usize, items: usize, messages: usize) -> bool {
-        if let Some(phase) = self.routed_phase() {
-            return phase.charge_counts(bytes, items, messages);
-        }
         let parent_ok = self
             .parent
             .as_ref()
@@ -262,6 +222,35 @@ impl PublicEventTrafficMeter {
             self.exhausted.store(true, Ordering::SeqCst);
         }
         !self.is_exhausted()
+    }
+}
+
+/// The active phase of request-owned sockets. This holds no counters of its own;
+/// switching phases preserves the request parent and installs fresh phase bounds.
+#[derive(Debug)]
+pub(crate) struct PublicEventPhaseRoute(StdMutex<Arc<PublicEventTrafficMeter>>);
+impl PublicEventPhaseRoute {
+    pub(crate) fn new(meter: &Arc<PublicEventTrafficMeter>) -> Arc<Self> {
+        Arc::new(Self(StdMutex::new(meter.clone())))
+    }
+    pub(crate) fn route_to(&self, phase: &Arc<PublicEventTrafficMeter>) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = phase.clone();
+    }
+    fn phase(&self) -> Arc<PublicEventTrafficMeter> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+    fn is_exhausted(&self) -> bool {
+        self.phase().is_exhausted()
+    }
+    fn charge_wire(&self, bytes: usize) -> bool {
+        self.phase().charge_wire(bytes)
+    }
+    fn charge_message(&self, event: bool) -> bool {
+        self.phase().charge_message(event)
+    }
+    #[cfg(test)]
+    fn charge(&self, bytes: usize, event: bool) -> bool {
+        self.phase().charge(bytes, event)
     }
 }
 
@@ -307,8 +296,8 @@ impl SocketSlot {
     }
 }
 
-/// Every socket one request phase opened. Bounded, request-owned and closed as
-/// a whole when the phase ends or its future is dropped.
+/// Every socket one request opened. Shared by its phases, bounded and closed as
+/// a whole when the request ends or its future is dropped.
 #[derive(Debug, Default)]
 pub(crate) struct PublicEventSocketRegistry {
     state: StdMutex<RegistryState>,
@@ -369,7 +358,7 @@ impl PublicEventSocketRegistry {
     }
 }
 
-/// Closes a phase's sockets when dropped, including on caller cancellation.
+/// Closes a request's sockets when dropped, including on caller cancellation.
 pub(crate) struct CloseSocketsOnDrop(pub(crate) Arc<PublicEventSocketRegistry>);
 
 impl Drop for CloseSocketsOnDrop {
@@ -383,13 +372,13 @@ impl Drop for CloseSocketsOnDrop {
 /// directions with separate timers, so read and write wakers both fire.
 pub(crate) struct PinnedSocketIo {
     slot: Arc<SocketSlot>,
-    meter: Arc<PublicEventTrafficMeter>,
+    meter: Arc<PublicEventPhaseRoute>,
     read_deadline: Pin<Box<Sleep>>,
     write_deadline: Pin<Box<Sleep>>,
 }
 
 impl PinnedSocketIo {
-    fn new(slot: Arc<SocketSlot>, meter: Arc<PublicEventTrafficMeter>, deadline: Instant) -> Self {
+    fn new(slot: Arc<SocketSlot>, meter: Arc<PublicEventPhaseRoute>, deadline: Instant) -> Self {
         Self {
             slot,
             meter,
@@ -535,7 +524,7 @@ pub(crate) fn relay_text_is_event(text: &str) -> bool {
 /// Charge one decoded message as an item or message (its bytes were charged
 /// on the wire) and convert it to the SDK message type. `None` means the
 /// message must not be delivered and the stream ends.
-fn admit_frame(meter: &PublicEventTrafficMeter, message: TungsteniteMessage) -> Option<Message> {
+fn admit_frame(meter: &PublicEventPhaseRoute, message: TungsteniteMessage) -> Option<Message> {
     let event = match &message {
         TungsteniteMessage::Text(text) => relay_text_is_event(text.as_str()),
         TungsteniteMessage::Binary(data) => match std::str::from_utf8(data) {
@@ -563,14 +552,14 @@ fn admit_frame(meter: &PublicEventTrafficMeter, message: TungsteniteMessage) -> 
 /// forcibly closes the underlying socket.
 pub(crate) struct MeteredStream<S> {
     inner: S,
-    meter: Arc<PublicEventTrafficMeter>,
+    meter: Arc<PublicEventPhaseRoute>,
     deadline: Pin<Box<Sleep>>,
     socket: Option<Arc<SocketSlot>>,
     done: bool,
 }
 
 impl<S> MeteredStream<S> {
-    pub(crate) fn new(inner: S, meter: Arc<PublicEventTrafficMeter>, deadline: Instant) -> Self {
+    pub(crate) fn new(inner: S, meter: Arc<PublicEventPhaseRoute>, deadline: Instant) -> Self {
         Self {
             inner,
             meter,
@@ -770,12 +759,12 @@ async fn connect_pinned(
     Err(PublicEventDialRefused)
 }
 
-/// One request phase's transport. It holds no background task; its sockets
-/// belong to the phase's [`PublicEventSocketRegistry`].
+/// One request's transport. It holds no background task; its sockets
+/// belong to the request's [`PublicEventSocketRegistry`].
 #[derive(Clone)]
 pub(crate) struct PinnedPublicEventTransport {
     policy: RelaySafetyPolicy,
-    meter: Arc<PublicEventTrafficMeter>,
+    meter: Arc<PublicEventPhaseRoute>,
     sockets: Arc<PublicEventSocketRegistry>,
     deadline: Instant,
 }
@@ -790,7 +779,7 @@ impl fmt::Debug for PinnedPublicEventTransport {
 impl PinnedPublicEventTransport {
     pub(crate) fn new(
         policy: RelaySafetyPolicy,
-        meter: Arc<PublicEventTrafficMeter>,
+        meter: Arc<PublicEventPhaseRoute>,
         sockets: Arc<PublicEventSocketRegistry>,
         deadline: Instant,
     ) -> Self {
@@ -1025,7 +1014,7 @@ mod tests {
         let request = PublicEventTrafficMeter::new(limits(3, 1000, 2));
         let first = PublicEventTrafficMeter::child(&request, limits(8, 1000, usize::MAX));
         let second = PublicEventTrafficMeter::child(&request, limits(8, 1000, usize::MAX));
-        let routed = PublicEventTrafficMeter::routed(&first);
+        let routed = PublicEventPhaseRoute::new(&first);
         assert!(routed.charge(10, true));
         assert!(routed.charge(10, true));
         routed.route_to(&second);
@@ -1084,7 +1073,7 @@ mod tests {
         ];
         let stream = MeteredStream::new(
             futures::stream::iter(frames),
-            phase.clone(),
+            PublicEventPhaseRoute::new(&phase),
             Instant::now() + Duration::from_secs(5),
         );
         let delivered: Vec<_> = stream.collect().await;
@@ -1117,7 +1106,7 @@ mod tests {
             .collect();
         let delivered: Vec<_> = MeteredStream::new(
             futures::stream::iter(frames),
-            request.clone(),
+            PublicEventPhaseRoute::new(&request),
             Instant::now() + Duration::from_secs(5),
         )
         .collect()
@@ -1142,7 +1131,7 @@ mod tests {
         let tcp = TcpStream::connect(addr).await.unwrap();
         let slot = sockets.register(tcp).unwrap();
         (
-            PinnedSocketIo::new(slot.clone(), meter.clone(), deadline),
+            PinnedSocketIo::new(slot.clone(), PublicEventPhaseRoute::new(meter), deadline),
             slot,
         )
     }
@@ -1208,7 +1197,8 @@ mod tests {
         let (_sink, stream) = websocket.split();
         let delivered: Vec<_> = tokio::time::timeout(
             Duration::from_secs(4),
-            MeteredStream::new(stream, meter.clone(), deadline).collect::<Vec<_>>(),
+            MeteredStream::new(stream, PublicEventPhaseRoute::new(&meter), deadline)
+                .collect::<Vec<_>>(),
         )
         .await
         .expect("fragment floods end on the byte budget, not the deadline");
@@ -1255,10 +1245,11 @@ mod tests {
         .unwrap();
         let (sink, stream) = websocket.split();
         let started = std::time::Instant::now();
-        let delivered: Vec<_> = MeteredStream::new(stream, meter.clone(), deadline)
-            .with_socket(slot)
-            .collect()
-            .await;
+        let delivered: Vec<_> =
+            MeteredStream::new(stream, PublicEventPhaseRoute::new(&meter), deadline)
+                .with_socket(slot)
+                .collect()
+                .await;
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(delivered.iter().all(Result::is_err));
         assert_eq!(sockets.open_sockets(), 0);

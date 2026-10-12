@@ -14,7 +14,8 @@ impl MarmotAppRuntime {
     /// order. The whole request (at most 16 references) is validated before
     /// storage is touched; invalid input is an error. If another account/storage
     /// operation currently owns the shared account transaction, every row is
-    /// `Busy` (retryable) rather than waiting or reporting `Missing`. Never
+    /// `Busy` (retryable) rather than waiting or reporting `Missing`. A local
+    /// preview operation blocks only the same account's synchronous cache read. Never
     /// sleeps, blocks on an async lock, or enters the async runtime.
     pub fn cached_public_event_previews(
         &self,
@@ -36,11 +37,31 @@ impl MarmotAppRuntime {
         };
         self.accounts.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
-        let reads = self
+        drop(account_transaction);
+        let gate = self.accounts.app.public_event_cache_gate(&account.label);
+        let Ok(_operation) = gate.try_lock() else {
+            return references.iter().map(stale_incarnation).collect();
+        };
+        let Some(cache) = self
             .accounts
             .app
-            .cached_public_events_for_account(&account, &references);
-        drop(account_transaction);
+            .public_event_cache_for_account_under_gate(&account, || {
+                self.public_event_account_is_current(&account)
+            })?
+        else {
+            return references.iter().map(stale_incarnation).collect();
+        };
+        let reads =
+            self.accounts
+                .app
+                .cached_public_events_with_cache(&account, &cache, &references);
+        if !self
+            .accounts
+            .app
+            .public_event_cache_is_current(&account.label, &cache)
+        {
+            return references.iter().map(stale_incarnation).collect();
+        }
         reads
     }
 
@@ -55,24 +76,35 @@ impl MarmotAppRuntime {
     ) -> Result<PublicEventCacheRead, AppError> {
         let reference = PublicEventReference::parse(reference)?;
         PublicEventCache::validate_candidates(&candidates)?;
-        // Serialize cache handle publication against removal, wipe and setup rollback.
-        let account_transaction = self.accounts.worker_transactions.clone().lock_owned().await;
         self.accounts.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
+        let runtime = self.clone();
         let app = self.accounts.app.clone();
         blocking_app_task(move || {
-            // Owned by the blocking closure: dropping the caller's future cannot
-            // release removal protection while this I/O is still running.
-            let _account_transaction = account_transaction;
-            app.admit_public_events_for_account(&account, &reference, &candidates)
+            let gate = app.public_event_cache_gate(&account.label);
+            let _operation = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(cache) = app.public_event_cache_for_account_under_gate(&account, || {
+                runtime.public_event_account_is_current(&account)
+            })?
+            else {
+                return stale_incarnation(&reference);
+            };
+            let result =
+                app.admit_public_events_with_cache(&account, &cache, &reference, &candidates);
+            if !runtime.public_event_account_is_current(&account)
+                || !app.public_event_cache_is_current(&account.label, &cache)
+            {
+                return stale_incarnation(&reference);
+            }
+            result
         })
         .await
     }
 
     /// Bounded native refresh for one reference, returning the resulting local
-    /// state. Local state is read under the account transaction, which is then
-    /// released before any relay await; persistence reacquires it and writes
-    /// only if the same account-cache incarnation is still published. Requests
+    /// state. Cache opening is fenced per account, and SQLite owns each local
+    /// read/write transaction. No lifecycle mutex is held during database or
+    /// network I/O; persistence requires the same published cache incarnation. Requests
     /// for one key coalesce, and a refresh reaching persistence starts a 30-second
     /// in-memory cooldown. Cancellation during network acquisition permits an
     /// immediate retry. Failed or empty refreshes keep prior content. If the
@@ -89,25 +121,40 @@ impl MarmotAppRuntime {
         let (reference, hints) = PublicEventReference::parse_with_hints(reference)?;
         let key = reference.cache_key()?;
 
-        let account_transaction = self.accounts.worker_transactions.clone().lock_owned().await;
         self.accounts.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
-        let (cache, local, known) = {
+        let initial = {
             let app = self.accounts.app.clone();
             let account = account.clone();
             let reference = reference.clone();
+            let runtime = self.clone();
             blocking_app_task(move || {
-                let _account_transaction = account_transaction;
-                let cache = app.public_event_cache_for_account(&account)?;
+                let gate = app.public_event_cache_gate(&account.label);
+                let _operation = gate.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(cache) = app
+                    .public_event_cache_for_account_under_gate(&account, || {
+                        runtime.public_event_account_is_current(&account)
+                    })?
+                else {
+                    return Ok(None);
+                };
                 let local = single_read(app.cached_public_events_with_cache(
                     &account,
                     &cache,
                     std::slice::from_ref(&reference),
                 )?)?;
                 let known = cache.selected_event(&reference, unix_now_seconds())?;
-                Ok((cache, local, known))
+                if !runtime.public_event_account_is_current(&account)
+                    || !app.public_event_cache_is_current(&account.label, &cache)
+                {
+                    return Ok(None);
+                }
+                Ok(Some((cache, local, known)))
             })
             .await?
+        };
+        let Some((cache, local, known)) = initial else {
+            return stale_incarnation(&reference);
         };
         // A deleted immutable ID cannot come back; skip the network entirely.
         if matches!(key, PublicEventCacheKey::EventId { .. })
@@ -153,17 +200,21 @@ impl MarmotAppRuntime {
             .fetch_public_event_candidates(&reference, &hints, known.as_ref())
             .await;
 
-        let account_transaction = self.accounts.worker_transactions.clone().lock_owned().await;
         let Some(current) = self.public_event_account_after_wait(account_ref) else {
             return stale_incarnation(&reference);
         };
         let app = self.accounts.app.clone();
+        let runtime = self.clone();
         blocking_app_task(move || {
-            let _account_transaction = account_transaction;
+            let gate = app.public_event_cache_gate(&account.label);
+            let _operation = gate.lock().unwrap_or_else(|p| p.into_inner());
+            if !runtime.public_event_account_is_current(&account) {
+                return stale_incarnation(&reference);
+            }
             // Keep the refresh lease until persistence finishes so coalesced
             // callers never read the pre-admission cache.
             // A cancelled network future starts no cooldown; once persistence
-            // owns the account fence it completes even if the caller leaves.
+            // starts it completes even if the caller leaves.
             let mut lease = lease;
             lease.mark_attempted();
             persist_refresh_if_current(&app, &account, &current, &cache, &reference, &candidates)
@@ -172,8 +223,8 @@ impl MarmotAppRuntime {
     }
 
     /// A coalesced caller's read after another refresh of the same key. It
-    /// reuses the handle captured with the original account, under the account
-    /// transaction, and never opens storage for a replaced incarnation.
+    /// reuses the handle captured with the original account, and never opens
+    /// storage for a replaced incarnation.
     async fn fenced_public_event_read(
         &self,
         account_ref: &str,
@@ -181,24 +232,43 @@ impl MarmotAppRuntime {
         cache: PublicEventCache,
         reference: PublicEventReference,
     ) -> Result<PublicEventCacheRead, AppError> {
-        let account_transaction = self.accounts.worker_transactions.clone().lock_owned().await;
         let Some(current) = self.public_event_account_after_wait(account_ref) else {
             return stale_incarnation(&reference);
         };
         let app = self.accounts.app.clone();
+        let runtime = self.clone();
         blocking_app_task(move || {
-            let _account_transaction = account_transaction;
+            let gate = app.public_event_cache_gate(&account.label);
+            let _operation = gate.lock().unwrap_or_else(|p| p.into_inner());
+            if !runtime.public_event_account_is_current(&account) {
+                return stale_incarnation(&reference);
+            }
             read_if_current(&app, &account, &current, &cache, &reference)
         })
         .await
     }
 
-    /// Called under the account transaction after a refresh or coalesced wait.
+    fn public_event_account_is_current(&self, account: &AccountSummary) -> bool {
+        self.accounts.shared.lifecycle().ensure_running().is_ok()
+            && !self
+                .accounts
+                .account_is_tearing_down(&account.account_id_hex)
+            && self.accounts.resolve(&account.label).is_ok_and(|current| {
+                current.account_id_hex == account.account_id_hex
+                    && current.local_signing == account.local_signing
+                    && current.external_signing == account.external_signing
+                    && current.signed_out == account.signed_out
+            })
+    }
+
+    /// Resolve the current account after a refresh or coalesced wait.
     /// Initial admission already resolved this account. A late lifecycle failure
     /// is retryable stale work, not a new fatal error or permission to open storage.
     fn public_event_account_after_wait(&self, account_ref: &str) -> Option<AccountSummary> {
         self.accounts.shared.lifecycle().ensure_running().ok()?;
-        self.accounts.resolve(account_ref).ok()
+        let account = self.accounts.resolve(account_ref).ok()?;
+        self.public_event_account_is_current(&account)
+            .then_some(account)
     }
 }
 
@@ -490,6 +560,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state(&still_deleted), "deleted");
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preview_cache_operation_blocks_only_its_own_account_and_not_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        home.create_account("bob").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let runtime = app.runtime();
+        let id = "cd".repeat(32);
+        assert_eq!(
+            state(
+                &runtime
+                    .cached_public_event_previews("bob", std::slice::from_ref(&id))
+                    .unwrap()[0]
+            ),
+            "missing"
+        );
+        let gate = app.public_event_cache_gate("alice");
+        let (held, observed) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _operation = gate.lock().unwrap();
+            held.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        observed.recv().unwrap();
+        let alice = runtime
+            .cached_public_event_previews("alice", std::slice::from_ref(&id))
+            .unwrap();
+        let bob = runtime
+            .cached_public_event_previews("bob", std::slice::from_ref(&id))
+            .unwrap();
+        let lifecycle_available = runtime.accounts.worker_transactions.try_lock().is_ok();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(state(&alice[0]), "busy");
+        assert_eq!(state(&bob[0]), "missing");
+        assert!(
+            lifecycle_available,
+            "preview I/O does not hold the lifecycle mutex"
+        );
         runtime.shutdown_and_close().await.unwrap();
     }
 

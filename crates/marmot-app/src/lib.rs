@@ -513,6 +513,7 @@ pub struct MarmotApp {
     account_session_owners: Arc<Mutex<HashSet<String>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
     public_event_caches: Arc<Mutex<HashMap<String, public_event_preview::PublicEventCache>>>,
+    public_event_cache_gates: Arc<Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
     /// Bounded, process-local composition prewarm. Entries are never durable
     /// directory admission and never reserve or consume a KeyPackage.
     member_key_package_prewarm_cache: Arc<Mutex<directory::MemberKeyPackagePrewarmCache>>,
@@ -1639,6 +1640,7 @@ impl MarmotApp {
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             public_event_caches: Arc::new(Mutex::new(HashMap::new())),
+            public_event_cache_gates: Arc::new(Mutex::new(HashMap::new())),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
                 directory::MemberKeyPackagePrewarmCache::default(),
             )),
@@ -1733,6 +1735,7 @@ impl MarmotApp {
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             public_event_caches: Arc::new(Mutex::new(HashMap::new())),
+            public_event_cache_gates: Arc::new(Mutex::new(HashMap::new())),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
                 directory::MemberKeyPackagePrewarmCache::default(),
             )),
@@ -6998,6 +7001,10 @@ impl MarmotApp {
     /// the warm/stale/ready flags forces the rebuilt account to re-warm its
     /// projections from the fresh database.
     fn drop_account_caches(&self, label: &str) {
+        // Only this account's cache opening can delay its removal. Warm cache
+        // reads/writes use the closeable handle, never the lifecycle mutex.
+        let cache_gate = self.public_event_cache_gate(label);
+        let _cache_open = cache_gate.lock().unwrap_or_else(|p| p.into_inner());
         // Close live bounded windows before a label can bind to another store.
         let _ = self
             .presentation_signals

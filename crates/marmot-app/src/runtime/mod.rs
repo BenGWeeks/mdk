@@ -8544,6 +8544,12 @@ impl AccountManager {
         // storage/directory handles. Evict them before the directory is deleted
         // so a later re-import does not reuse a handle bound to the now-unlinked
         // inode. See `drop_account_caches` and mdk#220.
+        let _teardown = self
+            .app
+            .account_home()
+            .account(account)
+            .ok()
+            .map(|account| AccountTeardownGuard::new(self, account.account_id_hex));
         self.app.drop_account_caches(account);
         if let Err(rollback) = self.app.remove_account_key_package_artifacts(account) {
             return Err(AppError::RelayDirectory(format!(
@@ -8568,6 +8574,7 @@ impl AccountManager {
             return self.rollback_account_after_setup_failure(&account.label, source);
         };
 
+        let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
         self.app.drop_account_caches(&account.label);
         if let Err(rollback) = self
             .app
