@@ -135,9 +135,9 @@ fn retry_at(storage: &SqliteAccountStorage, job: &AttachmentAcquisition, now: u6
     )
 }
 
-/// The scheduler's clock. Tests may run it ahead of wall time, or pin it, per
-/// account directory to cross readmission backoffs without sleeping;
-/// transfers, leases and publication keep wall time.
+/// The scheduler's clock. Tests may pin it per account directory to cross
+/// readmission backoffs without sleeping; transfers, leases and publication
+/// keep wall time.
 #[cfg_attr(not(test), allow(unused_variables))]
 fn scheduler_now(client: &AppClient) -> u64 {
     let now = crate::unix_now_seconds();
@@ -582,37 +582,20 @@ fn complete(
     )
 }
 
-/// Per-account-directory scheduler clocks for tests, read by
-/// [`scheduler_now`]: either a skew ahead of wall time or a pinned instant.
+/// Per-account-directory pinned scheduler clocks for tests, read by
+/// [`scheduler_now`].
 #[cfg(test)]
 pub(super) mod test_clock {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    #[derive(Clone, Copy)]
-    enum Clock {
-        Skew(u64),
-        At(u64),
-    }
+    static CLOCKS: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
 
-    static CLOCKS: Mutex<BTreeMap<PathBuf, Clock>> = Mutex::new(BTreeMap::new());
-
-    /// Run the scheduler for `root` and everything beneath it `seconds` ahead.
-    pub(crate) fn advance(root: &Path, seconds: u64) {
-        let mut clocks = CLOCKS.lock().unwrap();
-        let clock = clocks.entry(root.to_path_buf()).or_insert(Clock::Skew(0));
-        *clock = match *clock {
-            Clock::Skew(skew) => Clock::Skew(skew.saturating_add(seconds)),
-            Clock::At(at) => Clock::At(at.saturating_add(seconds)),
-        };
-    }
-    /// Pin the scheduler for `root` at `at`, so due times compare exactly.
+    /// Pin the scheduler for `root` and everything beneath it at `at`, so due
+    /// times compare exactly.
     pub(crate) fn set_now(root: &Path, at: u64) {
-        CLOCKS
-            .lock()
-            .unwrap()
-            .insert(root.to_path_buf(), Clock::At(at));
+        CLOCKS.lock().unwrap().insert(root.to_path_buf(), at);
     }
     /// Return `root` to wall time.
     pub(crate) fn clear(root: &Path) {
@@ -620,17 +603,12 @@ pub(super) mod test_clock {
     }
     /// The scheduler's reading for `path` when wall time is `now`.
     pub(super) fn adjust(path: &Path, now: u64) -> u64 {
-        match CLOCKS
+        CLOCKS
             .lock()
             .unwrap()
             .iter()
             .find(|(root, _)| path.starts_with(root))
-            .map(|(_, clock)| *clock)
-        {
-            Some(Clock::Skew(skew)) => now.saturating_add(skew),
-            Some(Clock::At(at)) => at,
-            None => now,
-        }
+            .map_or(now, |(_, at)| *at)
     }
 }
 

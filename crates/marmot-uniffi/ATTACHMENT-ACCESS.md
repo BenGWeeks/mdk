@@ -242,7 +242,8 @@ without recording successful acquisition and keeps its checkpoint, which also ke
 reservation, for at most seven days after the latest park. Readmission and both explicit Retry
 paths refresh the checkpoint's 24-hour idle expiry, so a park longer than a day still resumes
 from it; cancellation lets it expire, and past seven days it is pruned while the job stays
-parked, its target grows by the pruned bytes, and its next attempt starts the body over. If the database cannot record even the park, the error is
+parked, and its next attempt starts the body over, parking again at its first capacity check if
+the recorded target no longer covers it. If the database cannot record even the park, the error is
 returned and the attempt's lease recovers the job: an explicit row's next attempt parks again at
 its first capacity check, while an automatic-history row whose verified body was already
 receipted ends as `CompletedUnretained`, as any receipted body that was never published does. When the whole body had already arrived, the in-memory sink

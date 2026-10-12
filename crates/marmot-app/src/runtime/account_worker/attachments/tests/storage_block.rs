@@ -9,15 +9,13 @@
 //! exactly where the first implementation looped: above the admission reserve
 //! and the bare `4 x body` publication check, but below what the attempt's own
 //! staging and checkpoints add on top. The row must park once and stay parked
-//! across scheduler ticks until space frees. The scheduler's clock can run
-//! ahead of wall time, so readmission backoffs are crossed without sleeping.
+//! across scheduler ticks until space frees. The scheduler's clock can be
+//! pinned, so readmission backoffs are crossed without sleeping.
 use super::*;
 use crate::media::attachment_resume::test_free_space;
 use crate::runtime::account_worker::attachments::test_clock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use storage_sqlite::{
-    AttachmentTransferState, STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS, STORAGE_READMIT_MARGIN_BYTES,
-};
+use storage_sqlite::{AttachmentTransferState, STORAGE_READMIT_MARGIN_BYTES};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MIB: u64 = 1024 * 1024;
@@ -152,10 +150,6 @@ impl Fixture {
             ),
             &self.storage,
         );
-    }
-    /// Run the scheduler `seconds` ahead, past a readmission backoff.
-    fn advance(&self, seconds: u64) {
-        test_clock::advance(self._dir.path(), seconds);
     }
     /// The parked row's readmission due time, in the scheduler's clock.
     fn due(&self) -> Option<u64> {
@@ -481,8 +475,8 @@ async fn memory_sink_with_validator_parks_at_the_header_inside_the_loop_window()
 /// and parks a little later, recording the need it proved, which never exceeds
 /// what the body really needs, so the job publishes as soon as that much is
 /// free. Refetches are bounded in time: each readmission waits out the park
-/// streak, which the test crosses by running the scheduler's clock ahead
-/// instead of sleeping.
+/// streak, which the test crosses by pinning the scheduler's clock at each due
+/// time instead of sleeping.
 #[tokio::test]
 async fn unknown_length_parks_record_the_proven_need_and_back_off() {
     let plain = vec![0x7c; 8 * MIB as usize];
@@ -757,49 +751,6 @@ async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
         requests.load(Ordering::SeqCst),
         before + 1,
         "the remembered file sink restores the prefix and one Range request finishes the body"
-    );
-    server.abort();
-}
-
-/// A week after its latest park the prefix is pruned, and its saved bytes go
-/// back into the recorded target in the same step: the job no longer readmits
-/// at the stale `6T - S`, and at exactly `6T` plus the margin the readmitted
-/// attempt refetches the body once and publishes without parking again.
-#[tokio::test]
-async fn an_aged_parked_prefix_returns_its_bytes_to_the_target() {
-    let MidTransferPark {
-        mut fixture,
-        plain,
-        total,
-        requests,
-        server,
-        headroom,
-        saved,
-    } = park_mid_transfer().await;
-    assert_eq!(headroom, 6 * total - saved);
-    // Enough for the stale target only, a week on.
-    fixture.set_free(headroom + STORAGE_READMIT_MARGIN_BYTES);
-    fixture.advance(STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS);
-    fixture.tick().await;
-    assert_eq!(
-        fixture.storage.attachment_partial_bytes_for_test().unwrap(),
-        0,
-        "the aged prefix is pruned"
-    );
-    assert!(fixture.completions.try_recv().is_err());
-    assert_eq!(
-        fixture.state(),
-        AttachmentTransferState::StorageBlocked,
-        "the target grew by the pruned prefix"
-    );
-    let before = requests.load(Ordering::SeqCst);
-    fixture.set_free(6 * total + STORAGE_READMIT_MARGIN_BYTES);
-    fixture.tick().await;
-    fixture.publish_file(&plain).await;
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        before + 2,
-        "an in-memory probe, then one fresh file-sink request for the whole body, with no re-park"
     );
     server.abort();
 }
