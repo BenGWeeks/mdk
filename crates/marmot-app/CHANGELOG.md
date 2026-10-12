@@ -4,12 +4,40 @@
 
 ### Breaking changes
 
+- `AppError` adds `ModerationReportingNotConfigured`, `InvalidModerationReportConfig`,
+  `InvalidReportedPublicKey`, `CannotReportSelf` and `ModerationReportRateLimited`;
+  update exhaustive matches. `MarmotAppConfig` adds `moderation_report_config`;
+  struct literals that do not use `..Default::default()` must set it.
+
 - Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
   field. Update Rust struct literals; gallery consumers can exclude `InlineEmoji`
   without changing original slots, parser verdicts or acquisition references.
   See [the attachment-history handoff](../marmot-uniffi/ATTACHMENT-HISTORY.md).
 
 ### Added
+
+- `MarmotAppRuntime::submit_moderation_report` privately reports an account to
+  the deployment's moderation team. It sends a NIP-56 kind-1984 rumor, sealed by
+  the account key and gift-wrapped per NIP-59 (through the shared Welcome wrap
+  path) to the configured reports key, and publishes only to the configured
+  relays without account AUTH. This is additive: `report_message`,
+  `content_reports` and `dismiss_reports` are unchanged. Reports never carry
+  message, group or relay identifiers. Signed wraps are staged before publishing,
+  retried after `catch_up_accounts` and purged on sign-out and wipe. Repeats
+  within 10 minutes return the existing outcome, and each account may send 20
+  reports per hour. The new
+  `moderation_reporting_available`, `retry_pending_moderation_reports` and
+  `MarmotApp::set_moderation_report_config` complete the surface. See
+  `docs/marmot-architecture/moderation-reports.md`.
+
+- Opt-in relay telemetry exports `relay_reconciliation_attempts` and
+  `relay_reconciliation_order_unproven_passes`: device-wide, unlabeled counts
+  of NIP-77 history-repair passes, and of group passes that returned nothing
+  because no time order covered the missing history (#2086). Repeated, those
+  passes end in a "history may be incomplete" notice.
+  `NostrAdapterMetrics` gains `reconciliation_order_unproven_passes` and
+  `NostrReconciliationSummary` gains `order_unproven`; struct literals need
+  the field or `..Default::default()`.
 
 - `MarmotAppRuntime::create_identity_local_ready_with_initial_profile` makes a
   caller-selected profile the first public kind-0 of a generated account, so
@@ -51,6 +79,21 @@
   `relay.damus.io` can be invited again.
 
 ### Fixed
+
+- Catch-up downloads a large group backlog oldest first. When more history
+  is missing than one comparison pass fetches, the pass narrows to the oldest
+  part that fits, so commits no longer arrive ahead of older messages and move
+  a member's epoch past messages it can then never read (#2086).
+- Catch-up downloads missed group history in far fewer round trips. Each
+  comparison pass now fetches up to 256 events (1 MiB), across all relays, in
+  batched requests instead of 16 one-at-a-time requests, so a backlog of a few hundred
+  messages arrives in a couple of passes instead of dozens. A long drip gave
+  commits time to move a member's epoch past older messages it had not
+  downloaded yet (#2086).
+- Profile, follow-list and relay-list saves still return on the first relay
+  acknowledgement, but relays the quorum cancelled now receive the identical
+  signed record in a bounded background send. Previously those relays kept
+  serving the older version, such as a generated signup name (#2216).
 
 - Explicit onboarding relay edits now preview and publish the selected endpoint
   changes without rebuilding untouched tags: mixed NIP-65 roles, duplicate
