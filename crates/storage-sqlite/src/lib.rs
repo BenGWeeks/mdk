@@ -166,3 +166,6 @@ pub use attachment_acquisition::{
     AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
     AttachmentTransferStatus,
 };
+
+mod open_progress;
+pub use open_progress::{StorageOpenPhase, StorageOpenProgress};
