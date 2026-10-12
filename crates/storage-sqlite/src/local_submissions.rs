@@ -54,6 +54,20 @@ impl SqliteAccountStorage {
         self.lock()?.query_row_cached(&format!("SELECT {COLUMNS} FROM local_message_submissions WHERE group_id_hex=?1 AND client_token=?2"), params![group, token], from_row).optional().storage()
     }
 
+    /// Bounded app-owned scheduling candidates in admission order. A runtime may defer one
+    /// group's dependency without losing its retained request or blocking another group.
+    pub fn pending_local_submissions(&self) -> StorageResult<Vec<LocalSubmission>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM local_message_submissions WHERE state=0 ORDER BY rowid LIMIT ?1"
+        )).storage()?;
+        statement
+            .query_map(params![MAX_PENDING_SUBMISSIONS], from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
     /// Check both retained admissions and source rows, including legacy sends.
     /// Call inside the transaction that inserts the admission and pending row.
     pub fn local_message_identity_exists(&self, group: &str, message: &str) -> StorageResult<bool> {

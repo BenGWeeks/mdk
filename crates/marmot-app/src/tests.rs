@@ -2,9 +2,12 @@
 mod canonical_membership;
 mod draft_lifecycle;
 mod group_lookup;
+pub(crate) mod invite_recovery;
 mod key_package_inventory;
 mod key_package_selection;
 mod message_journeys;
+mod publication_progress;
+mod replaceable_delivery;
 mod report_backfill;
 mod user_blocks;
 
@@ -504,9 +507,9 @@ pub(crate) struct ScriptedPushRelayClient {
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
-    block_indexer_publish: std::sync::atomic::AtomicBool,
+    pub(crate) block_indexer_publish: std::sync::atomic::AtomicBool,
     indexer_publish_started: tokio::sync::Notify,
-    indexer_publish_release: tokio::sync::Notify,
+    pub(crate) indexer_publish_release: tokio::sync::Notify,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     scoped_subscriptions: std::sync::Mutex<Vec<(String, NostrSubscription)>>,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
@@ -525,6 +528,8 @@ pub(crate) struct ScriptedPushRelayClient {
     reject_next_publish: std::sync::atomic::AtomicBool,
     fail_publish_unavailable: std::sync::atomic::AtomicBool,
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
+    accept_first_endpoint_only: std::sync::atomic::AtomicBool,
+    accepted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
     publish_release: tokio::sync::Notify,
@@ -537,7 +542,7 @@ pub(crate) struct ScriptedPushRelayClient {
 
 #[derive(Default)]
 pub(crate) struct MemberResolutionDirectoryFetcher {
-    requests: std::sync::Mutex<Vec<crate::relay_plane::DirectoryFetchRequest>>,
+    pub(crate) requests: std::sync::Mutex<Vec<crate::relay_plane::DirectoryFetchRequest>>,
     events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
@@ -548,6 +553,10 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
+    incomplete_query_kind: std::sync::Mutex<Option<u64>>,
+    failing_endpoint: std::sync::Mutex<Option<String>>,
+    failing_endpoint_kind: std::sync::Mutex<Option<u64>>,
+    fetch_gate_kind: std::sync::Mutex<Option<u64>>,
     fetch_gate: std::sync::Mutex<
         Option<(
             std::sync::Arc<tokio::sync::Notify>,
@@ -564,8 +573,16 @@ impl MemberResolutionDirectoryFetcher {
         std::sync::Arc<tokio::sync::Notify>,
         std::sync::Arc<tokio::sync::Notify>,
     ) {
+        self.hold_fetches_for_kind(KIND_MARMOT_KEY_PACKAGE)
+    }
+
+    fn hold_fetches_for_kind(
+        &self,
+        kind: u64,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *self.fetch_gate_kind.lock().unwrap() = Some(kind);
         *self.fetch_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
         (entered, release)
     }
@@ -588,7 +605,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             if request
                 .queries
                 .iter()
-                .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+                .any(|query| Some(query.kind) == *self.fetch_gate_kind.lock().unwrap())
             {
                 fetch_gate.take()
             } else {
@@ -616,6 +633,19 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         {
             return Err(format!("single-author query failed for {failing_author}"));
         }
+        if self
+            .failing_endpoint
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|endpoint| request.endpoints.iter().any(|e| &e.0 == endpoint))
+            && request
+                .queries
+                .iter()
+                .any(|q| Some(q.kind) == *self.failing_endpoint_kind.lock().unwrap())
+        {
+            return Err("endpoint query failed".into());
+        }
         let stalled_endpoint = self.stalled_endpoint.lock().unwrap().clone();
         if stalled_endpoint.is_some_and(|stalled| {
             request
@@ -628,6 +658,9 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
         let multi_author_only = self.key_packages_only_in_multi_author.lock().unwrap();
         let matches_query = |event: &NostrTransportEvent| {
+            if event.kind == 5 && event.to_verified_nostr_event().is_err() {
+                return false;
+            }
             if event.kind == KIND_MARMOT_KEY_PACKAGE
                 && multi_author_only.contains(&event.id)
                 && request.queries.iter().all(|query| query.authors.len() == 1)
@@ -640,10 +673,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             {
                 return false;
             }
-            request
-                .queries
-                .iter()
-                .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
+            request.queries.iter().any(|query| query.matches(event))
         };
         let endpoint_events = self.events_by_endpoint.lock().unwrap();
         if endpoint_events.is_empty() {
@@ -688,20 +718,65 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             self.requests.lock().unwrap().push(request);
             return Ok(crate::relay_plane::DirectoryFetchOutcome::default());
         }
+        let incomplete_kind = *self.incomplete_query_kind.lock().unwrap();
         let complete = !self
             .incomplete_endpoint
             .lock()
             .unwrap()
             .as_ref()
             .is_some_and(|incomplete| {
-                request
-                    .endpoints
-                    .iter()
-                    .any(|endpoint| endpoint.0 == *incomplete)
+                (incomplete_kind.is_none()
+                    || request
+                        .queries
+                        .iter()
+                        .any(|query| Some(query.kind) == incomplete_kind))
+                    && request
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.0 == *incomplete)
             });
-        self.fetch_directory_events(request)
-            .await
-            .map(|records| crate::relay_plane::DirectoryFetchOutcome { records, complete })
+        let queries = request.queries.clone();
+        let endpoints = request.endpoints.clone();
+        let mut records = self.fetch_directory_events(request).await?;
+        records.sort_by(|a, b| {
+            b.event
+                .created_at
+                .cmp(&a.event.created_at)
+                .then_with(|| b.event.id.cmp(&a.event.id))
+        });
+        let mut retained = Vec::<crate::relay_plane::DirectoryRelayEventRecord>::new();
+        let mut complete = complete;
+        for endpoint in &endpoints {
+            for query in &queries {
+                // Apply full filters before relay limits, and count unique ids.
+                let mut seen = std::collections::BTreeSet::new();
+                let matching = records
+                    .iter()
+                    .filter(|r| r.endpoints.contains(endpoint) && query.matches(&r.event))
+                    .filter(|r| seen.insert(r.event.id.clone()))
+                    .take(query.limit)
+                    .collect::<Vec<_>>();
+                complete &= matching.len() < query.limit;
+                for record in matching {
+                    if let Some(existing) =
+                        retained.iter_mut().find(|r| r.event.id == record.event.id)
+                    {
+                        if !existing.endpoints.contains(endpoint) {
+                            existing.endpoints.push(endpoint.clone());
+                        }
+                    } else {
+                        retained.push(crate::relay_plane::DirectoryRelayEventRecord {
+                            endpoints: vec![endpoint.clone()],
+                            event: record.event.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(crate::relay_plane::DirectoryFetchOutcome {
+            records: retained,
+            complete,
+        })
     }
 }
 
@@ -831,12 +906,31 @@ impl ScriptedPushRelayClient {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn fail_publishes_of_kind(&self, kind: u64) {
+    pub(crate) fn fail_publishes_of_kind(&self, kind: u64) {
         *self.fail_publish_kind.lock().unwrap() = Some(kind);
     }
 
-    fn allow_all_publish_kinds(&self) {
+    pub(crate) fn allow_all_publish_kinds(&self) {
         self.fail_publish_kind.lock().unwrap().take();
+    }
+
+    /// Model one-ack quorum cancellation: multi-endpoint publishes report only
+    /// their first endpoint, and the others neither accept nor fail.
+    pub(crate) fn accept_first_endpoint_only(&self) {
+        self.accept_first_endpoint_only
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn attempted_routes(&self) -> Vec<(u64, Vec<TransportEndpoint>)> {
+        self.attempted_publish_routes.lock().unwrap().clone()
+    }
+
+    pub(crate) fn accepted_routes(&self) -> Vec<(u64, Vec<TransportEndpoint>)> {
+        self.accepted_publish_routes.lock().unwrap().clone()
+    }
+
+    pub(crate) fn attempted_events(&self) -> Vec<NostrTransportEvent> {
+        self.attempted_events.lock().unwrap().clone()
     }
 
     pub(crate) async fn wait_for_blocked_publish(&self) {
@@ -934,12 +1028,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for ScriptedPushRelayClient {
             .lock()
             .unwrap()
             .iter()
-            .filter(|event| {
-                request
-                    .queries
-                    .iter()
-                    .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
-            })
+            .filter(|event| request.queries.iter().any(|query| query.matches(event)))
             .cloned()
             .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
                 endpoints: request.endpoints.clone(),
@@ -1225,7 +1314,19 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .unwrap_or(true)
         {
             self.published_events.lock().unwrap().push(event.clone());
-            Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+            let accepted = if self
+                .accept_first_endpoint_only
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                endpoints.first().cloned().into_iter().collect()
+            } else {
+                endpoints.to_vec()
+            };
+            self.accepted_publish_routes
+                .lock()
+                .unwrap()
+                .push((event.kind, accepted.clone()));
+            Ok(NostrPublishOutcome::accepted(accepted))
         } else {
             Err(cgka_traits::TransportAdapterError::Publish(
                 "injected publish failure".to_owned(),
@@ -4141,15 +4242,23 @@ async fn account_local_ready_before_subscribe_body() {
     relay.block_next_subscribe();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
-    let runtime = MarmotAppRuntime::new(app);
-
+    let runtime = Arc::new(MarmotAppRuntime::new(app));
+    let reconcile_runtime = runtime.clone();
+    let reconcile = tokio::spawn(async move { reconcile_runtime.reconcile_accounts().await });
+    // Cold account/database setup is not the condition this test times. Once
+    // registration enters the explicit barrier, readiness must complete while
+    // registration stays blocked; an awaited registration still fails below.
     tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        runtime.reconcile_accounts(),
+        std::time::Duration::from_secs(30),
+        relay.wait_for_blocked_subscribe(),
     )
     .await
-    .expect("local account readiness must not wait for relay registration")
-    .unwrap();
+    .expect("subscription registration should reach its controlled barrier");
+    tokio::time::timeout(std::time::Duration::from_secs(5), reconcile)
+        .await
+        .expect("local account readiness must not wait for relay registration")
+        .expect("account reconciliation task must finish")
+        .unwrap();
     assert_eq!(runtime.accounts().managed_accounts().unwrap().len(), 1);
     assert!(
         tokio::time::timeout(
@@ -4161,13 +4270,6 @@ async fn account_local_ready_before_subscribe_body() {
         .unwrap()
         .is_empty()
     );
-
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_subscribe(),
-    )
-    .await
-    .expect("subscription registration should continue after local readiness");
 
     let telemetry = runtime
         .shared_services()
@@ -6541,6 +6643,182 @@ async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
     runtime.shutdown().await;
 }
 
+/// Bootstrap re-stamps the cached profile with its signed kind-0 timestamp,
+/// so a later setup call can return a newer `created_at` for the same profile.
+fn profile_content(profile: &Option<UserProfileMetadata>) -> Option<UserProfileMetadata> {
+    profile.clone().map(|profile| UserProfileMetadata {
+        created_at: 0,
+        ..profile
+    })
+}
+
+#[tokio::test]
+async fn generated_identity_publishes_supplied_initial_profile_as_first_kind0() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let chosen = UserProfileMetadata {
+        name: Some("Chosen Heron".into()),
+        display_name: Some("Chosen Heron".into()),
+        ..UserProfileMetadata::default()
+    };
+
+    let local = runtime
+        .create_identity_local_ready_with_initial_profile(
+            AccountSetupRequest {
+                default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+                bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+            chosen.clone(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime
+            .account_setup_readiness(&local.account.label)
+            .unwrap()
+            != AccountSetupReadiness::NetworkReady
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background setup must reach network readiness");
+
+    let pseudonym = default_profile_pseudonym(&local.account.account_id_hex);
+    let returned = local
+        .profile
+        .expect("local-ready setup returns its profile");
+    assert_eq!(returned.name.as_deref(), Some("Chosen Heron"));
+    assert_eq!(returned.display_name.as_deref(), Some("Chosen Heron"));
+    assert_ne!(
+        returned.created_at, 0,
+        "a zero stamp would lose to any stale relay copy"
+    );
+    let cached = app
+        .directory_entry_for_account_id(&local.account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .unwrap();
+    assert_eq!(cached.name.as_deref(), Some("Chosen Heron"));
+    let kind0 = relay
+        .attempted_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == KIND_NOSTR_METADATA)
+        .map(|event| event.content.clone())
+        .collect::<Vec<_>>();
+    assert!(!kind0.is_empty(), "bootstrap must publish kind-0 metadata");
+    for content in &kind0 {
+        assert!(
+            content.contains("Chosen Heron"),
+            "every bootstrap kind-0 must carry the selected name"
+        );
+        assert!(
+            !content.contains(&pseudonym),
+            "the generated default must never reach a relay"
+        );
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn initial_profile_retry_returns_the_profile_a_running_bootstrap_publishes() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    // Hold the concurrent KeyPackage and bootstrap publication lanes.
+    relay.block_next_publishes(2);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let request = || AccountSetupRequest {
+        default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+
+    let first = runtime
+        .create_identity_local_ready(request())
+        .await
+        .unwrap();
+    // `BootstrapPublicationStarted` follows the bootstrap's profile capture.
+    // Rewind to `LocalReady` to reproduce the window between the two.
+    relay.wait_for_blocked_publishes(2).await;
+    assert_eq!(
+        app.account_home()
+            .account_setup_state(&first.account.label)
+            .unwrap()
+            .unwrap()
+            .phase,
+        marmot_account::AccountSetupPhase::BootstrapPublicationStarted
+    );
+    app.account_home()
+        .set_account_setup_phase(
+            &first.account.label,
+            marmot_account::AccountSetupPhase::LocalReady,
+        )
+        .unwrap();
+
+    let retried = runtime
+        .create_identity_local_ready_with_initial_profile(
+            request(),
+            UserProfileMetadata {
+                name: Some("Chosen Heron".into()),
+                display_name: Some("Chosen Heron".into()),
+                ..UserProfileMetadata::default()
+            },
+        )
+        .await
+        .unwrap();
+    relay.release_publish();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime
+            .account_setup_readiness(&first.account.label)
+            .unwrap()
+            != AccountSetupReadiness::NetworkReady
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background setup must reach network readiness");
+
+    let returned = retried
+        .profile
+        .expect("local-ready setup returns its profile");
+    let published_name = format!(
+        "\"name\":\"{}\"",
+        returned
+            .name
+            .as_deref()
+            .expect("returned profile has a name")
+    );
+    let kind0 = relay
+        .attempted_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == KIND_NOSTR_METADATA)
+        .map(|event| event.content.clone())
+        .collect::<Vec<_>>();
+    assert!(!kind0.is_empty(), "bootstrap must publish kind-0 metadata");
+    assert!(
+        kind0
+            .iter()
+            .all(|content| content.contains(&published_name)),
+        "a retry must return the profile the running bootstrap publishes: \
+         returned {:?}, published {kind0:?}",
+        returned.name
+    );
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     let directory = tempfile::tempdir().unwrap();
@@ -6597,7 +6875,10 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
         .await
         .unwrap();
     assert_eq!(repeated.account, result.account);
-    assert_eq!(repeated.profile, result.profile);
+    assert_eq!(
+        profile_content(&repeated.profile),
+        profile_content(&result.profile)
+    );
     assert_eq!(repeated.key_package_bytes, result.key_package_bytes);
     assert_eq!(repeated.readiness, AccountSetupReadiness::Publishing);
     assert_eq!(
@@ -6907,7 +7188,10 @@ async fn concurrent_generated_identity_calls_converge_on_one_local_attempt() {
     let first = first.unwrap();
     let second = second.unwrap();
     assert_eq!(first.account, second.account);
-    assert_eq!(first.profile, second.profile);
+    assert_eq!(
+        profile_content(&first.profile),
+        profile_content(&second.profile)
+    );
     assert_eq!(first.key_package_bytes, second.key_package_bytes);
     assert_eq!(
         AccountHome::open(directory.path()).accounts().unwrap(),
@@ -7721,7 +8005,17 @@ async fn member_key_package_skips_local_legacy_cache() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
     let account = home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let mut app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    // A records-only mock reports unknown completion. Model an explicitly
+    // completed empty lookup so this test checks missing remote evidence.
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        None,
+        relay,
+        Arc::new(MemberResolutionDirectoryFetcher::default()),
+        false,
+    );
     let legacy = fresh_key_package_for_account(&app, &account, true).await;
     write_json(
         app.key_package_record_path(&account.label),
@@ -7740,10 +8034,10 @@ async fn member_key_package_skips_local_legacy_cache() {
     let result = app.member_key_package(&account.label).await;
     assert!(
         matches!(
-            result,
+            &result,
             Err(AppError::MissingKeyPackage(_) | AppError::MissingRelayLists(_))
         ),
-        "legacy local cache must not be selected for invites; fallback must fail closed"
+        "legacy local cache must not be selected for invites; got {result:?}"
     );
 }
 

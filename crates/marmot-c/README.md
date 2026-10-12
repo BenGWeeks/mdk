@@ -14,8 +14,10 @@ per feature.
 - [Using the ABI](#using-the-abi)
 - [Integration documentation](#integration-documentation)
 - [Lifecycle and teardown](#lifecycle-and-teardown)
+- [Onboarding relay repair](#onboarding-relay-repair)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
+  [file-backed media upload](#file-backed-media-upload),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
   [KeyPackage inventory](#keypackage-inventory), [selected chat-list presentation](#selected-chat-list-presentation),
@@ -141,6 +143,32 @@ Release subscriptions before clients, and never free an object while another cal
 destructors from racing process exit (since 0.10.3). Run final free off the UI thread. Calls from a Tokio runtime
 context retain nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
 
+## Onboarding relay repair
+
+For a general or inbox onboarding relay failure, call
+`marmot_propose_onboarding_relay_repair` and inspect the optional
+`proposal->relay_repair` in the returned snapshot. Its ordered before/after
+tags and occurrence changes preserve duplicate entries, direction markers,
+unrelated fields, and content. `ManualReview` has no approval action; do not
+publish it or treat it as a full reset. Free the snapshot with
+`marmot_onboarding_snapshot_free` after presenting the exact diff. Approval
+remains a separate revision- and recovery-epoch-bound call.
+
+Explicit `marmot_propose_onboarding_relays` selections also return the typed
+preview. See the shared [manual-edit preservation and checkpoint compatibility
+contract](../marmot-uniffi/README.md#explicit-recovery-and-checkpoint-compatibility).
+The C signatures and snapshot ownership rules are unchanged.
+
+C relay-repair previews encode `original_content`, `proposed_content`, every
+`fields` element in tags and changes, and each non-NULL `endpoint` as a JSON
+string literal. Decode exactly once with a parser that preserves embedded zero
+bytes and decoded UTF-8 lengths before displaying or prefilling an editor.
+For example, `"a\u0000b"` represents three bytes: `61 00 62`; `""` is an empty
+string, distinct from a NULL optional endpoint. Do not use `strlen` on decoded
+content or discard control bytes. The encoded C strings contain no embedded
+NULs; their snapshot ownership and deep-free rules are unchanged. Swift/Kotlin
+records retain ordinary strings and do not use this C-only encoding.
+
 ## Runtime construction
 
 `marmot_client_new_with_configuration` takes a `MarmotClientOptions` struct combining relay policy, cursor
@@ -154,6 +182,20 @@ an explicit loopback relay policy and an optional host secret-store vtable.
 Existing constructors keep their public-only policy. Loopback broker access
 requires a separate publisher trust opt-in; neither permits private or
 link-local endpoints. Local insecure trust is intended only for tests.
+
+## File-backed media upload
+
+`marmot_upload_media_files` and its token-aware twin take borrowed
+`MarmotMediaFileUploadRequest` inputs with private regular-file paths instead of
+plaintext arrays. See the [shared contract](../marmot-uniffi/README.md#file-backed-media-upload).
+Calls block; run them off the UI thread. Strings and request arrays must remain
+valid until return. Create one `MarmotMediaFileTransferControl` per call, query or
+cancel it from another thread, and free it only after all calls on the handle
+have returned. Results use the existing upload/submission deep-free functions.
+No host path is included in published attachment metadata.
+File-backed calls have no fixed worker-response timeout; per-endpoint network
+deadlines still apply. Cancellation observed before message admission starts
+prevents publication; admission is not interruptible once started.
 
 ## Local sends
 
@@ -280,6 +322,11 @@ Keep one `MarmotNip46Session` per remote-signer account. Local-key accounts use
 their normal login path in the same client. The session pins three separate keys:
 the client communication key, the remote signer's communication key, and the
 user's account key. Only the last identifies the MDK account.
+
+NIP-46 sessions use the shared [SOCKS5 routing policy](../marmot-app/README.md#socks5-routing).
+Invalid `WN_SOCKS5_*` configuration makes `marmot_nip46_new` fail with
+`MARMOT_STATUS_INVALID_ARGUMENT`, without connecting directly. The process policy is frozen at first use;
+clearing or correcting the environment afterward does not unblock it.
 
 1. Create an offline handle with `marmot_nip46_new`. Configuration accepts a bunker
    link in `uri`, or a `relays` array with an optional `name` for client pairing.

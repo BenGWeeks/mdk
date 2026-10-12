@@ -7,13 +7,42 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Mirror bounded native startup progress with opt-in enable/snapshot functions and a deep-free snapshot API. The synchronous observation remains usable before native startup completes.
+
 ### Added
 
+- NIP-46 signer sessions and the runtime follow the opt-in `WN_SOCKS5_*`
+  proxy settings described in the marmot-app
+  [SOCKS5 routing](../marmot-app/README.md#socks5-routing) section. With the
+  variables unset, nothing changes. When they are invalid,
+  `marmot_nip46_new` returns `MARMOT_STATUS_INVALID_ARGUMENT` and
+  `marmot_client_new` fails instead of connecting directly. Agent preview
+  publishing and watching are unavailable while SOCKS5 is on.
+
+- `marmot_submit_moderation_report`, `marmot_moderation_reporting_available`,
+  `marmot_configure_moderation_reporting` and
+  `marmot_moderation_report_outcome_free` mirror the private moderation-report
+  calls. `MarmotModerationReportOrigin` and `MarmotModerationReportOutcome` are new
+  types, and statuses 96–100 cover the new errors. `MarmotClientOptions` is
+  unchanged; configure the destination with the new call. These are new symbols,
+  so use the matching header and library.
+
+- `marmot_create_identity_with_initial_profile` creates a generated identity
+  whose first public kind-0 is the borrowed onboarding profile. New symbol;
+  use the matching header and library.
+
+- File-backed media upload inputs, token-aware upload calls and operation
+  cancellation/progress handles. New symbols and borrowed input records require
+  matching headers/libraries; existing byte-array APIs retain their bounds.
+- Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
+  preview records. `MarmotOnboardingRepairProposal` gains an optional
+  `relay_repair` pointer; regenerate and recompile with the matching header
+  and library. The preview is non-publishing, and `ManualReview` has no
+  approvable action.
 - The C event surface appends local-copy termination/restoration and removed-device-leaf
   events; existing discriminants remain unchanged. Recompile with the matching
   header and native library and handle the new event kinds. Restoration describes
   retained-history repair, not automatic scheduler restoration of removed copies.
-
 - `MarmotPresentedChatRow` gains a nullable row-owned `MarmotChatListDraftVersion` handle and
   `marmot_message_draft_revision_includes_chat_list_version` compares it against
   a borrowed selected revision. Both inputs are opaque read-only borrows; only
@@ -37,6 +66,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   Local-key accounts and separate remote signers can run in the same client.
 
 ### Changed
+
+- Relay-repair C preview content, tag fields and optional endpoints use JSON
+  string literals to preserve embedded NULs and all UTF-8 bytes. Decode once
+  with a length-aware parser before consent or editing. Pointer layouts and
+  snapshot frees are unchanged, but consumers must adopt the new encoding.
 
 - `MarmotAttachmentEntry` adds `role: MarmotAttachmentRole` (`Shared` or
   `InlineEmoji`) for gallery filtering without changing slot or acquisition identity.

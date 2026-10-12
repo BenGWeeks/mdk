@@ -94,6 +94,14 @@ with a new edit token; it was not admitted. This rate limit is distinct from
 `message identity collision`, which also rejects a new token but does not
 schedule an automatic retry.
 
+An engine-owned original can temporarily show `local_publish_failed` while its
+retained publication recovers. Its accepted edit remains queued with the same
+token and content until the original's authoritative projection becomes
+available again. This dependency preserves order within that group while
+independent groups can still progress. Deleted, foreign, terminal-group and
+convergence-invalidated targets retain their rejection behavior; a failure
+marker alone is not permission to edit a target.
+
 The host should continue to show the submitted revision as pending until its
 edit token completes, and keep the text available for retry or copy if it is
 rejected. Unsubmitted composer text remains host UI state. Existing
@@ -114,6 +122,17 @@ encrypted references. After an unknown outcome, query `local_send_status` with t
 original token before uploading again. Media references remain epoch-bound and
 can be rejected if the group changes before engine acceptance. A rejected media
 submission needs freshly prepared references and a new token.
+
+`upload_media_files_with_client_token` has the same admission contract for
+file-backed attachments (`source_path` instead of a plaintext byte array). Every
+attachment is snapshotted, encrypted and uploaded before admission. Its
+`MediaFileTransferControlFfi` is the only cancellation input. Cancellation
+observed before admission starts returns an error and admits nothing; an upload
+that already completed is left unreferenced on the server. Dropping the host's
+wait is not cancellation. Once admission starts it is not interruptible, even
+before durable acceptance returns; use `local_send_status` and timeline delivery
+as for any token-bound send. File-backed uploads have no fixed worker-response
+timeout; per-endpoint network deadlines still apply.
 
 ## Conversation windows and draft cost
 

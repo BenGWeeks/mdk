@@ -82,13 +82,13 @@ pub use account_attention::{
 mod chat_list_window;
 mod conversation_window;
 mod worker_startup;
-pub(crate) use conversation_window::SendCapture;
 pub use conversation_window::{
     CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,
     ConversationOpenQuery, ConversationOpenReadState, ConversationOpenTarget,
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
+pub(crate) use conversation_window::{SendCapture, publish_conversation_captures_from_session};
 pub(crate) mod attachment_controls;
 pub(crate) mod attachment_permission;
 pub use attachment_controls::{
@@ -111,6 +111,7 @@ mod avatar_access;
 pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
 mod commands;
 mod event_routing;
+mod local_submission_queue;
 mod local_submissions;
 mod onboarding;
 mod presentation;
@@ -363,6 +364,9 @@ pub struct RuntimeSharedServices {
     #[cfg(test)]
     pub(crate) ordinary_delivery_dropped: Arc<Notify>,
     local_submission_wakeups: watch::Sender<()>,
+    // Private bounded observations and weak per-account gate lookup. This
+    // global mutex is never held during storage, engine, or network work.
+    local_submission_queue: Arc<StdMutex<local_submission_queue::LocalSubmissionQueue>>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: watch::Sender<()>,
     attachment_cancellations: watch::Sender<()>,
@@ -478,6 +482,7 @@ impl Default for RuntimeSharedServices {
             ordinary_delivery_dropped: Arc::new(Notify::new()),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             local_submission_wakeups: watch::channel(()).0,
+            local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_updates: watch::channel(()).0,
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
@@ -508,6 +513,13 @@ impl Default for RuntimeSharedServices {
 }
 
 impl RuntimeSharedServices {
+    fn local_submission_gate(&self, account: &str) -> Arc<Mutex<()>> {
+        self.local_submission_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .account_gate(account)
+    }
+
     pub(crate) fn recovery_credit_pool(
         &self,
     ) -> Arc<account_worker::recovery_credits::RecoveryCreditPool> {
@@ -569,6 +581,7 @@ impl RuntimeSharedServices {
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             attachment_updates: watch::channel(()).0,
             local_submission_wakeups: watch::channel(()).0,
+            local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: app.relay_plane.clone(),
@@ -1784,7 +1797,9 @@ impl MarmotAppRuntime {
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
-        self.accounts.catch_up_accounts().await.map(|_| ())
+        let result = self.accounts.catch_up_accounts().await.map(|_| ());
+        self.spawn_moderation_report_retries();
+        result
     }
 
     /// Notify every running account worker that the host has observed usable
@@ -1799,7 +1814,9 @@ impl MarmotAppRuntime {
     /// workers were considered. Used by reconciliation drivers that expose
     /// aggregate per-pass work telemetry (mdk#1380).
     pub async fn catch_up_accounts_reporting(&self) -> Result<CatchUpAccountsSummary, AppError> {
-        self.accounts.catch_up_accounts().await
+        let result = self.accounts.catch_up_accounts().await;
+        self.spawn_moderation_report_retries();
+        result
     }
 
     /// Explicitly repair a potentially incomplete incremental history.
@@ -3630,6 +3647,18 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn upload_media_files(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        request: crate::MediaFileUploadRequest,
+        control: std::sync::Arc<crate::MediaFileTransferControl>,
+    ) -> Result<MediaUploadResult, AppError> {
+        self.accounts
+            .upload_media_files(account_ref, group_id, request, control)
+            .await
+    }
+
     /// Send already-uploaded attachments as one kind-9 chat that also carries
     /// application tags, such as NIP-30 `emoji` tags naming those attachments.
     pub async fn send_tagged_media(
@@ -4443,18 +4472,15 @@ impl MarmotAppRuntime {
         {
             profile = merge_user_profile_update(current, profile);
         }
-        // Stamp the just-published profile with the current time before caching
-        // it. The published kind-0 event is authored with `now`, so the cached
-        // own-account entry must carry a matching `created_at`. Callers that
-        // arrive via FFI hardcode `created_at == 0` (see
-        // `UserProfileMetadataFfi -> UserProfileMetadata`), and a zero stamp
-        // loses to *any* fetched kind-0 in `remember_directory_profile_if_newer`
-        // (it only retains the cache when `cached.created_at > fetched`). That
-        // let a stale pre-edit copy served by a lagging relay revert the local
-        // edit on the next directory refresh. Stamping `now` protects the edit
-        // against relay copies published before this moment.
+        // Cache the published event's own `created_at`. FFI callers pass
+        // `created_at == 0` (see `UserProfileMetadataFfi -> UserProfileMetadata`),
+        // which loses to any fetched kind-0 in `remember_directory_profile_if_newer`,
+        // and rapid saves author timestamps that run ahead of the clock. Either
+        // way, a stale or intermediate relay copy could otherwise revert the
+        // local edit on the next directory refresh.
         stamp_published_profile_created_at(&mut profile, unix_now_seconds());
-        self.accounts
+        profile.created_at = self
+            .accounts
             .app
             .publish_user_profile_to_endpoints_and_indexers(
                 &account.label,
@@ -5307,7 +5333,25 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
-        self.create_generated_account_local_ready(request, true)
+        self.create_generated_account_local_ready(request, true, None)
+            .await
+    }
+
+    /// Create a generated identity whose first public kind-0 is `profile`.
+    ///
+    /// The profile replaces the key-derived default before any bootstrap
+    /// record can reach a relay, so recipients never see a temporary name.
+    /// A setup resumed past its first local step ignores `profile`, because a
+    /// background bootstrap may already hold the profile it publishes, and
+    /// returns that profile; later changes are ordinary profile edits.
+    pub async fn create_identity_local_ready_with_initial_profile(
+        &self,
+        mut request: AccountSetupRequest,
+        profile: UserProfileMetadata,
+    ) -> Result<AccountSetupResult, AppError> {
+        validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
+        request.identity = None;
+        self.create_generated_account_local_ready(request, true, Some(profile))
             .await
     }
 
@@ -5427,7 +5471,7 @@ impl MarmotAppRuntime {
             }
         };
         if let Err(error) = self
-            .create_generated_account_local_ready(context.request(), true)
+            .create_generated_account_local_ready(context.request(), true, None)
             .await
         {
             self.report_generated_setup_resume_deferred(&account, error.privacy_safe_kind());
@@ -5459,6 +5503,7 @@ impl MarmotAppRuntime {
         &self,
         request: AccountSetupRequest,
         schedule_background: bool,
+        initial_profile: Option<UserProfileMetadata>,
     ) -> Result<AccountSetupResult, AppError> {
         let observation = self.shared.product_analytics.begin(
             crate::ProductFamily::Account,
@@ -5466,7 +5511,11 @@ impl MarmotAppRuntime {
             crate::ProductUnit::Attempt,
         );
         let result = self
-            .create_generated_account_local_ready_unobserved(request, schedule_background)
+            .create_generated_account_local_ready_unobserved(
+                request,
+                schedule_background,
+                initial_profile,
+            )
             .await;
         if let Some(observation) = observation {
             observation.finish(if result.is_ok() { "success" } else { "failure" });
@@ -5478,6 +5527,7 @@ impl MarmotAppRuntime {
         &self,
         request: AccountSetupRequest,
         schedule_background: bool,
+        initial_profile: Option<UserProfileMetadata>,
     ) -> Result<AccountSetupResult, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let _generated_setup_transaction =
@@ -5556,26 +5606,24 @@ impl MarmotAppRuntime {
 
         let profile_started = Instant::now();
         let profile_result = (|| {
-            if let Some(profile) = self
+            let cached = self
                 .accounts
                 .app
                 .directory_entry_for_account_id(&account.account_id_hex)?
-                .and_then(|entry| entry.profile)
-            {
-                Ok(profile)
-            } else {
-                let pseudonym = default_profile_pseudonym(&account.account_id_hex);
-                let profile = UserProfileMetadata {
-                    name: Some(pseudonym.clone()),
-                    display_name: Some(pseudonym),
-                    created_at: unix_now_seconds(),
-                    ..UserProfileMetadata::default()
-                };
+                .and_then(|entry| entry.profile);
+            let (profile, store) = generated_setup_profile(
+                &account.account_id_hex,
+                phase,
+                cached,
+                initial_profile,
+                unix_now_seconds(),
+            );
+            if store {
                 self.accounts
                     .app
                     .remember_directory_profile(&account.account_id_hex, &profile)?;
-                Ok::<_, AppError>(profile)
             }
+            Ok::<_, AppError>(profile)
         })();
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::AccountSetupProfileLocal,
@@ -5680,7 +5728,7 @@ impl MarmotAppRuntime {
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
         let local = self
-            .create_generated_account_local_ready(request, false)
+            .create_generated_account_local_ready(request, false, None)
             .await?;
         let context = self
             .accounts
@@ -5877,6 +5925,11 @@ impl MarmotAppRuntime {
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
+        self.shared
+            .local_submission_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         for task in self.accounts.app.abort_all_public_indexer_copies() {
             let _ = task.await;
         }
@@ -5987,6 +6040,11 @@ impl MarmotAppRuntime {
 
     async fn run_terminal_shutdown_and_close(self) -> Result<(), AppError> {
         self.shared.lifecycle().begin_shutdown();
+        self.shared
+            .local_submission_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let indexer_copies = self.accounts.app.abort_all_public_indexer_copies();
         #[cfg(test)]
         self.stall_shutdown_phase_for_test(ShutdownTestPhase::StorageClose)
@@ -6393,6 +6451,11 @@ impl AccountManager {
     }
 
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
+        // Stop and delete the account's moderation reports, and admit none
+        // until the removal below has committed (every removal entry point).
+        // Fenced before the global lock: the purge may open account storage.
+        // Removing the directory deletes the rows even if this purge fails.
+        let (_report_fence, _) = self.fence_moderation_reports(account_ref).await;
         let lock_wait = self
             .shared
             .app_performance_telemetry()
@@ -6428,10 +6491,33 @@ impl AccountManager {
             // storage connection (and directory cache) keeps pointing at the
             // unlinked inode and a later re-import silently splits writes
             // across a stale handle.
-            self.app.drop_account_caches(&account.label);
-            self.app
-                .remove_account_key_package_artifacts(&account.label)?;
-            self.app.account_home().remove_account(&account.label)?;
+            {
+                // A committed removal and observation cancellation cannot be
+                // overtaken by an already-owned local admission. No network
+                // or async cleanup runs while this account gate is held.
+                let gate = self.shared.local_submission_gate(&account.account_id_hex);
+                let _admission = gate.lock().await;
+                self.app.drop_account_caches(&account.label);
+                self.app
+                    .remove_account_key_package_artifacts(&account.label)?;
+                let removed = self.app.account_home().remove_account(&account.label);
+                if removed.is_ok()
+                    || matches!(
+                        self.app.account_home().account(&account.label),
+                        Err(AccountHomeError::UnknownAccount(_))
+                    )
+                {
+                    // Secret cleanup may fail after the live-directory rename.
+                    // Cancel only a confirmed removal, including that case;
+                    // pre-commit and ambiguous failures retain live-row timing.
+                    self.shared
+                        .local_submission_queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .cancel_account(&account.account_id_hex);
+                }
+                removed?;
+            }
             for task in self
                 .app
                 .abort_public_indexer_copies_for_account(&account.account_id_hex)
@@ -6520,12 +6606,30 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
-            self.app.drop_account_caches(&account.label);
-            self.app
-                .remove_account_key_package_artifacts(&account.label)?;
-            self.app
-                .account_home()
-                .reset_incomplete_setup_preserving_credential(&account.label)?;
+            {
+                let gate = self.shared.local_submission_gate(&account.account_id_hex);
+                let _admission = gate.lock().await;
+                self.app.drop_account_caches(&account.label);
+                self.app
+                    .remove_account_key_package_artifacts(&account.label)?;
+                let removed = self
+                    .app
+                    .account_home()
+                    .reset_incomplete_setup_preserving_credential(&account.label);
+                if removed.is_ok()
+                    || matches!(
+                        self.app.account_home().account(&account.label),
+                        Err(AccountHomeError::UnknownAccount(_))
+                    )
+                {
+                    self.shared
+                        .local_submission_queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .cancel_account(&account.account_id_hex);
+                }
+                removed?;
+            }
             Ok(())
         }
         .await
@@ -6548,7 +6652,29 @@ impl AccountManager {
     ///
     /// Dropping the in-memory caches is harmless when the directory is kept: a
     /// later sign-in simply re-warms them from the unchanged on-disk database.
+    /// Fence `account_ref`'s moderation reports for a teardown. An unknown
+    /// account has none; the teardown reports that itself.
+    async fn fence_moderation_reports(
+        &self,
+        account_ref: &str,
+    ) -> (
+        Option<crate::moderation_reports::ModerationReportFence>,
+        Result<(), AppError>,
+    ) {
+        let Ok(account) = self.app.account_home().account(account_ref) else {
+            return (None, Ok(()));
+        };
+        let (fence, purged) = self.app.fence_moderation_reports(&account.label).await;
+        (Some(fence), purged.map(|_| ()))
+    }
+
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
+        // Queued moderation reports never outlive a sign-out: stop and delete
+        // them, and admit none until the sign-out below has committed. Fenced
+        // before the global lock: the purge may open account storage. A failed
+        // purge does not stop the sign-out, but it is reported: reports left on
+        // disk would be retried at the next sign-in.
+        let (_report_fence, report_purge) = self.fence_moderation_reports(account_ref).await;
         let lock_wait = self
             .shared
             .app_performance_telemetry()
@@ -6574,9 +6700,10 @@ impl AccountManager {
                 .forget_account(&account.account_id_hex);
             self.shared.attachment_cancellations.send_modify(|_| {});
             self.app.drop_account_caches(&account.label);
-            Ok(())
+            Ok::<(), AppError>(())
         }
-        .await
+        .await?;
+        report_purge
     }
 
     async fn restore_signed_out_after_key_package_failure(&self, account_ref: &str) {
@@ -8031,7 +8158,7 @@ impl AccountManager {
         if let Some(copy) = publication.indexer_copy {
             self.app.spawn_public_indexer_copy(copy);
         }
-        Ok((publication.status, Some(profile)))
+        Ok((publication.status, Some(publication.profile)))
     }
 
     fn setup_failure_can_roll_back(
@@ -8489,6 +8616,11 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        self.shared
+            .local_submission_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         for task in self.app.abort_all_public_indexer_copies() {
             let _ = task.await;
         }
@@ -8817,6 +8949,40 @@ fn collect_notification_update_from_event(
                 error_code = "notification_projection_skipped",
                 "notification projection skipped",
             );
+        }
+    }
+}
+
+/// Choose a generated account's setup profile and whether to cache it.
+///
+/// A caller-selected profile applies only in `LocalStateCreated`. After that a
+/// background bootstrap may already hold its snapshot, taken off the setup
+/// lock: the cached profile, or this same key-derived fallback when none was
+/// cached. Ignoring the selection then keeps the result equal to what is
+/// published; later changes are ordinary profile edits.
+fn generated_setup_profile(
+    account_id_hex: &str,
+    phase: AccountSetupPhase,
+    cached: Option<UserProfileMetadata>,
+    initial: Option<UserProfileMetadata>,
+    now: u64,
+) -> (UserProfileMetadata, bool) {
+    let initial = initial.filter(|_| phase == AccountSetupPhase::LocalStateCreated);
+    match (initial, cached) {
+        (Some(mut selected), _) => {
+            stamp_published_profile_created_at(&mut selected, now);
+            (selected, true)
+        }
+        (None, Some(cached)) => (cached, false),
+        (None, None) => {
+            let pseudonym = default_profile_pseudonym(account_id_hex);
+            let profile = UserProfileMetadata {
+                name: Some(pseudonym.clone()),
+                display_name: Some(pseudonym),
+                created_at: now,
+                ..UserProfileMetadata::default()
+            };
+            (profile, true)
         }
     }
 }

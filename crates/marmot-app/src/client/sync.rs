@@ -786,9 +786,20 @@ impl AppClient {
             None => {
                 if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
+                } else if self.runtime.has_queued_outbound_intents(group_id)?
+                    && !self
+                        .runtime
+                        .queued_outbound_intents_blocked_by_fanouts(group_id)?
+                {
+                    // Restarted queued sends must get their ordinary wake even
+                    // when secondary replication retains a longer retry cutoff.
+                    // The drain uses the same durable publication safety gate.
+                    Ok(ConvergenceScheduleState::PendingOutbound {
+                        retry_after_ms: None,
+                    })
                 } else if self.runtime.has_pending_outbound_fanouts(group_id)? {
-                    // Fanout retry is a barrier to staging more outbound work,
-                    // including a due SelfRemove and queued local mutations.
+                    // Required publication and pending MLS still gate queued
+                    // sends. Other local mutations retain fanout precedence.
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
                     })
@@ -2971,7 +2982,12 @@ impl AppClient {
                 loop {
                     match timeout(EOSE_QUIET_WAIT, self.adapter.receive_account_delivery()).await {
                         Ok(result) => return result,
-                        Err(_) if self.adapter.account_subscription_eose().await.complete() => {
+                        // Settled, not complete: a relay that refused a REQ for
+                        // good will never report EOSE, so waiting longer brings
+                        // nothing. Ending the drain early ends it exactly as a
+                        // timeout would, checkpoint included; live promotion
+                        // and activation reuse still require EOSE.
+                        Err(_) if self.adapter.account_subscription_eose().await.settled() => {
                             return Ok(None);
                         }
                         Err(_) => {}
@@ -5285,16 +5301,126 @@ impl AppClient {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn advance_convergence_after_runtime_sync(
         &mut self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<SyncSummary, AppError> {
+        self.advance_convergence_with_projection_progress(group_id, None)
+            .await
+    }
+
+    /// Project accepted sends before later relay work finishes. A worker sink
+    /// publishes each committed update immediately; other callers receive the
+    /// updates once in the ordinary summary. The finalizer still owns guarded
+    /// failed-row revival and durable fanout acknowledgement.
+    #[cfg(test)]
+    pub(crate) async fn advance_convergence_with_projection_progress(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        on_update: Option<std::sync::Arc<dyn Fn(crate::AppProjectionUpdate) + Send + Sync>>,
+    ) -> Result<SyncSummary, AppError> {
+        self.advance_convergence_with_projection_progress_and_yield(
+            group_id,
+            on_update,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    /// Preserve publication finalization while allowing the owner to interrupt
+    /// already-confirmed secondary retry waits for durable foreground work.
+    pub(crate) async fn advance_convergence_with_projection_progress_and_yield(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        on_update: Option<std::sync::Arc<dyn Fn(crate::AppProjectionUpdate) + Send + Sync>>,
+        yield_requested: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<SyncSummary, AppError> {
         if self.is_group_forgotten(group_id)? {
             return Ok(SyncSummary::default());
         }
+        self.conversation_captures
+            .retain(|capture| capture.strong_count() > 0);
+        let conversation_captures = self.conversation_captures.clone();
+        let app = self.app.clone();
+        let label = self.state.label.clone();
+        let buffered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress_updates = buffered.clone();
+        let observe = std::sync::Arc::new(
+            move |session: &cgka_session::AccountDeviceSession,
+                  published: &marmot_account::PublishedApplicationMessage| {
+                // UPDATE-only finalization cannot create absent rows or clear an
+                // invalidation. Revival requires the live-group check in the final
+                // effects handler and intentionally waits for that handler.
+                let result = app.finalize_account_app_event_source_retention(
+                    &label,
+                    &hex::encode(published.group_id.as_slice()),
+                    &published.app_event_id,
+                    Some(&hex::encode(published.message_id.as_slice())),
+                    published.source_epoch.0,
+                    published.retention,
+                    published.authority,
+                );
+                match result {
+                    Ok(update) => {
+                        // Make the coherent live checkpoint available before the
+                        // projection broadcast wakes the selected window. Replay
+                        // may have no SQL delta but still owes a fresh checkpoint.
+                        crate::runtime::publish_conversation_captures_from_session(
+                            &conversation_captures,
+                            session,
+                            &app,
+                            &label,
+                            &published.group_id,
+                        );
+                        if let Some(update) = update {
+                            match &on_update {
+                                Some(on_update) => on_update(update),
+                                None => progress_updates.lock().unwrap().push(update),
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        target: "marmot_app::client::projection",
+                        method = "publication_progress",
+                        error_kind = error.privacy_safe_kind(),
+                        "published application-message projection deferred",
+                    ),
+                }
+            },
+        );
+        // Transfer committed early snapshots to the finalizer's retained owner
+        // on success, error, or cancellation of the runtime wait. Appending here
+        // keeps any older retained prefix before progress and later revival.
+        struct RetainPublicationProgress<'a> {
+            retained: &'a mut Vec<crate::AppProjectionUpdate>,
+            buffered: std::sync::Arc<std::sync::Mutex<Vec<crate::AppProjectionUpdate>>>,
+        }
+        impl Drop for RetainPublicationProgress<'_> {
+            fn drop(&mut self) {
+                let mut buffered = self
+                    .buffered
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                self.retained.extend(std::mem::take(&mut *buffered));
+            }
+        }
+        let retain_progress = RetainPublicationProgress {
+            retained: &mut self.pending_applied_sync_summary.projection_updates,
+            buffered,
+        };
         // The worker retries dirty subscription state before this pass. An
         // unchanged group set requires no account-wide refresh per group.
-        let effects = self.runtime.advance_convergence(group_id).await?;
+        let effects = self
+            .runtime
+            .advance_convergence_with_publication_progress_and_yield(
+                group_id,
+                observe,
+                yield_requested,
+            )
+            .await;
+        drop(retain_progress);
+        let effects = effects?;
         let mut summary = self
             .finish_scheduled_convergence_effects(group_id, &effects)
             .await?;
@@ -9176,6 +9302,58 @@ mod tests {
         assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
     }
 
+    /// A relay that refuses a subscription for good will never report its
+    /// end of stored events, so the drain stops waiting for it once every
+    /// other relay has answered. The refusal is not evidence that history
+    /// was served, so the replay stays incomplete and the live cursor is not
+    /// promoted past it.
+    #[tokio::test]
+    async fn dropped_refusal_shortens_quiet_drain_without_completing_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.sync_runtime_groups().await.unwrap();
+        tokio::time::pause();
+        client.sync_sdk_relay().await.unwrap();
+        let subscriptions = relay.accepted_subscriptions();
+        let (refused, served) = subscriptions
+            .split_first()
+            .expect("the account holds a subscription");
+        for endpoint in refused.endpoints() {
+            app.relay_plane
+                .handle_relay_closed_for_test(
+                    endpoint.clone(),
+                    refused.subscription_id(),
+                    transport_nostr_adapter::SubscriptionRefusal {
+                        category: Some(cgka_traits::TransportEndpointRejectionCategory::Restricted),
+                        disposition:
+                            transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
+                    },
+                )
+                .await;
+        }
+        for subscription in served {
+            for endpoint in subscription.endpoints() {
+                app.relay_plane
+                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+                    .await;
+            }
+        }
+        let progress = client.adapter.account_subscription_eose().await;
+        assert!(progress.settled());
+        assert!(!progress.complete());
+        assert!(!client.live_cursor_promotion_ready().await);
+        let started = tokio::time::Instant::now();
+        client.sync_sdk_relay().await.unwrap();
+        assert!(started.elapsed() >= super::EOSE_QUIET_WAIT);
+        assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
+    }
+
     /// A lag that lost the end-of-stored-events a quiet drain ends on would
     /// hold every later drain to its full first wait. The lag's repair
     /// re-issues the unanswered REQ, and once the relay's fresh answer
@@ -9344,6 +9522,9 @@ mod tests {
         assert_eq!(buffered, ingested);
     }
 }
+
+#[cfg(test)]
+mod queued_outbound_schedule_tests;
 
 #[cfg(test)]
 mod full_history_tests;

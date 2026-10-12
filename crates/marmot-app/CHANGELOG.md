@@ -2,22 +2,114 @@
 
 ## Unreleased
 
+- Opt-in native startup memory capture reports anonymous account/store/key-opening phases, migration progress and async completion, with bounded history/drop counters. Snapshotting does not query storage or the keystore, and ordinary construction keeps capture disabled.
+
 ### Breaking changes
+
+- `AppError` adds `ModerationReportingNotConfigured`, `InvalidModerationReportConfig`,
+  `InvalidReportedPublicKey`, `CannotReportSelf` and `ModerationReportRateLimited`;
+  update exhaustive matches. `MarmotAppConfig` adds `moderation_report_config`;
+  struct literals that do not use `..Default::default()` must set it.
 
 - Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
   field. Update Rust struct literals; gallery consumers can exclude `InlineEmoji`
   without changing original slots, parser verdicts or acquisition references.
   See [the attachment-history handoff](../marmot-uniffi/ATTACHMENT-HISTORY.md).
 
+- `RelaySyncSnapshot` adds `refusals: Vec<RelayRefusalStats>`. Struct literals
+  must set it (`Vec::new()` keeps the old meaning); serialized snapshots omit it
+  when empty and older ones still deserialize.
+
 ### Added
+
+- Relay refusals of live subscriptions are no longer dropped silently (#2247).
+  When a relay answers an inbox, group or maintenance REQ with `CLOSED`, the
+  account's v5 audit records a `subscription_refused` row: per relay (hashed)
+  and route kind, the reason category, whether the relay client kept the REQ
+  for a later AUTH or dropped it, and how often. `RelaySyncSnapshot.refusals`
+  (and `wn relay-stats`) counts refusals by opaque relay index, route kind,
+  category and disposition. `RelayRefusalStats`, `SubscriptionRouteKind` and
+  `SubscriptionRefusalDisposition` are re-exported.
+
+- Opt-in SOCKS5 routing. Set `WN_SOCKS5_PROXY` (a numeric `ip:port`) and,
+  optionally, both `WN_SOCKS5_USERNAME` and `WN_SOCKS5_PASSWORD` before the
+  runtime starts. Relay publishing, account receive and history pools,
+  directory reads, moderation reports, Blossom media, Open Ranking and
+  collector/audit uploads then connect through the proxy. Relay hostnames
+  resolve at the proxy; HTTP still sends the locally validated IP. The policy
+  is read once per process, ignores `ALL_PROXY`/`NO_PROXY`, and never falls
+  back to a direct connection. With all three variables unset, routing is
+  unchanged. See [SOCKS5 routing](README.md#socks5-routing).
+  - `MarmotApp::try_with_relays_and_account_home_and_config` now fails with an
+    `InvalidInput` I/O error when the `WN_SOCKS5_*` settings are invalid
+    (partial credentials, a hostname or a zero port). The infallible dev
+    constructors open, but every relay and HTTP connection is refused.
+  - `MarmotAppRuntime` agent preview publishing and watching return an
+    `Unsupported` I/O error while SOCKS5 is on, because the proxy cannot carry
+    QUIC.
+
+- `MarmotAppRuntime::submit_moderation_report` privately reports an account to
+  the deployment's moderation team. It sends a NIP-56 kind-1984 rumor, sealed by
+  the account key and gift-wrapped per NIP-59 (through the shared Welcome wrap
+  path) to the configured reports key, and publishes only to the configured
+  relays without account AUTH. This is additive: `report_message`,
+  `content_reports` and `dismiss_reports` are unchanged. Reports never carry
+  message, group or relay identifiers. Signed wraps are staged before publishing,
+  retried after `catch_up_accounts` and purged on sign-out and wipe. Repeats
+  within 10 minutes return the existing outcome, and each account may send 20
+  reports per hour. The new
+  `moderation_reporting_available`, `retry_pending_moderation_reports` and
+  `MarmotApp::set_moderation_report_config` complete the surface. See
+  `docs/marmot-architecture/moderation-reports.md`.
+
+- Opt-in relay telemetry exports `relay_reconciliation_attempts` and
+  `relay_reconciliation_order_unproven_passes`: device-wide, unlabeled counts
+  of NIP-77 history-repair passes, and of group passes that returned nothing
+  because no time order covered the missing history (#2086). Repeated, those
+  passes end in a "history may be incomplete" notice.
+  `NostrAdapterMetrics` gains `reconciliation_order_unproven_passes` and
+  `NostrReconciliationSummary` gains `order_unproven`; struct literals need
+  the field or `..Default::default()`.
+
+- `MarmotAppRuntime::create_identity_local_ready_with_initial_profile` makes a
+  caller-selected profile the first public kind-0 of a generated account, so
+  contacts never see the key-derived default name. A setup resumed past
+  its first local step ignores the profile and returns what its bootstrap
+  publishes.
+
+- `AccountManager::propose_onboarding_relay_repair` previews exact ordered
+  tags, content and minimal relay changes without signing or publishing.
+  Approval retains the existing revision and source-event checks; typed
+  previews require checkpoint version 6.
 
 - `MarmotAppRuntime::message_reactions` returns complete local reaction details for one exact
   account/group/message, with one effective entry per sender/emoji and no
   conversation-preview cap. Missing, hidden, deleted, invalidated and
   retention-pruned targets return no participants; blocked reactors are excluded.
   The read performs no network work or conversation-history scan.
+- `MarmotAppRuntime::upload_media_files` and
+  `upload_media_files_with_client_token` upload file-backed attachments
+  (`MediaFileUploadRequest`, `MediaFileTransferControl`) without whole-file
+  byte arrays: sources are snapshotted and encrypted into owner-only files
+  under the account's `media-staging/` before the first PUT, with the existing
+  wire format, ordered server fallback on identical ciphertext and the
+  existing publication and local-send admission. Optional retention streams
+  into SQLCipher through `stage_attachment_upload_files` and stays bounded by
+  the file-backed 900 MiB ceiling while preserving the account quota.
+  Explicit large acquisitions use private file sinks, bounded authenticated
+  decryption and ciphertext Range checkpoints. Legacy arrays retain their
+  smaller limits. Cancellation observed before admission starts publishes
+  nothing; admission itself is not interruptible. File uploads wait for their
+  size-bounded endpoint attempts without the legacy 16-minute response timeout.
+  File uploads require the server descriptor's `sha256` and `size`. (#2175)
 
 ### Changed
+
+- A sync drain stops waiting once every relay has answered its history REQs,
+  counting a relay that refused one for good as answered, instead of running
+  to `SDK_FIRST_SYNC_WAIT` / `SDK_DRAIN_WAIT`. A refusal is not evidence of
+  served history, so live cursor promotion and incremental activation reuse
+  still require end-of-stored-events from every relay.
 
 - `relay.damus.io` is no longer on the retired-relay denylist; the relay is
   still operating. `retired_relay_hosts()` now returns only
@@ -25,6 +117,39 @@
   `relay.damus.io` can be invited again.
 
 ### Fixed
+
+- Catch-up downloads a large group backlog oldest first. When more history
+  is missing than one comparison pass fetches, the pass narrows to the oldest
+  part that fits, so commits no longer arrive ahead of older messages and move
+  a member's epoch past messages it can then never read (#2086).
+- Catch-up downloads missed group history in far fewer round trips. Each
+  comparison pass now fetches up to 256 events (1 MiB), across all relays, in
+  batched requests instead of 16 one-at-a-time requests, so a backlog of a few hundred
+  messages arrives in a couple of passes instead of dozens. A long drip gave
+  commits time to move a member's epoch past older messages it had not
+  downloaded yet (#2086).
+- Profile, follow-list and relay-list saves still return on the first relay
+  acknowledgement, but relays the quorum cancelled now receive the identical
+  signed record in a bounded background send. Previously those relays kept
+  serving the older version, such as a generated signup name (#2216).
+
+- Explicit onboarding relay edits now preview and publish the selected endpoint
+  changes without rebuilding untouched tags: mixed NIP-65 roles, duplicate
+  occurrences, tag extensions, unrelated tags and event content survive, including
+  when a host supplies an equivalent URL spelling. No-op selections cannot publish. Approval revalidates the exact preview and current
+  endpoint policy; restart retries the same persisted signed event. Manual edit
+  checkpoints use version 7, which older readers reject; no database migration
+  or binding signature change is required. Follow-up to #1979.
+
+
+- File acquisition enforces disk reserve with or without resumable validators,
+  saves interrupted ciphertext tails, retries a rejected resumed representation
+  from zero without consuming redirect hops, and discards responses exceeding
+  their advertised total. Completed files keep progress in ciphertext units.
+  Cancelled file upload completion releases staging even when `send` is false.
+- Lossless relay repairs accept case-insensitive NIP-65 read/write markers,
+  matching relay-list inspection while preserving their original spelling
+  and extension fields through approval and publication.
 
 - Commands and maintenance retain committed activity before subscription waits.
   Manual and scheduled convergence keep subscriber updates owned through route,

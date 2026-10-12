@@ -178,6 +178,20 @@ enum MarmotStatus
    */
   MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94,
   MARMOT_STATUS_INVALID_APP_COMPONENT = 95,
+  /**
+   * No valid moderation-report destination is installed; nothing was published.
+   */
+  MARMOT_STATUS_MODERATION_REPORTING_NOT_CONFIGURED = 96,
+  /**
+   * The moderation-report destination was rejected as a whole.
+   */
+  MARMOT_STATUS_INVALID_MODERATION_REPORT_CONFIG = 97,
+  MARMOT_STATUS_INVALID_REPORTED_PUBLIC_KEY = 98,
+  MARMOT_STATUS_CANNOT_REPORT_SELF = 99,
+  /**
+   * Local per-account moderation-report cap; retry later.
+   */
+  MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED = 100,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -300,6 +314,35 @@ typedef enum MarmotOnboardingAction {
   MARMOT_ONBOARDING_ACTION_CONTINUE_ANYWAY,
   MARMOT_ONBOARDING_ACTION_CANCEL_ONBOARDING,
 } MarmotOnboardingAction;
+
+typedef enum MarmotOnboardingRelayRepairMode {
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_MANUAL_REVIEW,
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_REMOVAL_ONLY,
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_ADDITIVE,
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_REMOVAL_AND_ADDITIVE,
+} MarmotOnboardingRelayRepairMode;
+
+typedef enum MarmotOnboardingRelayTagRole {
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_OTHER,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_UNMARKED,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_READ,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_WRITE,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_INBOX,
+} MarmotOnboardingRelayTagRole;
+
+typedef enum MarmotOnboardingRelayTagDisposition {
+  MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_RETAINED,
+  MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_REMOVED,
+  MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_ADDED,
+} MarmotOnboardingRelayTagDisposition;
+
+typedef enum MarmotOnboardingRelayCapability {
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_NONE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_WRITE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ_AND_WRITE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_INBOX,
+} MarmotOnboardingRelayCapability;
 
 typedef enum MarmotOnboardingDeviceDiscovery {
   MARMOT_ONBOARDING_DEVICE_DISCOVERY_NONE_FOUND,
@@ -801,6 +844,36 @@ typedef enum MarmotReportReason {
   MARMOT_REPORT_REASON_OTHER,
 } MarmotReportReason;
 
+typedef enum MarmotNativeStartupStage {
+  MARMOT_NATIVE_STARTUP_STAGE_ATTACHMENT_TASK_QUEUED,
+  MARMOT_NATIVE_STARTUP_STAGE_ACCOUNT_RESOLUTION,
+  MARMOT_NATIVE_STARTUP_STAGE_ACCOUNT_STORAGE_CACHE,
+  MARMOT_NATIVE_STARTUP_STAGE_STORAGE_ADMISSION,
+  MARMOT_NATIVE_STARTUP_STAGE_DATABASE_OPEN_LOCK,
+  MARMOT_NATIVE_STARTUP_STAGE_SIGNING_KEYS,
+  MARMOT_NATIVE_STARTUP_STAGE_EXTERNAL_DATABASE_SECRET,
+  MARMOT_NATIVE_STARTUP_STAGE_KEY_DERIVATION,
+  MARMOT_NATIVE_STARTUP_STAGE_SALT_READ,
+  MARMOT_NATIVE_STARTUP_STAGE_RECOVERY_PROBE,
+  MARMOT_NATIVE_STARTUP_STAGE_RECOVERY_REKEY,
+  MARMOT_NATIVE_STARTUP_STAGE_ENCRYPTED_STORE_OPEN,
+  MARMOT_NATIVE_STARTUP_STAGE_CIPHER_CONFIGURATION,
+  MARMOT_NATIVE_STARTUP_STAGE_CIPHER_KEY_APPLICATION,
+  MARMOT_NATIVE_STARTUP_STAGE_OPERATIONAL_PRAGMAS,
+  MARMOT_NATIVE_STARTUP_STAGE_MIGRATION_INSPECTION,
+  MARMOT_NATIVE_STARTUP_STAGE_MIGRATION_APPLY,
+  MARMOT_NATIVE_STARTUP_STAGE_ATTACHMENT_LOCAL_READ,
+  MARMOT_NATIVE_STARTUP_STAGE_ATTACHMENT_FUTURE_WAIT,
+  MARMOT_NATIVE_STARTUP_STAGE_PRODUCT_ANALYTICS_ADMISSION,
+} MarmotNativeStartupStage;
+
+typedef enum MarmotNativeStartupOutcome {
+  MARMOT_NATIVE_STARTUP_OUTCOME_ACTIVE,
+  MARMOT_NATIVE_STARTUP_OUTCOME_SUCCESS,
+  MARMOT_NATIVE_STARTUP_OUTCOME_FAILURE,
+  MARMOT_NATIVE_STARTUP_OUTCOME_ABANDONED,
+} MarmotNativeStartupOutcome;
+
 /**
  * Why a timeline delta fired.
  */
@@ -1119,6 +1192,14 @@ typedef enum MarmotHostPerformanceOutcome {
 } MarmotHostPerformanceOutcome;
 
 /**
+ * Which user action produced a private moderation report.
+ */
+typedef enum MarmotModerationReportOrigin {
+  MARMOT_MODERATION_REPORT_ORIGIN_REPORT,
+  MARMOT_MODERATION_REPORT_ORIGIN_BLOCK_AND_REPORT,
+} MarmotModerationReportOrigin;
+
+/**
  * Free before its client. Concurrent next and commands are supported; never free during a call.
  */
 typedef struct MarmotAccountAttentionSubscription MarmotAccountAttentionSubscription;
@@ -1198,6 +1279,11 @@ typedef struct MarmotEventsSubscription MarmotEventsSubscription;
  * then the full record after each member/profile/roster change.
  */
 typedef struct MarmotGroupStateSubscription MarmotGroupStateSubscription;
+
+/**
+ * One operation's control. Query/cancel concurrently; never free during any call on the handle.
+ */
+typedef struct MarmotMediaFileTransferControl MarmotMediaFileTransferControl;
 
 /**
  * Opaque token owned by its SelectedMessageDraft; borrow only while that draft remains live.
@@ -1721,6 +1807,63 @@ typedef struct MarmotStringList {
   uintptr_t len;
 } MarmotStringList;
 
+typedef struct MarmotOnboardingRelayTag {
+  /**
+   *Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
+  char **fields;
+  uintptr_t fields_len;
+  /**
+   *NULL or a JSON string literal; decode once preserving embedded NULs.
+   */
+  char *endpoint;
+  enum MarmotOnboardingRelayTagRole role;
+} MarmotOnboardingRelayTag;
+
+typedef struct MarmotOnboardingRelayTagChange {
+  enum MarmotOnboardingRelayTagDisposition disposition;
+  bool has_before_index;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t before_index;
+  bool has_after_index;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t after_index;
+  /**
+   *Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
+  char **fields;
+  uintptr_t fields_len;
+  /**
+   *NULL or a JSON string literal; decode once preserving embedded NULs.
+   */
+  char *endpoint;
+  enum MarmotOnboardingRelayTagRole role;
+  enum MarmotOnboardingRelayCapability restores;
+} MarmotOnboardingRelayTagChange;
+
+typedef struct MarmotOnboardingRelayRepair {
+  enum MarmotOnboardingRelayRepairMode mode;
+  char *original_event_id;
+  /**
+   *JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
+  char *original_content;
+  /**
+   *JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
+  char *proposed_content;
+  struct MarmotOnboardingRelayTag *before_tags;
+  uintptr_t before_tags_len;
+  struct MarmotOnboardingRelayTag *after_tags;
+  uintptr_t after_tags_len;
+  struct MarmotOnboardingRelayTagChange *changes;
+  uintptr_t changes_len;
+} MarmotOnboardingRelayRepair;
+
 typedef struct MarmotOnboardingRepairProposal {
   enum MarmotOnboardingStep step;
   uint64_t revision;
@@ -1731,6 +1874,7 @@ typedef struct MarmotOnboardingRepairProposal {
   uintptr_t write_relays_len;
   struct MarmotUserProfileMetadata *profile;
   struct MarmotStringList *follows;
+  struct MarmotOnboardingRelayRepair *relay_repair;
 } MarmotOnboardingRepairProposal;
 
 typedef struct MarmotOnboardingDevicePackage {
@@ -4432,6 +4576,68 @@ typedef struct MarmotReportDismissalPage {
   uintptr_t labels_len;
   char *next_cursor;
 } MarmotReportDismissalPage;
+
+/**
+ * Outcome of marmot_submit_moderation_report. AcceptedPending and
+ * CompletionUnknown are queued and retried on catch-up; never resubmit them.
+ */
+typedef struct MarmotModerationReportOutcome {
+  char *report_id;
+  enum MarmotSendAcceptDisposition accept_disposition;
+} MarmotModerationReportOutcome;
+
+typedef struct MarmotNativeStartupObservation {
+  uint64_t token;
+  enum MarmotNativeStartupStage stage;
+  uint64_t elapsed_ms;
+  uint64_t stage_elapsed_ms;
+  bool has_migration_version;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint32_t migration_version;
+  uint32_t migrations_completed;
+  enum MarmotNativeStartupOutcome outcome;
+} MarmotNativeStartupObservation;
+
+typedef struct MarmotNativeStartupSnapshot {
+  bool enabled;
+  struct MarmotNativeStartupObservation *active;
+  uintptr_t active_len;
+  struct MarmotNativeStartupObservation *events;
+  uintptr_t events_len;
+  uint64_t dropped_events;
+  uint64_t dropped_scopes;
+} MarmotNativeStartupSnapshot;
+
+/**
+ * Borrowed private input. Its path is local only and is never published.
+ */
+typedef struct MarmotMediaFileUploadAttachmentRequest {
+  const char *source_path;
+  /**
+   * Nonzero requires the immutable snapshot to contain exactly expected_size bytes.
+   */
+  uint8_t has_expected_size;
+  uint64_t expected_size;
+  const char *file_name;
+  const char *media_type;
+  const char *dim;
+  const char *thumbhash;
+} MarmotMediaFileUploadAttachmentRequest;
+
+/**
+ * Borrowed input batch. Snapshots are copied before the first network side effect.
+ */
+typedef struct MarmotMediaFileUploadRequest {
+  const struct MarmotMediaFileUploadAttachmentRequest *attachments;
+  uintptr_t attachments_len;
+  const char *caption;
+  uint8_t send;
+  const char *blossom_server;
+  const struct MarmotStringArray *message_tags;
+  uintptr_t message_tags_len;
+} MarmotMediaFileUploadRequest;
 
 /**
  * Stable stream and start-message identifiers.
@@ -8368,6 +8574,29 @@ MarmotStatus marmot_publish_user_profile(const struct MarmotClient *client,
                                          struct MarmotUserProfileMetadata **out);
 
 /**
+ * Create a fresh identity whose first public kind-0 is `profile`, returning
+ * at durable local readiness. Use this instead of
+ * `marmot_create_identity_with_profile` followed by
+ * `marmot_publish_user_profile` when onboarding collects a name, so
+ * contacts never see the generated default. Free with
+ * `marmot_identity_creation_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `profile` a valid borrowed struct (never
+ * freed by the library); relay arrays must hold `len` valid strings (or be
+ * NULL with len 0); `out` valid.
+ */
+MarmotStatus marmot_create_identity_with_initial_profile(const struct MarmotClient *client,
+                                                         const struct MarmotUserProfileMetadata *profile,
+                                                         const char *const *default_relays,
+                                                         uintptr_t default_relays_len,
+                                                         const char *const *bootstrap_relays,
+                                                         uintptr_t bootstrap_relays_len,
+                                                         const char *const *inbox_relays,
+                                                         uintptr_t inbox_relays_len,
+                                                         struct MarmotIdentityCreationResult **out);
+
+/**
  * Replace the group's encrypted-media default blob endpoints as a full
  * component update. Requires admin. Free with
  * `marmot_send_summary_free`.
@@ -9009,6 +9238,24 @@ MarmotStatus marmot_propose_onboarding_relays(const struct MarmotClient *client,
                                               struct MarmotOnboardingSnapshot **out);
 
 /**
+ * Preview an exact minimal relay repair without signing or publishing. Manual-review
+ * previews cannot be approved. `step` is a MarmotOnboardingStep discriminant;
+ * out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+ * Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ *
+ * # Safety
+ * The client must be live, input pointers valid and borrowed, and out writable.
+ * Relay-repair content, tag fields and non-NULL tag/change endpoints are JSON
+ * string literals. Decode once preserving embedded NULs and UTF-8 lengths
+ * before displaying consent or prefilling an editor. Read/write route lists
+ * and event identifiers retain their ordinary-string contract.
+ */
+MarmotStatus marmot_propose_onboarding_relay_repair(const struct MarmotClient *client,
+                                                    const char *account_ref,
+                                                    uint32_t step,
+                                                    struct MarmotOnboardingSnapshot **out);
+
+/**
  * Prepare profile edits without publishing; NULL fields preserve existing values and empty strings clear them. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
@@ -9227,6 +9474,42 @@ MarmotStatus marmot_report_message(const struct MarmotClient *client,
                                    struct MarmotSendSummary **out);
 
 /**
+ * Privately report a user to the configured moderation team (NIP-56 report,
+ * NIP-59 gift-wrapped). Additive to marmot_report_message, which is unchanged.
+ * `reason` is a MarmotReportReason and `origin` a MarmotModerationReportOrigin
+ * discriminant. Release `*out` with marmot_moderation_report_outcome_free.
+ * # Safety
+ * Client, strings and output pointer must be valid. Inputs are borrowed.
+ */
+MarmotStatus marmot_submit_moderation_report(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             const char *reported_pubkey,
+                                             uint32_t reason,
+                                             const char *explanation,
+                                             uint32_t origin,
+                                             struct MarmotModerationReportOutcome **out);
+
+/**
+ * Write whether a valid moderation-report destination is installed.
+ * # Safety
+ * `client` must be a live handle and `out` writable.
+ */
+MarmotStatus marmot_moderation_reporting_available(const struct MarmotClient *client, bool *out);
+
+/**
+ * Install the moderation-report destination, or clear it when
+ * `recipient_pubkey` is NULL (`relays` is then ignored). An invalid
+ * destination is rejected whole and leaves reporting unconfigured.
+ * # Safety
+ * `client` must be a live handle; `recipient_pubkey` NULL or a valid string;
+ * `relays` must hold `relays_len` valid strings. Inputs are borrowed.
+ */
+MarmotStatus marmot_configure_moderation_reporting(const struct MarmotClient *client,
+                                                   const char *recipient_pubkey,
+                                                   const char *const *relays,
+                                                   uintptr_t relays_len);
+
+/**
  * Verify a public Nostr event's canonical ID and BIP-340 signature.
  * Invalid event JSON returns success with `*out = 0`. No client is required.
  * The caller must enforce application-specific author, kind, and tag policy.
@@ -9236,6 +9519,96 @@ MarmotStatus marmot_report_message(const struct MarmotClient *client,
  * Input is borrowed and never retained.
  */
 MarmotStatus marmot_verify_public_nostr_event_json(const char *event_json, uint8_t *out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_startup_diagnostics_enabled(const struct MarmotClient *client,
+                                                    uint8_t enabled);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_startup_diagnostics_snapshot(const struct MarmotClient *client,
+                                                 struct MarmotNativeStartupSnapshot **out);
+
+/**
+ * Create a control; free it with marmot_media_file_transfer_control_free after upload returns.
+ * # Safety
+ * out must be writable.
+ */
+MarmotStatus marmot_media_file_transfer_control_new(struct MarmotMediaFileTransferControl **out);
+
+/**
+ * Cancel before admission starts; once admission starts, delivery belongs to the local-send queue.
+ * # Safety
+ * control must be live; no concurrent free.
+ */
+MarmotStatus marmot_media_file_transfer_control_cancel(const struct MarmotMediaFileTransferControl *control);
+
+/**
+ * Read cancellation as uint8_t (0 or 1).
+ * # Safety
+ * control must be live; out writable; no concurrent free.
+ */
+MarmotStatus marmot_media_file_transfer_control_is_cancelled(const struct MarmotMediaFileTransferControl *control,
+                                                             uint8_t *out);
+
+/**
+ * Read monotonic processed bytes, not a percentage (preparation and retries can exceed file length).
+ * # Safety
+ * control must be live; out writable; no concurrent free.
+ */
+MarmotStatus marmot_media_file_transfer_control_processed_bytes(const struct MarmotMediaFileTransferControl *control,
+                                                                uint64_t *out);
+
+/**
+ * Free a control; NULL is accepted.
+ * # Safety
+ * control must be NULL or live, with all calls on it finished.
+ */
+void marmot_media_file_transfer_control_free(struct MarmotMediaFileTransferControl *control);
+
+/**
+ * Return the per-batch ciphertext implementation bound, including each attachment's AEAD tag.
+ */
+uint64_t marmot_max_file_media_ciphertext_bytes(void);
+
+/**
+ * Blocking file-backed upload. Results use marmot_media_upload_result_free; inputs remain borrowed.
+ * # Safety
+ * client/control must be live; strings/request valid until return; out writable. No concurrent frees.
+ */
+MarmotStatus marmot_upload_media_files(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *group_id_hex,
+                                       const struct MarmotMediaFileUploadRequest *request,
+                                       const struct MarmotMediaFileTransferControl *control,
+                                       struct MarmotMediaUploadResult **out);
+
+/**
+ * Blocking token-aware twin. Keep one token for the logical submission; probe local-send status after interruption.
+ * Results use marmot_media_upload_submission_free; input paths are copied, never published.
+ * # Safety
+ * Same input/lifetime requirements as marmot_upload_media_files, plus a valid client_token string.
+ */
+MarmotStatus marmot_upload_media_files_with_client_token(const struct MarmotClient *client,
+                                                         const char *account_ref,
+                                                         const char *group_id_hex,
+                                                         const struct MarmotMediaFileUploadRequest *request,
+                                                         const struct MarmotMediaFileTransferControl *control,
+                                                         const char *client_token,
+                                                         struct MarmotMediaUploadSubmission **out);
 
 /**
  * Create an offline session from a bunker URI, client pairing config, or durable
@@ -11707,6 +12080,16 @@ void marmot_avatar_bytes_list_free(struct MarmotAvatarBytesList *list);
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
+void marmot_moderation_report_outcome_free(struct MarmotModerationReportOutcome *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
 void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
 
 /**
@@ -11718,6 +12101,16 @@ void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
  * this library.
  */
 void marmot_report_dismissal_page_free(struct MarmotReportDismissalPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_native_startup_snapshot_free(struct MarmotNativeStartupSnapshot *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL
