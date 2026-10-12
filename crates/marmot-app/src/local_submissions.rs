@@ -13,7 +13,7 @@ use storage_sqlite::LocalSubmission;
 use crate::messages::{AppMessageIntent, build_inner_event_with_media_reply, encode_inner_event};
 use crate::{
     AppError, AppMessageProjection, AppProjectionUpdate, MarmotApp, MediaAttachmentReference,
-    MessageDraftRevision, unix_now_seconds,
+    MessageDraftRevision,
 };
 
 /// Select draft content, or consume an unchanged draft without replacing a captured payload.
@@ -177,6 +177,7 @@ impl MarmotApp {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn admit_local_message(
         &self,
         account_ref: &str,
@@ -191,12 +192,13 @@ impl MarmotApp {
             token,
             request,
             draft,
-            unix_now_seconds(),
+            crate::unix_now_seconds(),
         )
     }
 
     // Explicit event time makes collision tests independent of wall-clock edges.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn admit_local_message_at(
         &self,
         account_ref: &str,
@@ -218,6 +220,7 @@ impl MarmotApp {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn admit_local_message_with_edit_at(
         &self,
         account_ref: &str,
