@@ -20,6 +20,10 @@ Regenerate Swift/Kotlin bindings with the matching native library. See the
   `InvalidModerationReportConfig`, `InvalidReportedPublicKey`, `CannotReportSelf`
   and `ModerationReportRateLimited`. Regenerate bindings with the matching
   library and update exhaustive Swift `switch` / Kotlin `when` handling.
+- `MarmotKitError` gains `ObsoleteKeyPackage { account }` and
+  `MemberDiscoveryIncomplete { account }`; update exhaustive Swift/Kotlin error
+  switches. Recipient fields support focused recovery guidance; Display omits
+  identity.
 
 - `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
   a binding default. Regenerate matching Swift/Kotlin bindings and pass `nil`
@@ -175,7 +179,6 @@ Regenerate Swift/Kotlin bindings with the matching native library. See the
   unavailable for about eight minutes. Hosts should offer Retry: it derives a
   missing key from retained epoch state, recovering attachments whose key was
   never cached. Retry budgets are unchanged. (#2106)
-
 
 ## 0.11.0 - 2026-09-29
 

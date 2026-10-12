@@ -22,7 +22,7 @@ use transport_nostr_adapter::{
 
 use crate::key_package_records::{
     fresh_relay_list_status_from_records, merge_relay_list_status,
-    preferred_fresh_key_package_from_records,
+    preferred_member_key_package_from_records,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryFetchOutcome};
 use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp};
@@ -866,7 +866,7 @@ impl MarmotApp {
                 async move {
                     let result = app
                         .relay_plane
-                        .fetch_directory_events(endpoints, vec![query])
+                        .fetch_directory_events_with_completion(endpoints, vec![query])
                         .await
                         .map_err(|error| {
                             AppError::RelayDirectory(format!("fetch key packages: {error}"))
@@ -882,13 +882,13 @@ impl MarmotApp {
         let mut fallback = Vec::new();
         let mut fallback_records = BTreeMap::new();
         for (indices, result) in batches {
-            let Ok(records) = result else {
+            let Ok(fetched) = result else {
                 fallback.extend(indices);
                 continue;
             };
             let multiple_authors = indices.len() > 1;
             let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
-            for record in records {
+            for record in fetched.records {
                 records_by_author
                     .entry(record.event.pubkey.clone())
                     .or_default()
@@ -897,7 +897,7 @@ impl MarmotApp {
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
                 let account_records = records_by_author.remove(account_id).unwrap_or_default();
-                let selected = preferred_fresh_key_package_from_records(
+                let selected = preferred_member_key_package_from_records(
                     account_id,
                     &account_records,
                     self.directory_freshness(),
@@ -930,7 +930,12 @@ impl MarmotApp {
                     // Keep observed slot replacements when combining the refetch.
                     _ => {
                         fallback.push(index);
-                        fallback_records.insert(index, account_records);
+                        // Only a single-author read proves coverage for this recipient.
+                        // Completed single-author reads need recovery, not a duplicate fetch.
+                        fallback_records.insert(
+                            index,
+                            (account_records, fetched.complete && !multiple_authors),
+                        );
                     }
                 }
             }
@@ -965,19 +970,20 @@ impl MarmotApp {
             })
             .collect::<Vec<_>>();
         let app = self.clone();
-        let work =
-            fallback_specs
-                .into_iter()
-                .map(move |(index, target, endpoints, observed_records)| {
-                    let app = app.clone();
-                    async move {
-                        let query = DirectoryEventQuery::new(
-                            KIND_MARMOT_KEY_PACKAGE,
-                            vec![target.account_id_hex.clone()],
-                            KEY_PACKAGE_EVENTS_PER_AUTHOR,
-                        );
-                        let result = async {
-                            let (mut records, complete) = match app
+        let work = fallback_specs.into_iter().map(
+            move |(index, target, endpoints, (observed_records, observed_complete))| {
+                let app = app.clone();
+                async move {
+                    let query = DirectoryEventQuery::new(
+                        KIND_MARMOT_KEY_PACKAGE,
+                        vec![target.account_id_hex.clone()],
+                        KEY_PACKAGE_EVENTS_PER_AUTHOR,
+                    );
+                    let result = async {
+                        let (mut records, complete) = if observed_complete {
+                            (Vec::new(), true)
+                        } else {
+                            match app
                                 .relay_plane
                                 .fetch_directory_events_with_completion(
                                     endpoints.clone(),
@@ -987,42 +993,43 @@ impl MarmotApp {
                             {
                                 Ok(outcome) => (outcome.records, outcome.complete),
                                 Err(_) => (Vec::new(), false),
-                            };
-                            // This supplementary lookup must not discard a
-                            // valid package observed in this call's batch.
-                            // Never load a previously cached package here.
-                            records.extend(observed_records);
-                            let records = app
-                                .recover_key_package_records(
-                                    super::key_package_recovery::KeyPackageRecoveryRequest {
-                                        account: &target.account_id_hex,
-                                        searched: &endpoints,
-                                        observed: records,
-                                        primary_complete: complete,
-                                        discovery: &app.directory_source_relays(&[]),
-                                        requirements,
-                                        cached_target: None,
-                                    },
-                                )
-                                .await?;
-                            let mut fetched = preferred_fresh_key_package_from_records(
-                                &target.account_id_hex,
-                                &records.records,
-                                records.freshness,
-                                requirements,
-                            )?
-                            .value
-                            .ok_or_else(|| {
-                                AppError::MissingKeyPackage(target.account_id_hex.clone())
-                            })?
-                            .fetched;
-                            fetched.relay_lists = target.relay_lists;
-                            Ok::<_, AppError>(fetched)
-                        }
-                        .await;
-                        (index, result)
+                            }
+                        };
+                        // This supplementary lookup must not discard a
+                        // valid package observed in this call's batch.
+                        // Never load a previously cached package here.
+                        records.extend(observed_records);
+                        let records = app
+                            .recover_key_package_records(
+                                super::key_package_recovery::KeyPackageRecoveryRequest {
+                                    account: &target.account_id_hex,
+                                    searched: &endpoints,
+                                    observed: records,
+                                    primary_complete: complete,
+                                    discovery: &app.directory_source_relays(&[]),
+                                    requirements,
+                                    cached_target: None,
+                                    member_diagnostics: true,
+                                },
+                            )
+                            .await?;
+                        let mut fetched = preferred_member_key_package_from_records(
+                            &target.account_id_hex,
+                            &records.records,
+                            records.freshness,
+                            requirements,
+                        )?
+                        .value
+                        .ok_or_else(|| AppError::MissingKeyPackage(target.account_id_hex.clone()))?
+                        .fetched;
+                        fetched.relay_lists = target.relay_lists;
+                        Ok::<_, AppError>(fetched)
                     }
-                });
+                    .await;
+                    (index, result)
+                }
+            },
+        );
         let fallback_results = stream::iter(work)
             .buffered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
             .collect::<Vec<_>>()

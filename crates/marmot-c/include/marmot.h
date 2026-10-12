@@ -192,6 +192,8 @@ enum MarmotStatus
    * Local per-account moderation-report cap; retry later.
    */
   MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED = 100,
+  MARMOT_STATUS_OBSOLETE_KEY_PACKAGE = 101,
+  MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE = 102,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

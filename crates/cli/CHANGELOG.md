@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Invitation JSON errors distinguish obsolete KeyPackages from incomplete discovery, identify the recipient and offer update or retry guidance.
+
 ## [0.13.0] - 2026-10-12
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through
