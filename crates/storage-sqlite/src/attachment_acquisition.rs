@@ -103,9 +103,6 @@ pub struct AttachmentAcquisition {
     pub source_message_id_hex: String,
     pub source_epoch: u64,
     pub slot: serde_json::Value,
-    /// An earlier attempt learned the body exceeds the in-memory bound, so
-    /// this attempt opens the file sink without a header-only probe first.
-    pub file_sink: bool,
     attempt: Vec<u8>,
     digest: Vec<u8>,
 }
@@ -363,7 +360,7 @@ impl SqliteAccountStorage {
                     source_message_id_hex,source_epoch,slot_json,plaintext_digest,expires_at,due,permission_category)
                  VALUES(randomblob(16),?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                  ON CONFLICT(group_id_hex,message_id_hex,attachment_index)
-                 DO UPDATE SET state=0,due=excluded.due,permission_category=excluded.permission_category,storage_blocked_headroom=NULL
+                 DO UPDATE SET state=0,due=excluded.due,permission_category=excluded.permission_category
                  WHERE attachment_acquisition.state=5 AND attachment_acquisition.cancelled=0 AND (attachment_acquisition.automatic_history=0 OR (attachment_acquisition.body_completed=0 AND attachment_acquisition.network_attempts<64 AND attachment_acquisition.acquisition_attempts<4)) AND attachment_acquisition.permission_paused=0",
                 params![
                     group,
@@ -590,7 +587,7 @@ impl SqliteAccountStorage {
                 [&reference.token],
             ).storage()?;
             conn.execute(
-                "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),progress_phase=0,storage_blocked_headroom=NULL,body_completed=CASE WHEN automatic_history=0 THEN 0 ELSE body_completed END,
+                "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),progress_phase=0,body_completed=CASE WHEN automatic_history=0 THEN 0 ELSE body_completed END,
                     progress_epoch=progress_epoch+1,progress_received=0,progress_total=NULL,
                     attempts=min(attempts+1,2147483647),acquisition_attempts=min(acquisition_attempts+automatic_history,2147483647),preparation_deferrals=0 WHERE token=?1",
                 params![reference.token, deadline],
@@ -599,7 +596,7 @@ impl SqliteAccountStorage {
             let job = conn
                 .query_row(
                     "SELECT group_id_hex,message_id_hex,attachment_index,source_message_id_hex,
-                    source_epoch,slot_json,attempt,plaintext_digest,file_sink
+                    source_epoch,slot_json,attempt,plaintext_digest
                  FROM attachment_acquisition WHERE token=?1",
                     [&reference.token],
                     |r| {
@@ -612,7 +609,6 @@ impl SqliteAccountStorage {
                             r.get::<_, String>(5)?,
                             r.get::<_, Vec<u8>>(6)?,
                             r.get::<_, Vec<u8>>(7)?,
-                            r.get::<_, bool>(8)?,
                         ))
                     },
                 )
@@ -626,7 +622,6 @@ impl SqliteAccountStorage {
                 source_epoch: job.4,
                 slot: serde_json::from_str(&job.5)
                     .map_err(|_| invalid("invalid stored attachment slot"))?,
-                file_sink: job.8,
                 attempt: job.6,
                 digest: job.7,
             }))
@@ -658,12 +653,24 @@ impl SqliteAccountStorage {
                 return Ok(refused);
             }
             if plaintext.len() > ATTACHMENT_STAGING_CHUNK_BYTES {
-                insert_retained_chunks(&conn, job, plaintext)?;
+                let len = plaintext.len() as u64;
+                let nonce = file_import::reserve_chunked_file(&conn, job, len)?;
+                file_import::insert_chunks(&conn, &nonce, 0, plaintext)?;
+                file_import::seal_chunked_file(&conn, &job.reference.token, &nonce)?;
             } else {
-                insert_retained_array(&conn, &job.reference.token, plaintext)?;
+                // Declaring `byte_len` keeps the insert trigger from rewriting the row.
+                conn.execute(
+                    "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,?2,?3)",
+                    params![
+                        job.reference.token,
+                        u64_to_i64(plaintext.len() as u64)?,
+                        plaintext
+                    ],
+                )
+                .storage()?;
             }
             conn.execute(
-                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0 WHERE token=?1",
+                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0 WHERE token=?1",
                 [&job.reference.token],
             )
             .storage()?;
@@ -754,7 +761,7 @@ impl SqliteAccountStorage {
             let parked = partial::storage_parked(&conn, &reference.token)?;
             let retried = conn
                 .execute(
-                    "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
+                    "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
                  WHERE token=?1 AND state IN (2,4,5)",
                     params![reference.token, u64_to_i64(now)?],
                 )
@@ -984,102 +991,6 @@ impl SqliteAccountStorage {
             )
             .storage()
     }
-}
-
-/// Insert a body of at most one staging chunk as an array row. The row is
-/// created at its final `byte_len` over a `zeroblob`, so the insert trigger
-/// charges the quota from the declared length instead of rewriting the row, and
-/// the bytes arrive through an incremental BLOB write. Where migration 0104
-/// appended `byte_len` after `bytes`, SQLite expands the `zeroblob` to build the
-/// record, which is why larger bodies take `insert_retained_chunks`. The
-/// enclosing transaction rolls the reservation back if the write fails.
-fn insert_retained_array(conn: &Connection, token: &[u8], plaintext: &[u8]) -> StorageResult<()> {
-    if plaintext.is_empty() {
-        conn.execute(
-            "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,0,x'')",
-            [token],
-        )
-        .storage()?;
-        return Ok(());
-    }
-    conn.execute(
-        "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,?2,zeroblob(?2))",
-        params![token, u64_to_i64(plaintext.len() as u64)?],
-    )
-    .storage()?;
-    let row_id = conn.last_insert_rowid();
-    let mut blob = conn
-        .blob_open("main", "retained_attachment_bytes", "bytes", row_id, false)
-        .storage()?;
-    if blob.len() != plaintext.len() {
-        return Err(invalid("retained attachment length changed"));
-    }
-    for (index, chunk) in plaintext.chunks(ATTACHMENT_STAGING_CHUNK_BYTES).enumerate() {
-        blob.write_at(chunk, index * ATTACHMENT_STAGING_CHUNK_BYTES)
-            .storage()?;
-    }
-    blob.close().storage()?;
-    Ok(())
-}
-
-/// Publish a body larger than one staging chunk as a completed chunked file:
-/// an empty placeholder row keeps source and deletion ownership, the file row
-/// charges the quota once, and each chunk row binds one staging chunk, so no
-/// SQLite value holds more than one chunk. The file is sealed after its last chunk,
-/// since completed chunks are immutable, and before the state change that
-/// would discard an unfinished file. The enclosing transaction rolls every row
-/// back if any insert fails.
-fn insert_retained_chunks(
-    conn: &Connection,
-    job: &AttachmentAcquisition,
-    plaintext: &[u8],
-) -> StorageResult<()> {
-    let token = &job.reference.token;
-    let nonce: Vec<u8> = conn
-        .query_row("SELECT randomblob(16)", [], |row| row.get(0))
-        .storage()?;
-    conn.execute(
-        "INSERT INTO attachment_chunk_bodies(nonce) VALUES(?1)",
-        [&nonce],
-    )
-    .storage()?;
-    conn.execute(
-        "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,0,x'')",
-        [token],
-    )
-    .storage()?;
-    conn.execute(
-        "INSERT INTO retained_attachment_files(token,nonce,attempt,byte_len) VALUES(?1,?2,?3,?4)",
-        params![
-            token,
-            nonce,
-            job.attempt,
-            u64_to_i64(plaintext.len() as u64)?
-        ],
-    )
-    .storage()?;
-    for (index, chunk) in plaintext.chunks(ATTACHMENT_STAGING_CHUNK_BYTES).enumerate() {
-        conn.execute_cached(
-            "INSERT INTO retained_attachment_chunks(token,offset,bytes) VALUES(?1,?2,?3)",
-            params![
-                nonce,
-                u64_to_i64((index * ATTACHMENT_STAGING_CHUNK_BYTES) as u64)?,
-                chunk
-            ],
-        )
-        .storage()?;
-    }
-    let sealed = conn
-        .execute(
-            "UPDATE retained_attachment_files SET completed=1 WHERE token=?1 AND nonce=?2",
-            params![token, nonce],
-        )
-        .storage()?;
-    // An unsealed file would be discarded by the state change that follows.
-    if sealed != 1 {
-        return Err(invalid("retained attachment file was not sealed"));
-    }
-    Ok(())
 }
 
 /// Shared publication admission: store, attempt, lease, source, acceptance and

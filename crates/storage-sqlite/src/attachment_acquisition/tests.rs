@@ -3041,11 +3041,7 @@ fn column(store: &SqliteAccountStorage, asset: &AttachmentAssetRef, name: &str) 
         .unwrap()
 }
 fn park(store: &SqliteAccountStorage, job: &AttachmentAcquisition, headroom: u64, now: u64) {
-    assert!(
-        store
-            .block_attachment_storage(job, headroom, false, now)
-            .unwrap()
-    );
+    assert!(store.block_attachment_storage(job, headroom, now).unwrap());
 }
 fn due(store: &SqliteAccountStorage, asset: &AttachmentAssetRef) -> Option<u64> {
     store
@@ -3086,9 +3082,7 @@ fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
         .unwrap();
     park(&store, &job, 8192, 12);
     assert!(
-        !store
-            .block_attachment_storage(&job, 8192, false, 12)
-            .unwrap(),
+        !store.block_attachment_storage(&job, 8192, 12).unwrap(),
         "only the live attempt parks"
     );
     assert_eq!(
@@ -3112,7 +3106,7 @@ fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
     store.cancel_attachment_acquisition(&cancelled).unwrap();
     assert!(
         !store
-            .block_attachment_storage(&cancelled_job, 1, false, 12)
+            .block_attachment_storage(&cancelled_job, 1, 12)
             .unwrap()
     );
     let sized = request(&store, "size");
@@ -3427,51 +3421,31 @@ fn storage_parks_do_not_spend_the_automatic_history_budget() {
     );
 }
 
-/// A body that starts over on every attempt (no length, no validator) only
-/// proves a lower bound of its need, so its recorded target is the largest
-/// need any attempt proved, never a multiple of it. Free space at the true need
-/// therefore always readmits it: with 440 MiB free, a 100 MiB body that needs
-/// 500 MiB parks twice and must not then ask for 880 MiB. Refetches are
-/// bounded in time instead: each readmission waits out the park streak,
-/// 15 s doubling to an hour.
+/// Each park records the need its own check proved, even below an earlier
+/// park's, and readmissions are spaced by the park streak, 15 s doubling to an
+/// hour, so a body that keeps starting over cannot refetch faster than that.
+/// Explicit retry forgets the streak.
 #[test]
-fn restart_parks_record_the_largest_proven_need_and_back_off() {
+fn repeated_parks_record_their_own_need_and_back_off() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "chunked");
     let asset = request(&store, "chunked");
     let mib = 1024 * 1024;
     let mut now = 12;
     let mut delays = vec![];
-    // Projections in MiB as free space trickles in; a later attempt that
-    // parked earlier (space shrank meanwhile) proves nothing new.
-    for (projection, target) in [
-        (445, 445),
-        (470, 470),
-        (460, 470),
-        (480, 480),
-        (485, 485),
-        (486, 486),
-        (487, 487),
-        (488, 488),
-        (489, 489),
-        (490, 490),
-        (491, 491),
-        (492, 492),
-    ] {
+    for target in [445, 470, 460, 480, 485, 486, 487, 488, 489, 490, 491, 492] {
         let job = store
             .claim_attachment_acquisition(&asset, now, now + 100)
             .unwrap()
             .unwrap();
         assert!(
             store
-                .block_attachment_storage(&job, projection * mib, true, now)
+                .block_attachment_storage(&job, target * mib, now)
                 .unwrap()
         );
         assert_eq!(parked_headroom(&store, &asset), Some((target * mib) as i64));
-        // The body's true need, 500 MiB, always readmits it.
-        assert!(target <= 500);
         assert_eq!(readmit(&store, now, 0, fits(target * mib) - 1, true), 0);
-        assert_eq!(readmit(&store, now, 0, fits(500 * mib), true), 1);
+        assert_eq!(readmit(&store, now, 0, fits(target * mib), true), 1);
         let next = due(&store, &asset).unwrap();
         delays.push(next - now);
         now = next;
@@ -3479,33 +3453,15 @@ fn restart_parks_record_the_largest_proven_need_and_back_off() {
     assert_eq!(
         delays,
         [0, 15, 30, 60, 120, 240, 480, 960, 1920, 3600, 3600, 3600],
-        "restarts are spaced by the park streak, never more than one an hour once it saturates"
+        "readmissions are spaced by the park streak, at most one an hour once it saturates"
     );
-    // A park that can resume records its own need, even below the floor, and
-    // explicit retry forgets the floor and the streak.
     let job = store
         .claim_attachment_acquisition(&asset, now, now + 100)
         .unwrap()
         .unwrap();
-    assert!(
-        store
-            .block_attachment_storage(&job, 7 * mib, false, now)
-            .unwrap()
-    );
-    assert_eq!(parked_headroom(&store, &asset), Some(7 * mib as i64));
+    assert!(store.block_attachment_storage(&job, 7 * mib, now).unwrap());
     assert!(store.retry_attachment_acquisition(&asset, now + 1).unwrap());
-    assert_eq!(column(&store, &asset, "storage_park_floor"), Some(0));
     assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
-    let job = store
-        .claim_attachment_acquisition(&asset, now + 1, now + 200)
-        .unwrap()
-        .unwrap();
-    assert!(
-        store
-            .block_attachment_storage(&job, 5 * mib, true, now + 1)
-            .unwrap()
-    );
-    assert_eq!(parked_headroom(&store, &asset), Some(5 * mib as i64));
 }
 
 /// An explicit Retry of a job parked for longer than the idle expiry resumes
@@ -3610,8 +3566,8 @@ fn storage_parked_prefixes_expire_after_the_maximum_parked_age() {
     assert_eq!(readmit(&store, limit, 0, u64::MAX, true), 1);
 }
 
-/// A permission-owned park neither advances the storage park streak nor sets
-/// a floor, cancellation clears both, and every park refunds the claim streak
+/// A permission-owned park does not advance the storage park streak,
+/// cancellation clears it, and every park refunds the claim streak
 /// so a later network failure backs off as if the parks never happened.
 #[test]
 fn storage_park_streak_counts_only_storage_owned_parks() {
@@ -3624,11 +3580,7 @@ fn storage_park_streak_counts_only_storage_owned_parks() {
             .unwrap()
             .unwrap();
         assert_eq!(column(&store, &asset, "attempts"), Some(1));
-        assert!(
-            store
-                .block_attachment_storage(&job, 8192, true, now)
-                .unwrap()
-        );
+        assert!(store.block_attachment_storage(&job, 8192, now).unwrap());
         assert_eq!(
             column(&store, &asset, "attempts"),
             Some(0),
@@ -3638,19 +3590,13 @@ fn storage_park_streak_counts_only_storage_owned_parks() {
         sql(&store, "UPDATE attachment_acquisition SET due=0");
     }
     assert_eq!(column(&store, &asset, "storage_park_count"), Some(2));
-    assert_eq!(column(&store, &asset, "storage_park_floor"), Some(8192));
     let job = store
         .claim_attachment_acquisition(&asset, 14, 100)
         .unwrap()
         .unwrap();
     store.pause_automatic_attachments(14).unwrap();
-    assert!(
-        store
-            .block_attachment_storage(&job, 1 << 20, true, 14)
-            .unwrap()
-    );
+    assert!(store.block_attachment_storage(&job, 1 << 20, 14).unwrap());
     assert_eq!(column(&store, &asset, "storage_park_count"), Some(2));
-    assert_eq!(column(&store, &asset, "storage_park_floor"), Some(8192));
     assert_eq!(column(&store, &asset, "attempts"), Some(0));
     assert_eq!(
         store.resume_permitted_attachments(15, [true; 4]).unwrap(),
@@ -3666,7 +3612,6 @@ fn storage_park_streak_counts_only_storage_owned_parks() {
     store.fail_attachment_acquisition(&job, Some(30)).unwrap();
     store.cancel_attachment_acquisition(&asset).unwrap();
     assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
-    assert_eq!(column(&store, &asset, "storage_park_floor"), Some(0));
 }
 
 /// A verified-body shortage under a revoked automatic permission parks under
@@ -3871,7 +3816,7 @@ fn storage_park_needs_no_new_page_after_a_full_publication() {
     ));
     assert!(
         store
-            .block_attachment_storage(&job, 4 * body.len() as u64, false, 13)
+            .block_attachment_storage(&job, 4 * body.len() as u64, 13)
             .unwrap(),
         "the park write fits without a new page"
     );
@@ -3881,39 +3826,6 @@ fn storage_park_needs_no_new_page_after_a_full_publication() {
     );
     assert_eq!(partial_usage(&store), 3);
     store.limit_database_pages_for_test(1 << 30).unwrap();
-}
-
-/// A job that learned it needs the file sink carries that into every later
-/// claim, so a readmitted attempt opens the file sink without a header probe.
-#[test]
-fn recorded_file_sink_survives_into_later_claims() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    seed(&store, "large");
-    let asset = request(&store, "large");
-    let job = store
-        .claim_attachment_acquisition(&asset, 12, 100)
-        .unwrap()
-        .unwrap();
-    assert!(!job.file_sink);
-    assert!(store.record_attachment_file_sink(&job).unwrap());
-    park(&store, &job, 8192, 12);
-    assert!(
-        !store.record_attachment_file_sink(&job).unwrap(),
-        "only the live attempt records"
-    );
-    assert_eq!(readmit(&store, 13, 0, u64::MAX, true), 1);
-    let job = store
-        .claim_attachment_acquisition(&asset, 13, 100)
-        .unwrap()
-        .unwrap();
-    assert!(job.file_sink);
-    store.fail_attachment_acquisition(&job, None).unwrap();
-    assert!(store.explicitly_retry_attachment(&asset, 14).unwrap());
-    let job = store
-        .claim_attachment_acquisition(&asset, 14, 100)
-        .unwrap()
-        .unwrap();
-    assert!(job.file_sink, "the body does not shrink on retry");
 }
 
 /// The per-tick readmission probe is read-only while no parked row fits: no
@@ -3996,13 +3908,12 @@ fn storage_park_after_a_receipt_keeps_automatic_history_attemptable() {
         AttachmentPublishResult::Published
     );
     assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
-    assert_eq!(column(&store, &asset, "storage_park_floor"), Some(0));
     assert_eq!(read(&store, &asset), BODY);
 }
 
 /// mdk#2241: a body of at most one staging chunk publishes as an array row that
-/// declares `byte_len` on insert and copies through an incremental BLOB write,
-/// so the insert trigger charges the quota without rewriting the row.
+/// declares `byte_len` on insert, so the insert trigger charges the quota
+/// without rewriting the row.
 #[test]
 fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
     let store = SqliteAccountStorage::in_memory().unwrap();

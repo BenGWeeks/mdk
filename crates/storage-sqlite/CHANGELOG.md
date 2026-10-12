@@ -13,15 +13,10 @@
   canonical source tags in the page snapshot without a history backfill.
 - Migrations 0103 through 0108 advance account storage to schema 108 on first
   open. Older binaries reject the upgraded database; downgrade is unsupported.
-  Migration 0108 adds `attachment_acquisition.storage_blocked_headroom`,
-  `storage_park_count`, `storage_park_floor` and `file_sink`, a partial index
-  for parked rows, and keeps ciphertext checkpoints for jobs parked on disk
-  space. Pre-release builds of this change recorded it as migration 107,
-  which is now the moderation-report outbox, so a development database opened
-  under any of them fails to open with "migration 107 was applied as
-  0107_attachment_storage_block" and must be recreated.
+  Migration 0108 adds `attachment_acquisition.storage_blocked_headroom` and
+  `storage_park_count`, a partial index for parked rows, and keeps ciphertext
+  checkpoints for jobs parked on disk space.
 - `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
-  `AttachmentAcquisition` gains the public `file_sink` field.
 
 ### Added
 
@@ -49,30 +44,23 @@
   representation bounds, without increasing user quotas. (#2175)
 
 - `SqliteAccountStorage::block_attachment_storage` parks a live attempt whose
-  publication disk reserve the device cannot cover, recording the free space it
-  needs beyond the reserve (for an attempt that restarts from zero, the largest
-  need any attempt proved), refreshing its checkpoint's idle expiry, refunding
-  the automatic-history claim and the claim streak, withdrawing a
-  completed-body receipt that publication could not use, and advancing a park
-  streak; a permission-owned park advances neither the streak nor the floor. `readmit_storage_blocked_attachments` requeues up to 64 parked jobs
-  whose target fits the supplied free space less `STORAGE_READMIT_MARGIN_BYTES`
-  once admission (`disk_reserve + 4 * transfer_limit`) would pass, delays a
-  repeated park by its park streak, refreshes checkpoint expiry, and skips
+  publication disk reserve the device cannot cover. It records the free space
+  the next attempt needs beyond the reserve, refreshes the checkpoint's idle
+  expiry, refunds the automatic-history claim and the claim streak, withdraws
+  a completed-body receipt that publication could not use, and advances a park
+  streak (a permission-owned park does not). `readmit_storage_blocked_attachments`
+  requeues up to 64 parked jobs whose target fits the supplied free space less
+  `STORAGE_READMIT_MARGIN_BYTES` once admission (`disk_reserve + 4 *
+  transfer_limit`) would pass, delays a repeated park by its streak, and skips
   automatic rows while automatic acquisition is disabled; its probe is
-  read-only until a row fits. Explicit retry, a new claim, cancellation and
-  every permission transition clear the parked marker, cancellation also
-  clears the streak and floor, and both explicit retry APIs refresh a parked
-  prefix's idle expiry; size-policy work stays parked, and
-  `prune_attachment_partials` leaves parked (not cancelled) prefixes in place
-  for at most `STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS` (seven days) after the
-  latest park, then prunes them and adds their saved bytes to the row's target
-  in the same transaction. `attachment_partial_extent` reports a checkpoint's total and
-  saved bytes, and `record_attachment_file_sink` remembers a body that needs
-  the file sink. The new `test-support` feature exposes test hooks to
-  dependents' tests: `limit_database_pages_for_test`,
-  `attachment_partial_bytes_for_test`, `fail_next_storage_parks_for_test` and
-  `fail_next_storage_parks_with_backend_error_for_test`
-  (mdk#2239).
+  read-only until a row fits. Explicit retry, readmission, completion and
+  cancellation clear the parked marker; both explicit retry APIs refresh a
+  parked prefix's idle expiry. `prune_attachment_partials` keeps a parked
+  prefix for at most `STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS` (seven days) after
+  the latest park, then prunes it and adds its saved bytes to the row's target.
+  `attachment_partial_extent` reports a checkpoint's total and saved bytes. The
+  new `test-support` feature exposes `limit_database_pages_for_test` and
+  `attachment_partial_bytes_for_test` to dependents' tests (mdk#2239).
 
 ### Fixed
 

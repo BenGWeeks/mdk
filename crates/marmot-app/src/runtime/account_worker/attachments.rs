@@ -135,98 +135,6 @@ fn retry_at(storage: &SqliteAccountStorage, job: &AttachmentAcquisition, now: u6
     )
 }
 
-/// A storage park the database could not record because the write itself
-/// failed, as it can on a truly full disk. The attempt's lease still fences the
-/// row, so the worker retries the park before it schedules anything else.
-/// Until then the row shows the attempt's last phase and an explicit Retry
-/// changes nothing. A worker restart, or the lease expiring and the row being
-/// claimed again, loses the park: an explicit row's next attempt parks again at
-/// its first capacity check, but an automatic-history row whose verified body
-/// was receipted ends as `CompletedUnretained`, like any receipted body that
-/// was never published.
-#[derive(Clone)]
-pub(super) struct PendingStoragePark {
-    job: AttachmentAcquisition,
-    headroom: u64,
-    restarts: bool,
-}
-
-/// Parks awaiting a database write, shared by the worker and its publication
-/// tasks.
-pub(super) type PendingStorageParks = Arc<std::sync::Mutex<Vec<PendingStoragePark>>>;
-
-/// Record a storage park, or keep it for the next tick when the database
-/// cannot take even that write.
-fn park(
-    storage: &SqliteAccountStorage,
-    pending: &PendingStorageParks,
-    job: &AttachmentAcquisition,
-    headroom: u64,
-    restarts: bool,
-    now: u64,
-) -> Result<(), AppError> {
-    match storage.block_attachment_storage(job, headroom, restarts, now) {
-        Ok(_) => Ok(()),
-        Err(cgka_traits::StorageError::Capacity(_) | cgka_traits::StorageError::Busy(_)) => {
-            pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(PendingStoragePark {
-                    job: job.clone(),
-                    headroom,
-                    restarts,
-                });
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Retry parks the database refused earlier. A superseded attempt (its lease
-/// was reclaimed) drops out; a park that still cannot be written stays.
-///
-/// Any other storage error stops this pass but loses nothing: the entries not
-/// yet tried keep their place and the failing one moves behind them, so a
-/// single entry that keeps failing can neither be dropped nor starve the rest.
-/// The error is logged rather than returned. The attempt's lease still fences
-/// the row, so retrying on the next tick is safe, and failing the tick would
-/// stall all attachment scheduling behind one stale entry.
-fn retry_pending_parks(
-    storage: &SqliteAccountStorage,
-    pending: &PendingStorageParks,
-    now: u64,
-) -> bool {
-    let parks = std::mem::take(
-        &mut *pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    );
-    let mut recorded = false;
-    let mut kept = Vec::with_capacity(parks.len());
-    let mut parks = parks.into_iter();
-    while let Some(entry) = parks.next() {
-        match storage.block_attachment_storage(&entry.job, entry.headroom, entry.restarts, now) {
-            Ok(parked) => recorded |= parked,
-            Err(cgka_traits::StorageError::Capacity(_) | cgka_traits::StorageError::Busy(_)) => {
-                kept.push(entry);
-            }
-            Err(_) => {
-                tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
-                    "pending storage park could not be recorded; retrying next tick");
-                kept.extend(parks.by_ref());
-                kept.push(entry);
-            }
-        }
-    }
-    // Parks queued while this pass ran (by publication tasks) stay behind.
-    let mut pending = pending
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    kept.append(&mut pending);
-    *pending = kept;
-    recorded
-}
-
 /// The scheduler's clock. Tests may run it ahead of wall time, or pin it, per
 /// account directory to cross readmission backoffs without sleeping;
 /// transfers, leases and publication keep wall time.
@@ -252,10 +160,6 @@ pub(super) fn schedule(
     }
     let storage = client.app.account_storage(&client.state.label)?;
     let now = scheduler_now(client);
-    // A park the database refused is written before anything is scheduled.
-    if retry_pending_parks(&storage, &http.pending_storage_parks, now) {
-        shared.attachment_updates.send_modify(|_| {});
-    }
     // Abandoned ciphertext expires even after automatic acquisition is disabled.
     let partials = storage.prune_attachment_partials(now, 64)?;
     let orphan_uploads = storage
@@ -536,7 +440,6 @@ where
 
 pub(super) fn complete_acquired(
     client: &AppClient,
-    pending: &PendingStorageParks,
     job: &AttachmentAcquisition,
     result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
     byte_budget: u64,
@@ -547,7 +450,6 @@ pub(super) fn complete_acquired(
         &storage,
         &fallback,
         &client.app.account_dir(&client.state.label),
-        pending,
         job,
         result,
         byte_budget,
@@ -586,7 +488,6 @@ pub(super) fn complete_acquired_stored(
     storage: &SqliteAccountStorage,
     fallback: &storage_sqlite::AttachmentDownloadPolicy,
     directory: &std::path::Path,
-    pending: &PendingStorageParks,
     job: &AttachmentAcquisition,
     result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
     byte_budget: u64,
@@ -616,7 +517,7 @@ pub(super) fn complete_acquired_stored(
                 Err(cgka_traits::StorageError::Capacity(_)) => {
                     let headroom =
                         full_database_headroom(directory, &policy, file.len, 5, file.len);
-                    park(storage, pending, job, headroom, false, now)?;
+                    storage.block_attachment_storage(job, headroom, now)?;
                 }
                 _ => {
                     storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
@@ -638,7 +539,7 @@ pub(super) fn complete_acquired_stored(
                 Err(cgka_traits::StorageError::Capacity(_)) => {
                     let headroom =
                         full_database_headroom(directory, &policy, plaintext.len() as u64, 4, 0);
-                    park(storage, pending, job, headroom, false, now)?;
+                    storage.block_attachment_storage(job, headroom, now)?;
                 }
                 Ok(AttachmentPublishResult::CapacityBlocked) | Err(_) => {
                     storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
@@ -653,8 +554,8 @@ pub(super) fn complete_acquired_stored(
         }
         // Disk, not the network, is the blocker: park with the checkpoint until
         // free space covers the reserve or the user retries, never on a timer.
-        Err(AttachmentDownloadFailure::StorageBlocked { headroom, restarts }) => {
-            park(storage, pending, job, headroom, restarts, now)?;
+        Err(AttachmentDownloadFailure::StorageBlocked { headroom }) => {
+            storage.block_attachment_storage(job, headroom, now)?;
         }
         Err(AttachmentDownloadFailure::Stop(_)) => {
             storage.fail_attachment_acquisition(job, None)?;
@@ -675,7 +576,6 @@ fn complete(
 ) -> Result<(), AppError> {
     complete_acquired(
         client,
-        &PendingStorageParks::default(),
         job,
         result.map(crate::client::AcquiredMediaBody::Memory),
         byte_budget,

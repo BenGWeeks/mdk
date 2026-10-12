@@ -1042,13 +1042,10 @@ pub(crate) enum AttachmentDownloadFailure {
     /// Explicit acquisitions select a file sink before buffering a large body.
     FileRequired,
     /// Free disk cannot cover the publication reserve. `headroom` is the free
-    /// space beyond the policy reserve a retried attempt needs; `restarts` is
-    /// set when that attempt starts the body over, so storage keeps the largest
-    /// need proven so far as the target. The job parks with its checkpoints
-    /// instead of retrying on a timer.
+    /// space beyond the policy reserve a retried attempt needs. The job parks
+    /// with its checkpoints instead of retrying on a timer.
     StorageBlocked {
         headroom: u64,
-        restarts: bool,
     },
 }
 impl From<AppError> for AttachmentDownloadFailure {

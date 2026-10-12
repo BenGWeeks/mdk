@@ -207,7 +207,6 @@ async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenti
         .unwrap();
     complete_acquired(
         &client,
-        &Default::default(),
         &job,
         Ok(crate::client::AcquiredMediaBody::File(file)),
         128 * 1024 * 1024,

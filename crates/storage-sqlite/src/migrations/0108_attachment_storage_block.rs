@@ -20,11 +20,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     //
     // `storage_park_count` drives the readmission delay of a job that keeps
     // parking (reset by explicit retry, checkpoint progress, completion and
-    // cancellation), `storage_park_floor` is the largest need a body that
-    // restarts from zero has proven, so a later attempt that parked earlier
-    // does not lower its target, and `file_sink` remembers that the body
-    // exceeded the in-memory bound so a readmitted attempt opens the file sink
-    // without a header-only request first.
+    // cancellation).
     //
     // The trigger is recreated from its 0105 form with one added clause:
     // storage-parked rows keep their checkpoint.
@@ -33,10 +29,6 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
              CHECK(storage_blocked_headroom IS NULL OR storage_blocked_headroom>=0);
         ALTER TABLE attachment_acquisition ADD COLUMN storage_park_count INTEGER NOT NULL DEFAULT 0
              CHECK(storage_park_count>=0);
-        ALTER TABLE attachment_acquisition ADD COLUMN storage_park_floor INTEGER NOT NULL DEFAULT 0
-             CHECK(storage_park_floor>=0);
-        ALTER TABLE attachment_acquisition ADD COLUMN file_sink INTEGER NOT NULL DEFAULT 0
-             CHECK(file_sink IN (0,1));
         CREATE INDEX attachment_acquisition_storage_parked
             ON attachment_acquisition(priority_at DESC,token)
             WHERE state=4 AND storage_blocked_headroom IS NOT NULL;
@@ -102,7 +94,7 @@ mod tests {
         run(&mut conn, MIGRATIONS).unwrap();
         let row = conn
             .query_row(
-                "SELECT state,attempts,due,storage_blocked_headroom,storage_park_count,storage_park_floor,file_sink FROM attachment_acquisition",
+                "SELECT state,attempts,due,storage_blocked_headroom,storage_park_count FROM attachment_acquisition",
                 [],
                 |r| {
                     Ok((
@@ -111,13 +103,11 @@ mod tests {
                         r.get::<_, i64>(2)?,
                         r.get::<_, Option<i64>>(3)?,
                         r.get::<_, i64>(4)?,
-                        r.get::<_, i64>(5)?,
-                        r.get::<_, i64>(6)?,
                     ))
                 },
             )
             .unwrap();
-        assert_eq!(row, (2, 7, 1234, None, 0, 0, 0));
+        assert_eq!(row, (2, 7, 1234, None, 0));
         let after = trigger(&conn);
         assert!(
             after.contains(
@@ -168,25 +158,5 @@ mod tests {
         conn.execute("UPDATE attachment_acquisition SET state=4,due=NULL", [])
             .unwrap();
         assert_eq!(partials(&conn), 0, "an ordinary block still cleans up");
-    }
-
-    /// Pre-release builds recorded this migration as version 107, which is now
-    /// the moderation-report outbox. Such a database is refused on open rather
-    /// than silently mixing the two schemas, so it must be recreated.
-    #[test]
-    fn a_database_that_recorded_this_migration_as_107_is_refused() {
-        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        run(&mut conn, &MIGRATIONS[..106]).unwrap();
-        conn.execute(
-            "INSERT INTO cgka_schema_migrations(version,name,applied_at_unix_seconds)
-             VALUES(107,'0107_attachment_storage_block',0)",
-            [],
-        )
-        .unwrap();
-        let error = run(&mut conn, MIGRATIONS).unwrap_err().to_string();
-        assert!(
-            error.contains("migration 107 was applied as 0107_attachment_storage_block"),
-            "{error}"
-        );
     }
 }

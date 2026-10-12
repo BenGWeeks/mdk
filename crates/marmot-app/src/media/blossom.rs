@@ -866,7 +866,6 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                     growth.saturating_add(if identity.is_some() { growth } else { 0 })
                 }),
                 prefix_length,
-                false,
             )
             .await?;
         let mut response = response;
@@ -965,9 +964,6 @@ pub(crate) async fn fetch_blossom_file_with_transport(
             // held now, and the checkpoint still grows past the saved prefix.
             if output.len - capacity_checked >= storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES as u64 {
                 let projected = total.unwrap_or(output.len);
-                // Without a length or validator the next attempt starts the
-                // body over, so storage keeps the largest need proven so far.
-                let restarts = total.is_none() && identity.is_none();
                 observation
                     .publication_capacity(
                         projected,
@@ -979,7 +975,6 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                             },
                         ),
                         output.len,
-                        restarts,
                     )
                     .await?;
                 capacity_checked = output.len;

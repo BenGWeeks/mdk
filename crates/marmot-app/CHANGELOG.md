@@ -128,48 +128,33 @@
   retries forever. The publication reserve (disk reserve plus four times the
   plaintext) is checked as soon as a response declares the size, as a body
   grows, and before the completed-body receipt, counting the staging,
-  checkpoint and decrypted-file bytes the attempt itself still has to write;
-  a shortage, or a database that reports it is full while publishing, parks
+  checkpoint and decrypted-file bytes the attempt itself still has to write.
+  A shortage, or a database that reports it is full while publishing, parks
   the job as `AttachmentTransferState::StorageBlocked` with its ciphertext
-  checkpoint instead of scheduling a timer. The parked job records the free
-  space it needs beyond the reserve in the worker's own frame, so a
-  readmitted attempt sees at least what its parking check wanted; the worker
-  readmits it once free space exceeds that by 4 MiB and admission would pass,
-  a job that parks again waits out its park streak (15 s doubling to an hour,
-  reset by explicit Retry, checkpoint progress, completion and cancellation), and explicit
-  Retry readmits at once. With a strong validator, the in-memory sink
-  checkpoints a body that had already arrived, so readmission publishes
-  without another request, and the file sink re-requests at most its unsaved
-  sub-MiB tail; without one both restart. A body with neither length nor
-  validator records the largest need any attempt proved, never more, so it
-  readmits as soon as that much is free; its restarts are bounded in time by
-  the park streak. A full database records at least the free space seen at
-  the refusal plus the body and withdraws the completed-body receipt, so the
-  job readmits only once the volume gains room and automatic history is not
-  ended as an unretained body; when the database cannot take even the park
-  write, the worker keeps the park in memory and records it on a later tick.
-  Parked checkpoints keep their quota reservation for at most seven days after
-  the latest park, and readmission and both explicit Retry paths refresh
-  their 24-hour idle expiry, so a park longer than a day still resumes from
-  the checkpoint; cancellation lets them expire. Storage parks refund the
-  automatic-history claim and the claim streak they consumed, and only
-  storage-owned parks advance the park streak. Explicit bodies
-  between the transfer limit and 512 MiB now take the file sink and need the
-  reserve plus five bodies free (six with a strong validator) instead of
-  about four, because their staging and checkpoint copies are counted (#2239).
+  checkpoint instead of scheduling a timer, recording the free space it needs
+  in the worker's own frame. The worker readmits it once free space exceeds
+  that by 4 MiB and admission would pass; a job that parks again waits out its
+  park streak (15 s doubling to an hour), and explicit Retry readmits at once.
+  With a strong validator the in-memory sink publishes a checkpointed body
+  without another request and the file sink re-requests at most its unsaved
+  tail; without one both start over. A full database records at least the free
+  space seen at the refusal plus the body and withdraws the completed-body
+  receipt. If even the park write fails, the error is returned and the lease
+  recovers the job. Parked checkpoints keep their quota reservation for at
+  most seven days after the latest park. Explicit bodies between the transfer
+  limit and 512 MiB now take the file sink and need the reserve plus five
+  bodies free (six with a strong validator) instead of about four, because
+  their staging and checkpoint copies are counted (#2239).
 - Receiving an attachment no longer holds several copies of it in native
   memory. The body buffer is reserved once from the declared length (an
   undeclared length grows geometrically to half the transfer limit and then
   once to the limit, so the buffer never exceeds the limit and the copy while
   it grows holds at most 1.5 times it; a failed reservation is a transient
-  failure, not an abort), decrypted
-  in place, explicit downloads above the automatic transfer limit stream
-  through the existing private file sink, and in-memory publication stores
-  a body larger than one 64 KiB staging chunk as chunk rows, so SQLite keeps
-  no bind, record or trigger-rewrite copy of it. Integrity checks,
-  resume and retention behavior are unchanged. A job that learned it needs the
-  file sink remembers it, so only its first attempt spends a header-only
-  request before the file sink reopens the URL (#2241).
+  failure, not an abort), decrypted in place, explicit downloads above the
+  automatic transfer limit stream through the existing private file sink, and
+  in-memory publication stores a body larger than one 64 KiB staging chunk as
+  chunk rows, so SQLite keeps no bind, record or trigger-rewrite copy of it.
+  Integrity checks, resume and retention behavior are unchanged (#2241).
 - Catch-up downloads missed group history in far fewer round trips. Each
   comparison pass now fetches up to 256 events (1 MiB), across all relays, in
   batched requests instead of 16 one-at-a-time requests, so a backlog of a few hundred

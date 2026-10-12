@@ -361,8 +361,8 @@ fn serve(
 /// `[4P, 5P)`: the first implementation downloaded until its own staging
 /// tripped the reserve, parked with the bytes received, and was readmitted the
 /// same tick. Now the declared size parks the job before any body byte, the
-/// target includes the staging a retry needs, the row stays parked, and the
-/// readmitted attempt opens the file sink directly.
+/// target includes the staging a retry needs, and the row stays parked until
+/// space frees.
 #[tokio::test]
 async fn file_sink_without_validator_parks_once_inside_the_loop_window() {
     let plain = vec![0x5a; 32 * MIB as usize];
@@ -400,8 +400,8 @@ async fn file_sink_without_validator_parks_once_inside_the_loop_window() {
     fixture.publish_file(&plain).await;
     assert_eq!(
         requests.load(Ordering::SeqCst),
-        3,
-        "the readmitted attempt remembers the file sink and skips the header probe"
+        4,
+        "the readmitted attempt probes once more, then publishes through the file sink"
     );
     fixture.tick().await;
     assert!(fixture.completions.try_recv().is_err());
@@ -478,14 +478,13 @@ async fn memory_sink_with_validator_parks_at_the_header_inside_the_loop_window()
 
 /// File sink, chunked body with neither length nor validator, on a disk that
 /// frees exactly what each park asks for. Every attempt starts the body over
-/// and parks a little later. The recorded target is the largest need an
-/// attempt proved, so it never exceeds what the body really needs and the job
-/// publishes as soon as that much is free (a doubled target would demand more
-/// than the body needs and block it). Refetches are bounded in time: each
-/// readmission waits out the park streak, which the test crosses by running
-/// the scheduler's clock ahead instead of sleeping.
+/// and parks a little later, recording the need it proved, which never exceeds
+/// what the body really needs, so the job publishes as soon as that much is
+/// free. Refetches are bounded in time: each readmission waits out the park
+/// streak, which the test crosses by running the scheduler's clock ahead
+/// instead of sleeping.
 #[tokio::test]
-async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
+async fn unknown_length_parks_record_the_proven_need_and_back_off() {
     let plain = vec![0x7c; 8 * MIB as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (reference, cipher) = loopback_reference(&listener, &plain);
@@ -556,10 +555,9 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
         let done = fixture.completion().await;
         match &done.completion {
             MediaHttpCompletion::Attachment {
-                result: Err(AttachmentDownloadFailure::StorageBlocked { headroom, restarts }),
+                result: Err(AttachmentDownloadFailure::StorageBlocked { headroom }),
                 ..
             } => {
-                assert!(restarts, "a body without length or validator starts over");
                 assert!(*headroom > target, "{headroom} after {target}");
                 target = *headroom;
                 parks += 1;
@@ -606,8 +604,8 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
     );
     assert_eq!(
         requests.load(Ordering::SeqCst),
-        1 + parks + 1,
-        "the header probe, one request per park, and the publishing attempt"
+        2 * (parks + 1),
+        "each parking attempt and the publishing one: an in-memory probe, then the file sink"
     );
     stop.send(()).unwrap();
     server.await.unwrap();
@@ -800,8 +798,8 @@ async fn an_aged_parked_prefix_returns_its_bytes_to_the_target() {
     fixture.publish_file(&plain).await;
     assert_eq!(
         requests.load(Ordering::SeqCst),
-        before + 1,
-        "one fresh request for the whole body, with no re-park"
+        before + 2,
+        "an in-memory probe, then one fresh file-sink request for the whole body, with no re-park"
     );
     server.abort();
 }
@@ -1007,184 +1005,10 @@ async fn file_publication_into_a_full_database_parks_until_room_returns() {
     fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES);
     fixture.tick().await;
     fixture.publish_file(&plain).await;
-    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    // Without a checkpoint the readmitted attempt probes the in-memory sink first.
+    assert_eq!(requests.load(Ordering::SeqCst), 4);
     stop.send(()).unwrap();
     server.await.unwrap();
-}
-
-/// On a truly full disk even the park write can fail. The worker keeps the
-/// park in memory while the attempt's lease fences the row, records it on the
-/// next tick, and nothing is refetched in between.
-#[tokio::test]
-async fn a_park_the_database_refuses_is_recorded_on_the_next_tick() {
-    let plain = vec![0x46; (2 * MIB + 9) as usize];
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (reference, cipher) = loopback_reference(&listener, &plain);
-    let requests = Arc::new(AtomicUsize::new(0));
-    let (stop, stopped) = oneshot::channel();
-    let server = serve(
-        listener,
-        cipher,
-        Framing {
-            etag: false,
-            chunked: false,
-        },
-        Arc::clone(&requests),
-        stopped,
-    );
-    let mut fixture = explicit_fixture(&reference, 4 * MIB).await;
-    fixture.set_free(16 * MIB);
-    fixture.tick().await;
-    let done = fixture.completion().await;
-    fixture.storage.limit_database_pages_for_test(16).unwrap();
-    fixture.storage.fail_next_storage_parks_for_test(1).unwrap();
-    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
-    assert_eq!(
-        fixture.state(),
-        AttachmentTransferState::VerifyingPlaintext,
-        "the refused park leaves the leased attempt in place"
-    );
-    assert_eq!(fixture.storage.retained_attachment_byte_count().unwrap(), 0);
-    let mut updates = fixture.shared.attachment_updates.subscribe();
-    updates.borrow_and_update();
-    fixture.tick().await;
-    assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
-    assert!(
-        updates.has_changed().unwrap(),
-        "the recorded park wakes subscribers"
-    );
-    assert!(fixture.completions.try_recv().is_err());
-    assert_eq!(requests.load(Ordering::SeqCst), 1, "nothing was refetched");
-    fixture
-        .storage
-        .limit_database_pages_for_test(1 << 30)
-        .unwrap();
-    fixture.set_free(PLENTY);
-    fixture.tick().await;
-    fixture.publish_memory(&plain).await;
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    stop.send(()).unwrap();
-    server.await.unwrap();
-}
-
-/// A pending park that fails with something other than a full database is
-/// neither dropped nor allowed to take the rest of the list with it: the
-/// park not yet tried keeps its place, the failing one moves behind it, and
-/// a later tick records both.
-#[test]
-fn pending_parks_survive_a_non_capacity_failure() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".into(),
-                groups: vec![group(false)],
-                ..Default::default()
-            },
-            100,
-            300,
-        )
-        .unwrap();
-    let claimed = |message: &str| {
-        let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(message.as_bytes()).into();
-        let tag = vec![
-            "imeta".to_string(),
-            "m application/octet-stream".to_string(),
-            format!("x {}", hex::encode(digest)),
-        ];
-        store
-            .record_app_event(&StoredAppEvent {
-                group_id_hex: GROUP.into(),
-                message_id_hex: message.repeat(32),
-                source_message_id_hex: Some(message.repeat(32)),
-                source_epoch: Some(3),
-                direction: "received".into(),
-                sender: "33".repeat(32),
-                plaintext: String::new(),
-                kind: 9,
-                tags: vec![tag.clone()],
-                recorded_at: 10,
-                received_at: 10,
-                origin_commit_id: None,
-                moderation_grant: false,
-            })
-            .unwrap();
-        let selected = storage_sqlite::AttachmentHistoryEntry {
-            message_id_hex: message.repeat(32),
-            attachment_index: 0,
-            source_message_id_hex: message.repeat(32),
-            source_epoch: Some(3),
-            sender: "33".repeat(32),
-            timeline_at: 10,
-            received_at: 10,
-            slot: serde_json::to_value(&tag).unwrap(),
-            emoji_tags: Vec::new(),
-        };
-        let storage_sqlite::AttachmentDemand::Requested(asset) = store
-            .request_attachment_acquisition(GROUP, &selected, digest, 11)
-            .unwrap()
-        else {
-            panic!("attachment demand");
-        };
-        store
-            .claim_attachment_acquisition(&asset, 12, 1000)
-            .unwrap()
-            .unwrap()
-    };
-    let (first, second) = (claimed("aa"), claimed("bb"));
-    let pending = PendingStorageParks::default();
-    pending.lock().unwrap().extend([
-        PendingStoragePark {
-            job: first.clone(),
-            headroom: 4096,
-            restarts: false,
-        },
-        PendingStoragePark {
-            job: second.clone(),
-            headroom: 8192,
-            restarts: false,
-        },
-    ]);
-    let state = |job: &AttachmentAcquisition| {
-        store
-            .attachment_acquisition_status(&job.reference)
-            .unwrap()
-            .unwrap()
-            .state
-    };
-    store
-        .fail_next_storage_parks_with_backend_error_for_test(1)
-        .unwrap();
-    assert!(!retry_pending_parks(&store, &pending, 20));
-    let kept: Vec<u64> = pending
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|park| park.headroom)
-        .collect();
-    assert_eq!(
-        kept,
-        [8192, 4096],
-        "the untried park keeps its place and the failing one moves behind it"
-    );
-    assert_eq!(
-        state(&first),
-        storage_sqlite::AttachmentAcquisitionState::Fetching
-    );
-    assert_eq!(
-        state(&second),
-        storage_sqlite::AttachmentAcquisitionState::Fetching
-    );
-    assert!(retry_pending_parks(&store, &pending, 21));
-    assert!(pending.lock().unwrap().is_empty());
-    assert_eq!(
-        state(&first),
-        storage_sqlite::AttachmentAcquisitionState::Blocked
-    );
-    assert_eq!(
-        state(&second),
-        storage_sqlite::AttachmentAcquisitionState::Blocked
-    );
 }
 
 /// Parking and readmission both reach a transfer subscription. A parked row
@@ -1266,52 +1090,6 @@ async fn transfer_subscribers_see_park_and_readmission_without_the_active_refres
     stream.close();
     drop(fixture);
     runtime.shutdown_and_close().await.unwrap();
-    stop.send(()).unwrap();
-    server.await.unwrap();
-}
-
-/// The remembered file sink only short-cuts explicit work: an automatic job
-/// carrying the marker still takes the in-memory sink and its transfer limit.
-#[tokio::test]
-async fn a_remembered_file_sink_never_routes_automatic_work() {
-    let plain = vec![0x56; (MIB + 3) as usize];
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (reference, cipher) = loopback_reference(&listener, &plain);
-    let requests = Arc::new(AtomicUsize::new(0));
-    let (stop, stopped) = oneshot::channel();
-    let server = serve(
-        listener,
-        cipher,
-        Framing {
-            etag: false,
-            chunked: false,
-        },
-        Arc::clone(&requests),
-        stopped,
-    );
-    let mut fixture = fixture(&reference, 4 * MIB, false).await;
-    let now = crate::unix_now_seconds();
-    let asset = fixture.status().reference.unwrap();
-    // The policy write paused automatic work; the worker resumes it each tick.
-    fixture
-        .storage
-        .resume_permitted_attachments(now, [true; 4])
-        .unwrap();
-    let job = fixture
-        .storage
-        .claim_attachment_acquisition(&asset, now, now + 100)
-        .unwrap()
-        .unwrap();
-    assert!(fixture.storage.record_attachment_file_sink(&job).unwrap());
-    assert!(
-        fixture
-            .storage
-            .fail_attachment_acquisition(&job, Some(now))
-            .unwrap()
-    );
-    fixture.tick().await;
-    fixture.publish_memory(&plain).await;
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
     stop.send(()).unwrap();
     server.await.unwrap();
 }

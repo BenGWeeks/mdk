@@ -47,8 +47,8 @@ fn stop(message: &str) -> AttachmentDownloadFailure {
 /// private staging copies). Below that, the job parks as `StorageBlocked` with
 /// its checkpoints instead of re-fetching on a timer. The payload is the
 /// headroom beyond the reserve a retried attempt needs, in the worker's frame.
-fn storage_blocked(headroom: u64, restarts: bool) -> AttachmentDownloadFailure {
-    AttachmentDownloadFailure::StorageBlocked { headroom, restarts }
+fn storage_blocked(headroom: u64) -> AttachmentDownloadFailure {
+    AttachmentDownloadFailure::StorageBlocked { headroom }
 }
 
 /// Free bytes on the volume holding `path`, as every capacity decision and the
@@ -173,7 +173,7 @@ impl AttachmentResume {
             // Park on disk pressure before recording a completed receipt, so a
             // blocked job never becomes an opted-in body with no retention.
             // Stable retention quota failures after this boundary remain terminal.
-            this.check_publication_capacity(plaintext_len as u64, 0, held, false)?;
+            this.check_publication_capacity(plaintext_len as u64, 0, held)?;
             this.storage
                 .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
                 .map_err(|_| stop("attachment receipt failed"))
@@ -200,16 +200,14 @@ impl AttachmentResume {
     /// reserve: `4 * bytes + ahead + held`. Readmission requires that headroom
     /// in the worker's frame plus a margin wider than the sub-MiB tail a
     /// checkpointed body still re-requests, so the first check a readmitted
-    /// attempt reaches passes. A check that parks again without saved progress
-    /// records at least the same target (more, once more of an unknown-length
-    /// body is seen); saved progress may lower it, since the next attempt then
-    /// has less left to write. Unknown free space is a transient failure.
+    /// attempt reaches passes. Each park records the need its own check
+    /// proved; saved progress may lower a later one, since the next attempt
+    /// then has less left to write. Unknown free space is a transient failure.
     fn check_publication_capacity(
         &self,
         bytes: u64,
         ahead: u64,
         held: u64,
-        restarts: bool,
     ) -> Result<(), AttachmentDownloadFailure> {
         let policy = self
             .storage
@@ -219,36 +217,22 @@ impl AttachmentResume {
             available_space(&self.directory).map_err(|_| retry("free disk space unavailable"))?;
         let needed = bytes.saturating_mul(4).saturating_add(ahead);
         if free < policy.disk_reserve.saturating_add(needed) {
-            return Err(storage_blocked(needed.saturating_add(held), restarts));
+            return Err(storage_blocked(needed.saturating_add(held)));
         }
         Ok(())
     }
 
     /// Check publication headroom without recording a completed-body receipt.
-    /// `restarts` marks a check whose next attempt starts the body over.
     pub(crate) async fn publication_capacity(
         self: &Arc<Self>,
         bytes: u64,
         ahead: u64,
         held: u64,
-        restarts: bool,
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
-            this.check_publication_capacity(bytes, ahead, held, restarts)
-        })
-        .await
-        .map_err(|_| retry("attachment capacity task failed"))?
-    }
-
-    /// Remember that this body needs the file sink, so a readmitted attempt
-    /// skips the in-memory sink's header-only request. Best effort.
-    pub(crate) async fn record_file_sink(&self) {
-        let this = self.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            this.storage.record_attachment_file_sink(&this.job)
-        })
-        .await;
+        tokio::task::spawn_blocking(move || this.check_publication_capacity(bytes, ahead, held))
+            .await
+            .map_err(|_| retry("attachment capacity task failed"))?
     }
 
     /// Early in-memory capacity check: a definite shortage parks the job, but
@@ -260,7 +244,7 @@ impl AttachmentResume {
         bytes: u64,
         ahead: u64,
     ) -> Result<(), AttachmentDownloadFailure> {
-        match self.publication_capacity(bytes, ahead, 0, false).await {
+        match self.publication_capacity(bytes, ahead, 0).await {
             Err(blocked @ AttachmentDownloadFailure::StorageBlocked { .. }) => Err(blocked),
             _ => Ok(()),
         }
@@ -451,7 +435,6 @@ impl AttachmentResume {
                     .saturating_mul(2)
                     .saturating_add(saved),
                 0,
-                false,
             )?;
             let mut file = super::file_transfer::PrivateMediaFile::create(&directory)?;
             let mut writer = file.writer()?;

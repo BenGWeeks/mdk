@@ -870,7 +870,6 @@ pub(crate) async fn download_file(
                 encrypted.len.saturating_sub(MEDIA_AEAD_TAG_BYTES),
                 0,
                 encrypted.len,
-                false,
             )
             .await?;
         let decryption_directory = directory.clone();

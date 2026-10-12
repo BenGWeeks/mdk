@@ -242,24 +242,17 @@ without recording successful acquisition and keeps its checkpoint, which also ke
 reservation, for at most seven days after the latest park. Readmission and both explicit Retry
 paths refresh the checkpoint's 24-hour idle expiry, so a park longer than a day still resumes
 from it; cancellation lets it expire, and past seven days it is pruned while the job stays
-parked, its target grows by the pruned bytes, and its next attempt starts the body over. If the database cannot record even the park, the worker
-keeps it in memory and writes it on a later tick. Until then the row still shows the attempt's
-last phase (typically `VerifyingPlaintext`), and an explicit Retry in that window changes
-nothing because the attempt still holds its lease. A worker restart, or the lease expiring and
-the row being claimed again, before the park is recorded loses it: an explicit row is then
-retried and parks again at its first capacity check, but an automatic-history row whose verified
-body was already receipted ends as `CompletedUnretained`, as any receipted body that was never
-published does. When the whole body had already arrived, the in-memory sink
+parked, its target grows by the pruned bytes, and its next attempt starts the body over. If the database cannot record even the park, the error is
+returned and the attempt's lease recovers the job: an explicit row's next attempt parks again at
+its first capacity check, while an automatic-history row whose verified body was already
+receipted ends as `CompletedUnretained`, as any receipted body that was never published does. When the whole body had already arrived, the in-memory sink
 checkpoints the complete ciphertext when the server gave a strong validator, so its readmitted
 attempt publishes without another request; a receipt-time park re-requests only the unsaved
 tail, and a body without a validator is fetched again. The file sink keeps every saved
 1 MiB checkpoint when the server gave a strong validator and re-requests at most the unsaved
-tail; without one it starts over. A body with neither length nor validator records the largest
-need any attempt proved, never more, so it readmits as soon as that much is free. Each restart
-refetches the body from zero and spends one network attempt, so the number of restarts grows
-linearly with the part of the body not yet proven when free space returns a little at a time;
-they are bounded in time by the park streak below, and automatic history still stops at its
-network-attempt budget. No timer refetches while parked: the job records the free space it needs
+tail; without one it starts over. A body with neither length nor validator starts over on each
+attempt and records the need that attempt proved; its refetches are bounded in time by the park
+streak below, and automatic history still stops at its network-attempt budget. No timer refetches while parked: the job records the free space it needs
 beyond the reserve (the body plus the staging and checkpoint bytes a retry occupies; after a
 full database, at least the free space seen at the refusal plus the body, so readmission waits
 until the volume actually gains room), the worker
