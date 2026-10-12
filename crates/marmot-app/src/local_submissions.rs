@@ -17,19 +17,12 @@ use crate::{
 };
 
 /// Select draft content, or consume an unchanged draft without replacing a captured payload.
-#[derive(Clone)]
 pub(crate) enum LocalDraftAdmission {
     Source(MessageDraftRevision),
     ConsumeIfCurrent(MessageDraftRevision),
 }
 
 impl LocalDraftAdmission {
-    pub(crate) fn into_revision(self) -> MessageDraftRevision {
-        match self {
-            Self::Source(revision) | Self::ConsumeIfCurrent(revision) => revision,
-        }
-    }
-
     fn revision(&self) -> &MessageDraftRevision {
         match self {
             Self::Source(revision) | Self::ConsumeIfCurrent(revision) => revision,
@@ -349,8 +342,8 @@ impl MarmotApp {
                 }
                 Some(LocalDraftAdmission::ConsumeIfCurrent(revision)) => {
                     let selected = storage.selected_message_draft(&group_hex)?;
-                    if selected.revision == *revision {
-                        if let Some(selected) = selected.draft {
+                    match selected.draft.filter(|_| selected.revision == *revision) {
+                        Some(selected) => {
                             let plaintext_hashes =
                                 storage.message_draft_plaintext_hashes(revision).map_err(
                                     |error| crate::drafts::revision_error(error, &group_hex),
@@ -371,11 +364,8 @@ impl MarmotApp {
                                 ));
                             }
                             Some(revision)
-                        } else {
-                            None
                         }
-                    } else {
-                        None
+                        None => None,
                     }
                 }
                 None => None,

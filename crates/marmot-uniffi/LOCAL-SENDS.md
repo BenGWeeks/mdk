@@ -117,35 +117,23 @@ submission needs freshly prepared references and a new token.
 
 ## Captured ordinary-media drafts
 
-Use `send_prepared_media_with_client_token` after an upload-only call when the
-composer already persisted the ordinary-media draft. Capture the immutable
-caption, ordered upload inputs, stable token and eligible opaque draft revision
-before allowing a later composition to take ownership. Pass that same revision
-with the resulting references; do not reselect a draft after upload.
+Use `send_prepared_media_with_client_token` for an uploaded ordinary-media
+snapshot. Pass its captured caption, ordered references, stable client token and
+optional original draft revision. The method has no reply target; use revisioned
+draft admission for replied media.
 
-Native admission records the payload and its pending projection in one
-transaction. If the captured revision is still current, its caption/reply and
-ordered media descriptors must describe the submitted snapshot, and that draft
-is consumed in the same transaction. A stale, cleared or newer draft is left
-unchanged and cannot replace the captured payload or reject admission. The
-ordinary-media method has no reply target; keep replied-media on its revisioned
-draft method. Whitespace-normalized captions are eligible for consumption.
+If that revision is still current, admission validates the caption, reply,
+ordered name/type descriptors and each attachment's plaintext SHA-256, then
+consumes the draft in the same transaction as the retained send and projection.
+A newer, cleared or absent draft is preserved and never replaces the payload.
+Caption whitespace is normalized for the consumption check.
 
-Keep the original token, references and revision for live retries. The cleanup
-revision participates in the token's request binding. A replay returns the
-original identity before examining current draft state and never consumes a
-later draft. After an interrupted return or restart, query `local_send_status`
-first; opaque revision objects are not host persistence records. Recover owned
-work instead of uploading again, recapturing cleanup authority or creating a new
-token. Acceptance is local ownership, not peer receipt.
-
-A null consumption revision is for composer-free sends or an original draft
-whose consumption eligibility was revoked by a newer composition. Never treat a
-failed draft read as proof that no persisted draft exists. Native draft
-notifications follow committed consumption; consumers should refresh their
-transient shelf and preserve fresh picker occurrences. Do not separately delete
-an accepted draft on delivery. Pair the additive Swift/Kotlin method and C
-function with their matching generated bindings, header and native library.
+Keep the original token and revision for live retries. Replaying an owned token
+returns its identity before inspecting the current draft and preserves later
+drafts. After interruption or restart, query `local_send_status` before uploading
+or admitting again. A null revision means no draft consumption; a failed draft
+read does not establish that no draft exists. Use matching generated bindings,
+header and native library. Acceptance is local ownership, not peer receipt.
 
 `upload_media_files_with_client_token` has the same admission contract for
 file-backed attachments (`source_path` instead of a plaintext byte array). Every

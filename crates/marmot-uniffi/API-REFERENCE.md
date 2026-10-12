@@ -4408,9 +4408,7 @@ acceptance, not delivery; never clear a newer composer on completion. See [local
 pub async fn send_prepared_media_with_client_token( &self, account_ref: String, group_id_hex: String, attachments: Vec<MediaAttachmentReferenceFfi>, caption: Option<String>, client_token: String, consuming_draft: Option<Arc<MessageDraftRevisionFfi>>, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
 ```
 
-Admit the immutable caption and ordered references from an ordinary-media upload with its stable client token. If the original captured draft revision remains current, matching caption/reply and media descriptors are validated and that draft is consumed in the admission transaction. A newer, cleared or absent draft is preserved and never supplies send content. This method has no reply target; retain revisioned draft admission for replied media.
-
-Capture cleanup authority before upload and keep it with the logical attempt; never reselect a newer draft during Retry. Use `local_send_status` to recover owned work after an interrupted return or restart before uploading or admitting again. A nullable consumption revision is for composer-free sends or revoked consumption eligibility, not a fallback for a failed draft read. Acceptance is local ownership, not peer receipt. See [captured-media integration](LOCAL-SENDS.md#captured-ordinary-media-drafts) and use matching generated Swift/Kotlin bindings and native binaries.
+Admit an uploaded ordinary-media snapshot with its stable client token and optional captured draft revision. Conditional consumption is transactional, bound to ordered plaintext SHA-256 hashes, and preserves newer drafts. The method has no reply target. See the [captured-media contract](LOCAL-SENDS.md#captured-ordinary-media-drafts) for token replay, interruption recovery and matching bindings.
 
 [Source](src/commands/local_submissions.rs#L125)
 

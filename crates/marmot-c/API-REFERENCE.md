@@ -5188,9 +5188,7 @@ on delivery. See [local sends](../marmot-uniffi/LOCAL-SENDS.md).
 MarmotStatus marmot_send_prepared_media_with_client_token(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const struct MarmotMediaAttachmentReference *attachments, uintptr_t attachments_len, const char *caption, const char *client_token, const struct MarmotMessageDraftRevision *consuming_draft, struct MarmotLocalSendAcceptance **out);
 ```
 
-Admit the immutable ordinary-media snapshot with its stable token. The optional original draft revision is borrowed from its live selected-draft owner; only an exact unchanged revision is consumed in the admission transaction. A newer or cleared draft is preserved. Keep the original token, references and revision for live retry, and query local token status after interruption before another upload or admission.
-
-Required strings and the ordered attachment array are borrowed; caption and consumption revision may be NULL. The output is validated and cleared before inputs or mutation. Free the owned acceptance with `marmot_local_send_acceptance_free`. Use this additive function with matching regenerated headers and libraries. See [shared captured-media contract](../marmot-uniffi/LOCAL-SENDS.md#captured-ordinary-media-drafts) and [method guidance](../marmot-uniffi/API-REFERENCE.md#marmotsend_prepared_media_with_client_token).
+C binding for [captured ordinary-media admission](../marmot-uniffi/LOCAL-SENDS.md#captured-ordinary-media-drafts). Inputs and the nullable captured revision are borrowed; free the owned result with `marmot_local_send_acceptance_free`. Use the matching generated header and native library.
 
 [Header contract](include/marmot.h#L8642)
 

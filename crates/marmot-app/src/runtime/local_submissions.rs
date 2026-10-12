@@ -344,34 +344,15 @@ impl MarmotAppRuntime {
             let gate = shared.local_submission_gate(&account.account_id_hex);
             let admission = gate.blocking_lock();
             shared.lifecycle().ensure_running()?;
-            let (accepted, update) = match (draft, edit_of_client_token) {
-                (Some(policy @ LocalDraftAdmission::ConsumeIfCurrent(_)), original) => app
-                    .admit_local_message_with_draft_policy_at(
-                        &account.label,
-                        &group,
-                        token,
-                        request,
-                        Some(policy),
-                        original,
-                        crate::unix_now_seconds(),
-                    )?,
-                (source, Some(original)) => app.admit_local_message_with_edit_at(
-                    &account.label,
-                    &group,
-                    token,
-                    request,
-                    source.map(LocalDraftAdmission::into_revision),
-                    Some(original),
-                    crate::unix_now_seconds(),
-                )?,
-                (source, None) => app.admit_local_message(
-                    &account.label,
-                    &group,
-                    token,
-                    request,
-                    source.map(LocalDraftAdmission::into_revision),
-                )?,
-            };
+            let (accepted, update) = app.admit_local_message_with_draft_policy_at(
+                &account.label,
+                &group,
+                token,
+                request,
+                draft,
+                edit_of_client_token,
+                crate::unix_now_seconds(),
+            )?;
             if update.is_some() {
                 let mut queue = shared
                     .local_submission_queue

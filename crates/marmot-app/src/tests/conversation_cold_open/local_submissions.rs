@@ -954,6 +954,51 @@ fn prepared_media_snapshot_fixture(
 }
 
 #[tokio::test]
+async fn prepared_media_snapshot_runtime_consumes_and_replays_without_clearing_a_new_draft() {
+    let h = History::new(0).await;
+    let group = hex::encode(h.group.as_slice());
+    let (revision, request) = prepared_media_snapshot_fixture(&h);
+    let runtime = MarmotAppRuntime::new(h.app.clone());
+    let accepted = runtime
+        .submit_prepared_media_snapshot(
+            "alice",
+            &h.group,
+            request.attachments.clone(),
+            Some(request.content.clone()),
+            "runtime-snapshot".into(),
+            Some(revision.clone()),
+        )
+        .await
+        .unwrap();
+    let empty = h.app.selected_message_draft("alice", &group).unwrap();
+    assert!(empty.draft.is_none());
+    let newer = h
+        .app
+        .save_message_draft_if_revision("alice", &empty.revision, "next message", None, vec![])
+        .unwrap();
+    let replayed = runtime
+        .submit_prepared_media_snapshot(
+            "alice",
+            &h.group,
+            request.attachments,
+            Some(request.content),
+            "runtime-snapshot".into(),
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted, replayed);
+    assert_eq!(
+        h.app
+            .selected_message_draft("alice", &group)
+            .unwrap()
+            .revision,
+        newer.revision
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn prepared_media_snapshot_consumption_survives_restart_before_host_cleanup() {
     use crate::local_submissions::LocalDraftAdmission;
     let h = History::new(0).await;
