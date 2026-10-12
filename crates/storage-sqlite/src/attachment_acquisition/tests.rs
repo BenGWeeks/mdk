@@ -610,26 +610,33 @@ fn attachment_admission_rejects_source_changed_since_shared_parser_validation() 
 fn attachment_small_reads_do_not_materialize_the_whole_blob() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "one");
+    seed(&store, "legacy");
     let bytes = vec![7u8; 2 * 1024 * 1024];
-    let hash: [u8; 32] = Sha256::digest(&bytes).into();
-    let mut event = source("one");
-    event.tags[0][2] = format!("x {}", hex::encode(hash));
-    store.record_app_event(&event).unwrap();
-    let mut selection = selected("one");
-    selection.slot = serde_json::to_value(&event.tags[0]).unwrap();
-    let AttachmentDemand::Requested(reference) = store
-        .request_attachment_acquisition(GROUP, &selection, hash, 11)
-        .unwrap()
-    else {
-        panic!("missing demand")
-    };
-    let job = store
-        .claim_attachment_acquisition(&reference, 11, 100)
-        .unwrap()
-        .unwrap();
+    let job = claim_body(&store, "one", &bytes);
     store
-        .complete_attachment_acquisition(&job, &bytes, 12, bytes.len() as u64)
+        .complete_attachment_acquisition(&job, &bytes, 12, 2 * bytes.len() as u64)
         .unwrap();
+    // A large array row as upgraded databases still hold one: bound whole and
+    // left at the migration's `byte_len=-1` sentinel, so sizing reads `bytes`.
+    let legacy = claim_body(&store, "legacy", &bytes);
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO retained_attachment_bytes(token,bytes) VALUES(?1,?2)",
+            params![legacy.reference.token, bytes],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE retained_attachment_bytes SET byte_len=-1 WHERE token=?1",
+            [&legacy.reference.token],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
+            [&legacy.reference.token],
+        )
+        .unwrap();
+    }
     {
         let conn = store.lock().unwrap();
         // SAFETY: the guard exclusively owns this live connection. Lowering its
@@ -642,22 +649,26 @@ fn attachment_small_reads_do_not_materialize_the_whole_blob() {
             );
         }
     }
-    assert_eq!(
-        store
-            .retained_attachment_asset(GROUP, "one", "source-one", 0, 12)
-            .unwrap()
-            .unwrap()
-            .byte_count,
-        bytes.len() as u64,
-    );
-    assert_eq!(
-        store
-            .read_retained_attachment(&reference, 12, 1024 * 1024, 17)
-            .unwrap()
-            .unwrap()
-            .as_slice(),
-        &[7; 17]
-    );
+    // Sizing and a small read of the chunked body and of the legacy array row
+    // (through `blob_open`) never build a whole-body value.
+    for (message, job) in [("one", &job), ("legacy", &legacy)] {
+        assert_eq!(
+            store
+                .retained_attachment_asset(GROUP, message, &format!("source-{message}"), 0, 12)
+                .unwrap()
+                .unwrap()
+                .byte_count,
+            bytes.len() as u64,
+        );
+        assert_eq!(
+            store
+                .read_retained_attachment(&job.reference, 12, 1024 * 1024, 17)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            &[7; 17]
+        );
+    }
 }
 
 /// Request and claim one slot whose source declares `bytes` as its plaintext.
@@ -759,6 +770,51 @@ fn attachment_publication_never_holds_more_than_one_chunk_in_a_sqlite_value() {
         )
         .unwrap();
     assert_eq!(bodies, 0);
+}
+
+#[test]
+fn chunk_publication_failing_mid_body_commits_nothing() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let body: Vec<u8> = (0..3 * ATTACHMENT_STAGING_CHUNK_BYTES + 5)
+        .map(|i| (i % 239) as u8)
+        .collect();
+    let job = claim_body(&store, "one", &body);
+    sql(
+        &store,
+        "CREATE TEMP TRIGGER fail_second_chunk BEFORE INSERT ON main.retained_attachment_chunks
+         WHEN NEW.offset>0 BEGIN SELECT RAISE(ABORT,'injected chunk failure'); END;",
+    );
+    assert!(
+        store
+            .complete_attachment_acquisition(&job, &body, 12, 1 << 30)
+            .is_err()
+    );
+    let rows: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM retained_attachment_bytes)+(SELECT count(*) FROM retained_attachment_files)
+                   +(SELECT count(*) FROM attachment_chunk_bodies)+(SELECT count(*) FROM retained_attachment_chunks)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
+    assert_eq!(store.retained_attachment_byte_count().unwrap(), 0);
+    // The rolled-back attempt still owns its lease and publishes once the
+    // fault is gone.
+    sql(&store, "DROP TRIGGER temp.fail_second_chunk");
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&job, &body, 12, 1 << 30)
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        body.len() as u64
+    );
 }
 
 #[test]

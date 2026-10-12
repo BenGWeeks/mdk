@@ -639,8 +639,8 @@ impl SqliteAccountStorage {
     /// runtime disk-pressure admission must reserve that overhead separately.
     /// A body larger than one `ATTACHMENT_STAGING_CHUNK_BYTES` chunk publishes
     /// as a completed chunked file, the layout the file sink's import produces,
-    /// so SQLite holds at most one chunk of it at a time; a smaller body stays
-    /// one array row. Either way publication is one transaction.
+    /// so no SQLite value holds more than one chunk of it; a body of at most one
+    /// chunk stays one array row. Either way publication is one transaction.
     pub fn complete_attachment_acquisition(
         &self,
         job: &AttachmentAcquisition,
@@ -1024,8 +1024,8 @@ fn insert_retained_array(conn: &Connection, token: &[u8], plaintext: &[u8]) -> S
 
 /// Publish a body larger than one staging chunk as a completed chunked file:
 /// an empty placeholder row keeps source and deletion ownership, the file row
-/// charges the quota once, and each chunk row binds one staging chunk, so
-/// SQLite never holds the whole body. The file is sealed after its last chunk,
+/// charges the quota once, and each chunk row binds one staging chunk, so no
+/// SQLite value holds more than one chunk. The file is sealed after its last chunk,
 /// since completed chunks are immutable, and before the state change that
 /// would discard an unfinished file. The enclosing transaction rolls every row
 /// back if any insert fails.
@@ -1069,11 +1069,16 @@ fn insert_retained_chunks(
         )
         .storage()?;
     }
-    conn.execute(
-        "UPDATE retained_attachment_files SET completed=1 WHERE token=?1 AND nonce=?2",
-        params![token, nonce],
-    )
-    .storage()?;
+    let sealed = conn
+        .execute(
+            "UPDATE retained_attachment_files SET completed=1 WHERE token=?1 AND nonce=?2",
+            params![token, nonce],
+        )
+        .storage()?;
+    // An unsealed file would be discarded by the state change that follows.
+    if sealed != 1 {
+        return Err(invalid("retained attachment file was not sealed"));
+    }
     Ok(())
 }
 

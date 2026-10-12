@@ -78,11 +78,11 @@
 
 - `complete_attachment_acquisition` publishes a body larger than one 64 KiB
   staging chunk as a completed chunked file, the layout the file sink's import
-  already produces, so SQLite holds at most one chunk of it and the insert
-  trigger never rewrites a body-sized row. Migration 0104 appends `byte_len`
+  already produces, so no SQLite value holds more than one chunk of it and the
+  insert trigger never rewrites a body-sized row. Migration 0104 appends `byte_len`
   after `bytes`, and SQLite expands a `zeroblob` that is not the record's last
-  field, so a pre-sized array row would still materialize the body. Smaller
-  bodies stay one array row (mdk#2241).
+  field, so a pre-sized array row would still materialize the body. A body of
+  at most one chunk stays one array row (mdk#2241).
 - `load_attachment_partial` sizes the restored prefix for the complete
   representation with a fallible reservation: a refused allocation is a
   storage error that keeps the checkpoint, not a process abort (mdk#2241).

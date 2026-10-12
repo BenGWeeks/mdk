@@ -1,5 +1,5 @@
 //! mdk#2241: publishing a received attachment must not multiply its size in
-//! memory, through either the in-memory array path or the file sink's chunked
+//! memory, through either the in-memory path or the file sink's chunked
 //! import. This binary holds a single test, measuring the two paths one after
 //! the other, so the process-wide SQLite and Rust allocation high-water marks
 //! measure only the publication under test.
@@ -180,13 +180,12 @@ fn publishing_a_large_body_adds_a_bounded_amount_of_memory() {
     );
     let (sqlite_peak, rust_peak) = end_window(window);
     eprintln!(
-        "MDK_BENCH attachment_publication path=array plaintext_bytes={} sqlite_peak_bytes={sqlite_peak} rust_peak_bytes={rust_peak}",
+        "MDK_BENCH attachment_publication path=memory plaintext_bytes={} sqlite_peak_bytes={sqlite_peak} rust_peak_bytes={rust_peak}",
         plaintext.len()
     );
     // The caller's buffer is the only whole-body copy: SQLite takes it one
-    // staging chunk per row through a page cache, whichever physical 0104
-    // layout the database has, and the publication path itself allocates no
-    // body-sized Rust buffer.
+    // staging chunk per row through a page cache, and the publication path
+    // itself allocates no body-sized Rust buffer.
     let budget = (8 * MIB) as u64;
     assert!(
         sqlite_peak < budget,
