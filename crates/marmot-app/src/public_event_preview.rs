@@ -545,7 +545,9 @@ pub(crate) fn is_addressable(kind: u32) -> bool {
 }
 
 fn is_replaceable(kind: u32) -> bool {
-    u16::try_from(kind).is_ok_and(|kind| nostr::event::Kind::from(kind).is_replaceable())
+    // NIP-01 coordinates exclude special SDK categories such as NIP-28
+    // channel metadata (kind 41), which is immutable by event ID here.
+    kind == 0 || kind == 3 || (10_000..20_000).contains(&kind)
 }
 
 fn event_kind(event: &Event) -> u32 {
@@ -1524,11 +1526,14 @@ impl PublicEventCache {
                         return Err(corrupt_evidence());
                     }
                 }
-                // An immutable event, or an addressable one whose identifier
-                // is too long to form a coordinate, is its own cohort and never
-                // fences one. Replaceable kinds always form a coordinate.
+                // Only an immutable event is its own cohort. Supported
+                // replaceable and addressable targets always form coordinates;
+                // oversized addressable identifiers are rejected on admission.
                 None => {
-                    if cohort != cache_key || record.fences_selection || is_replaceable(target_kind)
+                    if cohort != cache_key
+                        || record.fences_selection
+                        || is_replaceable(target_kind)
+                        || is_addressable(target_kind)
                     {
                         return Err(corrupt_evidence());
                     }
@@ -2315,7 +2320,8 @@ impl MarmotApp {
                 result,
             });
         }
-        self.attach_author_profiles(account, &mut reads);
+        let authors = Self::preview_authors(&reads);
+        self.attach_author_profiles(account, &mut reads, &authors);
         Ok(reads)
     }
 
@@ -2340,15 +2346,13 @@ impl MarmotApp {
         let key = reference.cache_key()?;
         let (result, metadata) =
             cache.admit_state_with_metadata(reference, candidates, unix_now())?;
-        if let PublicEventCacheResult::Present(preview) = &result
-            && let Ok(selected) = Event::from_json(&preview.event_json)
-        {
-            let author = selected.pubkey.to_hex();
+        let mut reads = vec![PublicEventCacheRead { key, result }];
+        let authors = Self::preview_authors(&reads);
+        if let Some((_, author)) = authors.first() {
             // Only the selected author's kind-0 enters the account's existing
             // directory store; a metadata failure never hides verified content.
             if !metadata.is_empty()
-                && let Err(error) =
-                    self.remember_account_profile_events(account, &author, &metadata)
+                && let Err(error) = self.remember_account_profile_events(account, author, &metadata)
             {
                 tracing::debug!(
                     target: "marmot_app::directory",
@@ -2358,34 +2362,47 @@ impl MarmotApp {
                 );
             }
         }
-        let mut reads = vec![PublicEventCacheRead { key, result }];
-        self.attach_author_profiles(account, &mut reads);
+        self.attach_author_profiles(account, &mut reads, &authors);
         reads.pop().ok_or_else(invalid_reference)
     }
 
-    fn attach_author_profiles(&self, account: &AccountSummary, reads: &mut [PublicEventCacheRead]) {
-        let authors: BTreeSet<String> = reads
+    fn preview_authors(reads: &[PublicEventCacheRead]) -> Vec<(usize, String)> {
+        reads
             .iter()
-            .filter_map(|read| match &read.result {
+            .enumerate()
+            .filter_map(|(index, read)| match &read.result {
                 PublicEventCacheResult::Present(preview) => Event::from_json(&preview.event_json)
                     .ok()
-                    .map(|event| event.pubkey.to_hex()),
+                    .map(|event| (index, event.pubkey.to_hex())),
                 _ => None,
             })
-            .collect();
+            .collect()
+    }
+
+    fn attach_author_profiles(
+        &self,
+        account: &AccountSummary,
+        reads: &mut [PublicEventCacheRead],
+        authors: &[(usize, String)],
+    ) {
         if authors.is_empty() {
             return;
         }
-        let authors: Vec<String> = authors.into_iter().collect();
+        let distinct: Vec<String> = authors
+            .iter()
+            .map(|(_, author)| author.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         // Enrichment is best effort and local-only: no profile request starts here.
-        let Ok(profiles) = self.account_scoped_profiles(account, &authors) else {
+        let Ok(profiles) = self.account_scoped_profiles(account, &distinct) else {
             return;
         };
-        for read in reads {
-            if let PublicEventCacheResult::Present(preview) = &mut read.result
-                && let Ok(event) = Event::from_json(&preview.event_json)
+        for (index, author) in authors {
+            if let Some(read) = reads.get_mut(*index)
+                && let PublicEventCacheResult::Present(preview) = &mut read.result
             {
-                preview.author_profile = profiles.get(&event.pubkey.to_hex()).cloned();
+                preview.author_profile = profiles.get(author).cloned();
             }
         }
     }

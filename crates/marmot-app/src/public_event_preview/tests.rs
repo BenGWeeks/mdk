@@ -211,6 +211,45 @@ fn normal_replaceable_coordinates_require_an_empty_identifier() {
 }
 
 #[test]
+fn channel_metadata_keeps_independent_immutable_deletion_cohorts() {
+    let (_dir, cache) = fixture();
+    let keys = Keys::generate();
+    let first = signed(&keys, 41, 1000, "first channel metadata");
+    let second = signed(&keys, 41, 1001, "second channel metadata");
+    assert!(address(&keys, 41).cache_key().is_err());
+    for event in [&first, &second] {
+        assert_eq!(
+            Some(event.id.to_hex()),
+            present_id(
+                &cache
+                    .admit_state(&id_reference(event), &[event.as_json()], 1002)
+                    .unwrap()
+            )
+        );
+    }
+    // An invalid kind-41 coordinate cannot delete either channel's metadata.
+    let broad = deletion(&keys, 1100, vec![a_tag(&keys, 41, "")]);
+    assert_eq!(
+        Some(first.id.to_hex()),
+        present_id(
+            &cache
+                .admit_state(&id_reference(&first), &[broad.as_json()], 1101)
+                .unwrap()
+        )
+    );
+    let exact = deletion(&keys, 1200, vec![e_tag(&first)]);
+    assert!(is_deleted(
+        &cache
+            .admit_state(&id_reference(&first), &[exact.as_json()], 1201)
+            .unwrap()
+    ));
+    assert_eq!(
+        Some(second.id.to_hex()),
+        present_id(&cache.lookup_state(&id_reference(&second), 1201).unwrap())
+    );
+}
+
+#[test]
 fn the_first_d_tag_determines_the_coordinate_even_when_it_has_no_value() {
     let (_dir, cache) = fixture();
     let keys = Keys::generate();
@@ -1554,12 +1593,27 @@ fn admission_reuses_verified_author_metadata_without_a_second_parse() {
             &[target.as_json(), profile.as_json()],
         )
         .unwrap();
-    assert!(matches!(read.result, PublicEventCacheResult::Present(_)));
+    let PublicEventCacheResult::Present(preview) = &read.result else {
+        panic!("signed target must remain present");
+    };
+    assert!(preview.author_profile.is_some());
     assert_eq!(
         METADATA_PARSE_COUNT.with(|count| count.get()),
         1,
         "the already verified profile was parsed again during directory admission"
     );
+    let cache = app.public_event_cache_for_account(&account).unwrap();
+    let missing = PublicEventReference::parse(&"ab".repeat(32)).unwrap();
+    let reads = app
+        .cached_public_events_with_cache(
+            &account,
+            &cache,
+            &[super_reference(&target), missing, super_reference(&target)],
+        )
+        .unwrap();
+    assert_eq!(reads[0], read);
+    assert_eq!(reads[1].result, PublicEventCacheResult::Missing);
+    assert_eq!(reads[2], read);
 }
 
 #[test]
