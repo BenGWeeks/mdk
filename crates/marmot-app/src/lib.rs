@@ -127,6 +127,10 @@ mod relay_telemetry_export;
 mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
+mod startup_diagnostics;
+pub use startup_diagnostics::{
+    NativeStartupObservation, NativeStartupOutcome, NativeStartupSnapshot, NativeStartupStage,
+};
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
 
@@ -533,6 +537,7 @@ pub struct MarmotApp {
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     product_analytics: ProductAnalytics,
+    startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     /// One signer-bound publisher per account. Setup publishes and the managed
     /// account worker share this client so the worker can reuse the same relay
@@ -1658,6 +1663,7 @@ impl MarmotApp {
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             product_analytics,
+            startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
@@ -1751,6 +1757,7 @@ impl MarmotApp {
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             product_analytics,
+            startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
@@ -6337,9 +6344,26 @@ impl MarmotApp {
         self.audit_export_lifecycle.admit(attempt, work).transpose()
     }
 
+    /// Observe account-open admission before analytics or cache locks; preserve the original storage result.
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
+        let probe = self
+            .startup_diagnostics
+            .observe_pending_open(NativeStartupStage::ProductAnalyticsAdmission);
+        let result = self.account_storage_observed(label, &probe);
+        probe.finish(result.is_ok());
+        result
+    }
+
+    /// Reuse the caller's scope across analytics admission and native open work; the caller owns retirement.
+    fn account_storage_observed(
+        &self,
+        label: &str,
+        probe: &startup_diagnostics::NativeStartupProbe,
+    ) -> Result<SqliteAccountStorage, AppError> {
+        probe.phase(NativeStartupStage::ProductAnalyticsAdmission);
         let permit = self.product_analytics.permit();
-        let result = self.account_storage_unobserved(label);
+        probe.phase(NativeStartupStage::AccountStorageCache);
+        let result = self.account_storage_unobserved(label, probe);
         if let Err(error) = &result {
             self.product_analytics
                 .storage_failure(permit.as_ref(), error);
@@ -6347,7 +6371,12 @@ impl MarmotApp {
         result
     }
 
-    fn account_storage_unobserved(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
+    /// Reuse a cached store or perform the guarded key/open path, reporting only fixed phases to the probe.
+    fn account_storage_unobserved(
+        &self,
+        label: &str,
+        probe: &startup_diagnostics::NativeStartupProbe,
+    ) -> Result<SqliteAccountStorage, AppError> {
         self.ensure_storage_open("account storage")?;
         if let Some(storage) = self
             .account_storages
@@ -6358,6 +6387,8 @@ impl MarmotApp {
         {
             return Ok(storage);
         }
+        probe.record_history();
+        probe.phase(NativeStartupStage::StorageAdmission);
         let _lifecycle = self.begin_storage_open("account storage")?;
         let _span = tracing::debug_span!(
             target: "marmot_app::storage",
@@ -6367,6 +6398,7 @@ impl MarmotApp {
         .entered();
         let path = self.account_storage_path(label);
         let lock = sqlcipher::database_open_lock(&path);
+        probe.phase(NativeStartupStage::DatabaseOpenLock);
         let database = lock.lock();
         // Another opener may have filled the cache while we waited. Hold the
         // database guard through key selection, migrations and publication.
@@ -6379,11 +6411,15 @@ impl MarmotApp {
         {
             return Ok(storage);
         }
+        probe.phase(NativeStartupStage::AccountResolution);
         let account = self.account_home().account(label)?;
         let key = if account.local_signing {
+            probe.phase(NativeStartupStage::SigningKeys);
             let keys = self.account_home().load_signing_keys(label)?;
+            probe.phase(NativeStartupStage::KeyDerivation);
             self.sqlcipher_key_locked(label, &keys, &database, SqlcipherDatabaseKind::Session)?
         } else {
+            probe.phase(NativeStartupStage::ExternalDatabaseSecret);
             self.external_sqlcipher_key(
                 label,
                 &account.account_id_hex,
@@ -6394,7 +6430,31 @@ impl MarmotApp {
         let migration_observation =
             self.product_analytics
                 .begin(ProductFamily::Storage, "migration", ProductUnit::Attempt);
-        let opened = SqliteAccountStorage::open_encrypted(&path, &key);
+        probe.phase(NativeStartupStage::EncryptedStoreOpen);
+        let observer = |progress| {
+            use storage_sqlite::{StorageOpenPhase as Phase, StorageOpenProgress as Progress};
+            match progress {
+                Progress::Phase(phase) => probe.phase(match phase {
+                    Phase::CipherConfiguration => NativeStartupStage::CipherConfiguration,
+                    Phase::CipherKeyApplication => NativeStartupStage::CipherKeyApplication,
+                    Phase::OperationalPragmas => NativeStartupStage::OperationalPragmas,
+                    Phase::MigrationInspection => NativeStartupStage::MigrationInspection,
+                }),
+                Progress::MigrationStarted(version) => {
+                    probe.progress(NativeStartupStage::MigrationApply, Some(version), false)
+                }
+                Progress::MigrationFinished { version, success } => probe.progress(
+                    if success {
+                        NativeStartupStage::MigrationInspection
+                    } else {
+                        NativeStartupStage::MigrationApply
+                    },
+                    Some(version),
+                    success,
+                ),
+            }
+        };
+        let opened = SqliteAccountStorage::open_encrypted_observed(&path, &key, &observer);
         if let Some(observation) = migration_observation {
             match &opened {
                 Ok(storage) if storage.migration_summary().0 > 0 => {
