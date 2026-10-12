@@ -109,7 +109,7 @@ fn sdk_filter(filter: &PublicEventQueryFilter) -> Option<Filter> {
                 .authors([PublicKey::parse(author_hex).ok()?])
                 .limit(4);
             // Ordinary replaceable kinds carry no `d` tag.
-            if (30_000..40_000).contains(kind) {
+            if crate::public_event_preview::is_addressable(u32::from(*kind)) {
                 filter.custom_tags(tag('d')?, [identifier.clone()])
             } else {
                 filter

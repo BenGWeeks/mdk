@@ -540,7 +540,7 @@ fn normalized_hex64(value: &str) -> Option<String> {
     is_hex64(value).then(|| value.to_ascii_lowercase())
 }
 
-fn is_addressable(kind: u32) -> bool {
+pub(crate) fn is_addressable(kind: u32) -> bool {
     u16::try_from(kind).is_ok_and(|kind| nostr::event::Kind::from(kind).is_addressable())
 }
 
@@ -679,7 +679,8 @@ fn parse_verified(json: &str) -> Option<Event> {
 
 /// Every admitted target keeps its full deletion semantics within the same coordinate budget.
 fn supported_target(event: &Event) -> bool {
-    !is_addressable(event_kind(event)) || first_d_tag(event).len() <= 1024
+    !is_addressable(event_kind(event))
+        || first_d_tag(event).len() <= MAX_COORDINATE_IDENTIFIER_BYTES
 }
 
 fn verified_event(json: &str, reference: &PublicEventReference) -> Option<Event> {
@@ -2530,8 +2531,5 @@ impl MarmotApp {
 }
 
 fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    crate::unix_now_seconds()
 }
