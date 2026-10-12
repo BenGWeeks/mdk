@@ -660,6 +660,107 @@ fn attachment_small_reads_do_not_materialize_the_whole_blob() {
     );
 }
 
+/// Request and claim one slot whose source declares `bytes` as its plaintext.
+fn claim_body(store: &SqliteAccountStorage, message: &str, bytes: &[u8]) -> AttachmentAcquisition {
+    let hash: [u8; 32] = Sha256::digest(bytes).into();
+    let mut event = source(message);
+    event.tags[0][2] = format!("x {}", hex::encode(hash));
+    store.record_app_event(&event).unwrap();
+    let mut selection = selected(message);
+    selection.slot = serde_json::to_value(&event.tags[0]).unwrap();
+    let AttachmentDemand::Requested(reference) = store
+        .request_attachment_acquisition(GROUP, &selection, hash, 11)
+        .unwrap()
+    else {
+        panic!("missing demand")
+    };
+    store
+        .claim_attachment_acquisition(&reference, 11, 100)
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn attachment_publication_never_holds_more_than_one_chunk_in_a_sqlite_value() {
+    const CHUNK: usize = ATTACHMENT_STAGING_CHUNK_BYTES;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "array");
+    seed(&store, "chunked");
+    let array: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
+    let chunked: Vec<u8> = (0..3 * CHUNK + 5).map(|i| (i % 241) as u8).collect();
+    let array_job = claim_body(&store, "array", &array);
+    let chunked_job = claim_body(&store, "chunked", &chunked);
+    {
+        let conn = store.lock().unwrap();
+        // SAFETY: the guard exclusively owns this live connection. Any value
+        // longer than one staging chunk, such as a whole-body zeroblob or
+        // record, now fails deterministically instead of being allocated.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_LENGTH,
+                CHUNK as i32 + 1024,
+            );
+        }
+    }
+    for (job, body) in [(&array_job, &array), (&chunked_job, &chunked)] {
+        assert_eq!(
+            store
+                .complete_attachment_acquisition(job, body, 12, 1 << 30)
+                .unwrap(),
+            AttachmentPublishResult::Published
+        );
+    }
+    let (files, chunks): (i64, i64) = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM retained_attachment_files WHERE completed=1),
+                    (SELECT count(*) FROM retained_attachment_chunks)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    // One staging chunk stays an array row; a larger body is one sealed file.
+    assert_eq!((files, chunks), (1, 4));
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        (array.len() + chunked.len()) as u64
+    );
+    for (message, body) in [("array", &array), ("chunked", &chunked)] {
+        let asset = store
+            .retained_attachment_asset(GROUP, message, &format!("source-{message}"), 0, 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.byte_count, body.len() as u64);
+        for (offset, len) in [(0, 17), (CHUNK - 6, 20), (body.len() - 3, 3)] {
+            assert_eq!(
+                store
+                    .read_retained_attachment(&asset.reference, 12, offset as u64, len)
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                &body[offset..(offset + len).min(body.len())]
+            );
+        }
+    }
+    assert!(store.remove_local_attachment(GROUP, "chunked", 0).unwrap());
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        array.len() as u64
+    );
+    let bodies: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM attachment_chunk_bodies)+(SELECT count(*) FROM retained_attachment_chunks)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bodies, 0);
+}
+
 #[test]
 fn attachment_policy_park_resumes_on_readmission_but_terminal_failure_does_not() {
     let dir = tempfile::tempdir().unwrap();
@@ -3843,9 +3944,9 @@ fn storage_park_after_a_receipt_keeps_automatic_history_attemptable() {
     assert_eq!(read(&store, &asset), BODY);
 }
 
-/// mdk#2241: legacy array publication declares `byte_len` on insert and copies
-/// through incremental BLOB writes, so the insert trigger charges the quota
-/// without rewriting the row and SQLite never binds a second plaintext copy.
+/// mdk#2241: a body of at most one staging chunk publishes as an array row that
+/// declares `byte_len` on insert and copies through an incremental BLOB write,
+/// so the insert trigger charges the quota without rewriting the row.
 #[test]
 fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
     let store = SqliteAccountStorage::in_memory().unwrap();

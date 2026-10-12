@@ -183,9 +183,10 @@ fn publishing_a_large_body_adds_a_bounded_amount_of_memory() {
         "MDK_BENCH attachment_publication path=array plaintext_bytes={} sqlite_peak_bytes={sqlite_peak} rust_peak_bytes={rust_peak}",
         plaintext.len()
     );
-    // The caller's buffer is the only whole-body copy: SQLite streams it into
-    // a pre-sized row through bounded blob writes and a page cache, and the
-    // publication path itself allocates no body-sized Rust buffer.
+    // The caller's buffer is the only whole-body copy: SQLite takes it one
+    // staging chunk per row through a page cache, whichever physical 0104
+    // layout the database has, and the publication path itself allocates no
+    // body-sized Rust buffer.
     let budget = (8 * MIB) as u64;
     assert!(
         sqlite_peak < budget,

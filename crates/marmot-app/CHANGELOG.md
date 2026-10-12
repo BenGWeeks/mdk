@@ -164,9 +164,9 @@
   it grows holds at most 1.5 times it; a failed reservation is a transient
   failure, not an abort), decrypted
   in place, explicit downloads above the automatic transfer limit stream
-  through the existing private file sink, and in-memory publication writes
-  the row at its final length through bounded incremental BLOB writes so
-  SQLite keeps no bind, record or trigger-rewrite copy. Integrity checks,
+  through the existing private file sink, and in-memory publication stores
+  a body larger than one 64 KiB staging chunk as chunk rows, so SQLite keeps
+  no bind, record or trigger-rewrite copy of it. Integrity checks,
   resume and retention behavior are unchanged. A job that learned it needs the
   file sink remembers it, so only its first attempt spends a header-only
   request before the file sink reopens the URL (#2241).

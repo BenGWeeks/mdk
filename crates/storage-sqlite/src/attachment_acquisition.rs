@@ -637,9 +637,10 @@ impl SqliteAccountStorage {
     /// verifies the parser-supplied plaintext hash, but cannot authenticate AEAD.
     /// Quota counts retained plaintext bytes, not SQLite/WAL filesystem overhead;
     /// runtime disk-pressure admission must reserve that overhead separately.
-    /// Publication reserves the row at its final length and copies the caller's
-    /// buffer through incremental BLOB writes of `ATTACHMENT_STAGING_CHUNK_BYTES`,
-    /// so SQLite never binds, records or trigger-rewrites a second plaintext copy.
+    /// A body larger than one `ATTACHMENT_STAGING_CHUNK_BYTES` chunk publishes
+    /// as a completed chunked file, the layout the file sink's import produces,
+    /// so SQLite holds at most one chunk of it at a time; a smaller body stays
+    /// one array row. Either way publication is one transaction.
     pub fn complete_attachment_acquisition(
         &self,
         job: &AttachmentAcquisition,
@@ -656,7 +657,11 @@ impl SqliteAccountStorage {
             {
                 return Ok(refused);
             }
-            insert_retained_array(&conn, &job.reference.token, plaintext)?;
+            if plaintext.len() > ATTACHMENT_STAGING_CHUNK_BYTES {
+                insert_retained_chunks(&conn, job, plaintext)?;
+            } else {
+                insert_retained_array(&conn, &job.reference.token, plaintext)?;
+            }
             conn.execute(
                 "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0,storage_park_floor=0 WHERE token=?1",
                 [&job.reference.token],
@@ -981,12 +986,13 @@ impl SqliteAccountStorage {
     }
 }
 
-/// Insert a legacy array body without materializing it inside SQLite. The row is
+/// Insert a body of at most one staging chunk as an array row. The row is
 /// created at its final `byte_len` over a `zeroblob`, so the insert trigger
 /// charges the quota from the declared length instead of rewriting the row, and
-/// the bytes arrive through bounded incremental BLOB writes that bypass both the
-/// statement bind copy and the update trigger. The enclosing transaction rolls
-/// the reservation back if any chunk fails.
+/// the bytes arrive through an incremental BLOB write. Where migration 0104
+/// appended `byte_len` after `bytes`, SQLite expands the `zeroblob` to build the
+/// record, which is why larger bodies take `insert_retained_chunks`. The
+/// enclosing transaction rolls the reservation back if the write fails.
 fn insert_retained_array(conn: &Connection, token: &[u8], plaintext: &[u8]) -> StorageResult<()> {
     if plaintext.is_empty() {
         conn.execute(
@@ -1013,6 +1019,61 @@ fn insert_retained_array(conn: &Connection, token: &[u8], plaintext: &[u8]) -> S
             .storage()?;
     }
     blob.close().storage()?;
+    Ok(())
+}
+
+/// Publish a body larger than one staging chunk as a completed chunked file:
+/// an empty placeholder row keeps source and deletion ownership, the file row
+/// charges the quota once, and each chunk row binds one staging chunk, so
+/// SQLite never holds the whole body. The file is sealed after its last chunk,
+/// since completed chunks are immutable, and before the state change that
+/// would discard an unfinished file. The enclosing transaction rolls every row
+/// back if any insert fails.
+fn insert_retained_chunks(
+    conn: &Connection,
+    job: &AttachmentAcquisition,
+    plaintext: &[u8],
+) -> StorageResult<()> {
+    let token = &job.reference.token;
+    let nonce: Vec<u8> = conn
+        .query_row("SELECT randomblob(16)", [], |row| row.get(0))
+        .storage()?;
+    conn.execute(
+        "INSERT INTO attachment_chunk_bodies(nonce) VALUES(?1)",
+        [&nonce],
+    )
+    .storage()?;
+    conn.execute(
+        "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,0,x'')",
+        [token],
+    )
+    .storage()?;
+    conn.execute(
+        "INSERT INTO retained_attachment_files(token,nonce,attempt,byte_len) VALUES(?1,?2,?3,?4)",
+        params![
+            token,
+            nonce,
+            job.attempt,
+            u64_to_i64(plaintext.len() as u64)?
+        ],
+    )
+    .storage()?;
+    for (index, chunk) in plaintext.chunks(ATTACHMENT_STAGING_CHUNK_BYTES).enumerate() {
+        conn.execute_cached(
+            "INSERT INTO retained_attachment_chunks(token,offset,bytes) VALUES(?1,?2,?3)",
+            params![
+                nonce,
+                u64_to_i64((index * ATTACHMENT_STAGING_CHUNK_BYTES) as u64)?,
+                chunk
+            ],
+        )
+        .storage()?;
+    }
+    conn.execute(
+        "UPDATE retained_attachment_files SET completed=1 WHERE token=?1 AND nonce=?2",
+        params![token, nonce],
+    )
+    .storage()?;
     Ok(())
 }
 
