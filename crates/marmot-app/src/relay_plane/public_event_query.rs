@@ -4,7 +4,7 @@
 //! requests by a known author, and that author's kind-0 metadata can be asked
 //! for. Every request uses a fresh anonymous SDK client whose only WebSocket
 //! transport is [`PinnedPublicEventTransport`]: endpoints pass
-//! [`super::RelaySafetyPolicy`], hostnames are resolved once, every address is
+//! [`super::RelaySafetyPolicy`], each dial resolves its hostname once, every address is
 //! validated and each dial pins its resolved socket before TLS (see
 //! `public_event_transport.rs`). At most four relays, the caller's absolute
 //! deadline, a raw wire-byte budget charged below TLS/WebSocket parsing and an

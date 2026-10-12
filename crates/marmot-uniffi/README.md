@@ -657,7 +657,7 @@ Every payload carries `projectionVersion` (currently 1).
 `resolvePublicEventPreview(accountRef, reference)` performs the bounded native refresh and returns the resulting
 local state. It asks at most four safe relays (up to two ephemeral reference hints, then the configured directory
 relays) for the exact event ID or complete coordinate, then NIP-09 deletion requests and kind-0 metadata from the
-actual target author, within ten seconds and sixteen events / 4 MiB overall. Every relay hostname is resolved once,
+actual target author, within ten seconds and sixteen events / 4 MiB overall. Each dial resolves its relay hostname once;
 each address must be public, and the connection is pinned to a validated address while TLS still verifies the
 original hostname; no proxy is used. The byte budget counts raw received wire bytes, including TLS and HTTP
 handshakes and every WebSocket frame and fragment, before they are parsed; the event budget counts every relay

@@ -4461,7 +4461,7 @@ must enforce those separately and bound any untrusted JSON before passing it.
 </details>
 
 <details>
-<summary>Verified public event preview cache</summary>
+<summary>Audit telemetry</summary>
 
 ### `Marmot::post_audit_log_tracker_update_v5`
 
@@ -4529,7 +4529,7 @@ Validate and persist up to 16 signed event JSON candidates (each at most 256 KiB
 pub fn cached_public_event_previews( &self, account_ref: String, references: Vec<String>, ) -> Result<Vec<PublicEventCacheReadFfi>, MarmotKitError>
 ```
 
-Synchronous, network-free cached reads for first-frame state. Returns exactly one `PublicEventCacheReadFfi` per input, in input order and including duplicates; at most 16 references of at most 5,000 bytes each, and the whole request is validated before storage is opened, so one invalid reference fails the call. Each row is `Present` (with a `projection_version` 1 preview and optional cached author profile), `AuthoritativeDeleted` (with the author's signed deletion request), `Missing` (no local knowledge; never durable negative truth) or `Busy` (account lifecycle work is running; retry later, never treat it as a miss). Signatures, reference identity and stored deletion evidence are rechecked on every read; corrupt evidence or an unknown projection version is an error. `refresh_recommended` becomes true for a coordinate after 15 minutes, while immutable event IDs remain reusable. The cache keeps at most 1,024 records and 32 MiB per account. Render a hit before refreshing and keep results with the originating account.
+Synchronous, network-free cached reads for first-frame state. Returns exactly one `PublicEventCacheReadFfi` per input, in input order and including duplicates; at most 16 references of at most 5,000 bytes each, and the whole request is validated before storage is opened, so one invalid reference fails the call. Each row is `Present` (with a `projection_version` 1 preview and optional cached author profile), `AuthoritativeDeleted` (with the author's signed deletion request), `Missing` (no local knowledge; never durable negative truth) or `Busy` (retryable lifecycle, cache or refresh contention; retry later, never treat it as a miss). Signatures, reference identity and stored deletion evidence are rechecked on every read; corrupt evidence or an unknown projection version is an error. `refresh_recommended` becomes true for a coordinate after 15 minutes, while immutable event IDs remain reusable. The cache keeps at most 1,024 records and 32 MiB per account. Render a hit before refreshing and keep results with the originating account.
 
 [Source](src/commands/public_event_preview.rs#L143)
 
@@ -4539,7 +4539,7 @@ Synchronous, network-free cached reads for first-frame state. Returns exactly on
 pub async fn resolve_public_event_preview( &self, account_ref: String, reference: String, ) -> Result<PublicEventCacheReadFfi, MarmotKitError>
 ```
 
-Bounded native refresh for one reference, then the resulting local state. Queries at most four safe relays (up to two ephemeral reference hints, then configured directory relays) for the exact event ID or complete coordinate, then kind-5 deletion requests and kind-0 metadata from the actual target author only, within ten seconds and sixteen received events / 4 MiB overall. It never fetches references inside event content. Concurrent calls for one reference share a single request, and an attempted refresh is not repeated for 30 seconds (in memory only). An empty or failed refresh keeps prior content; a deleted event ID is not queried again. No account guard is held across the network, and results are discarded if the account was removed, wiped, reimported or closed meanwhile.
+Bounded native refresh for one reference, then the resulting local state. Queries at most four safe relays (up to two ephemeral reference hints, then configured directory relays) for the exact event ID or complete coordinate, then kind-5 deletion requests and kind-0 metadata from the actual target author only, within ten seconds and sixteen received events / 4 MiB overall. It never fetches references inside event content. Concurrent calls for one reference share a single request, and a refresh reaching persistence starts a 30-second in-memory cooldown. Cancellation during network acquisition starts none. An empty or failed refresh keeps prior content; a deleted event ID is not queried again. No account guard is held across the network, and results are discarded if the account was removed, wiped, reimported or closed meanwhile.
 
 [Source](src/commands/public_event_preview.rs#L173)
 
