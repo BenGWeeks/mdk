@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- `MarmotKitError` adds `ModerationReportingNotConfigured`,
+  `InvalidModerationReportConfig`, `InvalidReportedPublicKey`, `CannotReportSelf`
+  and `ModerationReportRateLimited`. Regenerate bindings with the matching
+  library and update exhaustive Swift `switch` / Kotlin `when` handling.
+
 - `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
   a binding default. Regenerate matching Swift/Kotlin bindings and pass `nil`
   (Swift) or `null` (Kotlin) in host record initializers without a typed preview.
@@ -28,6 +33,12 @@
 
 ### Added
 
+- `submit_moderation_report`, `moderation_reporting_available` and
+  `configure_moderation_reporting` add private, NIP-59 gift-wrapped NIP-56
+  reports to the deployment's moderation team (`ModerationReportOriginFfi`,
+  `ModerationReportOutcomeFfi`). `MarmotOptions.moderation_report_config` is
+  optional, defaults to unset, and is set per build flavor. This is additive:
+  `report_message`, `content_reports` and `dismiss_reports` are unchanged.
 - `capture_chat_list_selection` and the `ChatListSelection` object expose complete
   fixed-view count, revision-fenced ID pages, deselection, remove-only action
   revalidation and terminal close. Three typed selection errors distinguish

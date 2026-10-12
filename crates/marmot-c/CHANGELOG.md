@@ -9,9 +9,16 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_submit_moderation_report`, `marmot_moderation_reporting_available`,
+  `marmot_configure_moderation_reporting` and
+  `marmot_moderation_report_outcome_free` mirror the private moderation-report
+  calls. `MarmotModerationReportOrigin` and `MarmotModerationReportOutcome` are new
+  types, and statuses 96–100 cover the new errors. `MarmotClientOptions` is
+  unchanged; configure the destination with the new call. These are new symbols,
+  so use the matching header and library.
 - Fixed-view `MarmotChatListSelection` capture/count/page/deselect/revalidate/
   close/free calls and owned summary/page deep frees. Append selection closed,
-  stale and invalid-page statuses96–98 without changing existing values.
+  stale and invalid-page statuses 101–103 without changing existing values.
   Capture and local mutations preflight output pointers; close is terminal.
   Rebuild with matching headers/libraries. Automatic-folder predicates remain separate.
 
