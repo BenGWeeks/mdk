@@ -1030,6 +1030,17 @@ async fn wait_for_runtime_shutdown(stopping: &mut watch::Receiver<bool>) {
     }
 }
 
+async fn wait_for_account_reset(resets: &mut broadcast::Receiver<String>, label: &str) {
+    loop {
+        match resets.recv().await {
+            Ok(reset) if reset == label => return,
+            // A lost teardown signal is terminal, never a reason to rebind a handle.
+            Err(_) => return,
+            _ => {}
+        }
+    }
+}
+
 fn runtime_shutdown_requested(stopping: &watch::Receiver<bool>) -> bool {
     *stopping.borrow()
 }

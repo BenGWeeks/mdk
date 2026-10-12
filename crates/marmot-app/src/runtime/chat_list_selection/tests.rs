@@ -12,6 +12,15 @@ struct Fixture {
 }
 impl Fixture {
     fn new(count: usize) -> Self {
+        let fixture = Self::new_unprepared(count);
+        fixture
+            .store
+            .refresh_chat_list_rows(&fixture.account_id, &|_, _| false)
+            .unwrap();
+        fixture
+    }
+
+    fn new_unprepared(count: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")
@@ -52,9 +61,6 @@ impl Fixture {
                 120,
             )
             .unwrap();
-        store
-            .refresh_chat_list_rows(&account.account_id_hex, &|_, _| false)
-            .unwrap();
         let runtime = MarmotAppRuntime::new(app.clone());
         Self {
             _dir: dir,
@@ -63,6 +69,52 @@ impl Fixture {
             store,
             account_id: account.account_id_hex,
         }
+    }
+}
+
+#[tokio::test]
+async fn capture_prepares_multiple_base_batches_before_returning_a_complete_selection() {
+    let f = Fixture::new_unprepared(101);
+    let handle = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        f.runtime
+            .capture_chat_list_selection("alice", ChatListView::Chats),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(handle.count().await.unwrap().count, 101);
+    assert_eq!(handle.page(0, 0, 200).await.unwrap().group_ids.len(), 101);
+    handle.close();
+}
+
+#[tokio::test]
+async fn pending_base_capture_is_cancelled_by_reset_or_shutdown() {
+    for shutdown in [false, true] {
+        let f = Fixture::new_unprepared(101);
+        let capture = f
+            .runtime
+            .capture_chat_list_selection("alice", ChatListView::Chats);
+        tokio::pin!(capture);
+        tokio::select! {
+            result = &mut capture => panic!("capture returned before base preparation: {}", result.is_ok()),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {},
+        }
+        if shutdown {
+            f.runtime.shared.lifecycle().begin_shutdown();
+        } else {
+            f.app
+                .presentation_signals
+                .account_resets
+                .send("alice".into())
+                .unwrap();
+        }
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), capture)
+                .await
+                .unwrap(),
+            Err(ChatSelectionError::Closed)
+        ));
     }
 }
 
