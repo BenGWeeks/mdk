@@ -831,3 +831,5 @@ mod account_attachment_history;
 pub use account_attachment_history::*;
 mod attachment_management;
 pub use attachment_management::*;
+mod startup_diagnostics;
+pub use startup_diagnostics::*;

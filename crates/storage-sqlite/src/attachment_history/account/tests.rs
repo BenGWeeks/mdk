@@ -27,6 +27,17 @@ fn global_albums_equal_times_and_sparse_chats_page_once() {
                 )
                 .unwrap();
             assert!(page.entries.len() <= limit);
+            for entry in &page.entries {
+                let attachment = &entry.attachment;
+                assert_eq!(attachment.sender, "11".repeat(32));
+                assert_eq!(attachment.source_message_id_hex, attachment.message_id_hex);
+                assert_eq!(attachment.source_epoch, Some(0));
+                let expected_at = if entry.group_id_hex == "cc" { 8 } else { 9 };
+                assert_eq!(attachment.timeline_at, expected_at);
+                assert_eq!(attachment.received_at, expected_at);
+                assert_eq!(attachment.slot, serde_json::json!(["imeta", "v future"]));
+                assert!(attachment.emoji_tags.is_empty());
+            }
             result.extend(page.entries.iter().map(|e| {
                 (
                     e.group_id_hex.clone(),
@@ -58,8 +69,8 @@ fn filtered_empty_page_keeps_its_authoritative_continuation() {
     let query = AccountAttachmentQuery {
         groups: vec!["BB".into(), "bb".into()],
         senders: vec!["11".repeat(32)],
-        after: Some(9),
-        before: Some(10),
+        min_timeline_at: Some(9),
+        max_timeline_at: Some(10),
     };
     let first = s.account_attachment_history_page(&query, 3, None).unwrap();
     assert!(first.entries.is_empty());
@@ -179,8 +190,8 @@ fn invalid_bounds_ids_ceilings_and_oversized_metadata_fail_without_partial_resul
             ..Default::default()
         },
         AccountAttachmentQuery {
-            after: Some(10),
-            before: Some(9),
+            min_timeline_at: Some(10),
+            max_timeline_at: Some(9),
             ..Default::default()
         },
     ] {

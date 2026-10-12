@@ -58,3 +58,4 @@ pub use attachment_controls::AttachmentTransferSubscription;
 mod account_attachment_history;
 mod attachment_management;
 pub use attachment_management::AttachmentManagementSubscription;
+mod startup_diagnostics;

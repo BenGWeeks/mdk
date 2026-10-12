@@ -1035,6 +1035,8 @@ pub use controls::{
 };
 
 mod outgoing;
+#[cfg(test)]
+pub(crate) use outgoing::copy_staged_body_for_test;
 pub use outgoing::{ATTACHMENT_STAGING_CHUNK_BYTES, AttachmentUploadSource};
 
 mod management;

@@ -175,3 +175,5 @@ pub use attachment_acquisition::{
 };
 
 pub use attachment_acquisition::AttachmentManagementPermission;
+mod open_progress;
+pub use open_progress::{StorageOpenPhase, StorageOpenProgress};

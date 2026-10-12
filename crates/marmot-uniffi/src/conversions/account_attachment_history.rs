@@ -6,16 +6,18 @@ use std::sync::Arc;
 pub struct AccountAttachmentQueryFfi {
     pub groups: Vec<String>,
     pub senders: Vec<String>,
-    pub after: Option<u64>,
-    pub before: Option<u64>,
+    /// Inclusive lower timeline timestamp bound; absent means unbounded.
+    pub min_timeline_at: Option<u64>,
+    /// Inclusive upper timeline timestamp bound; absent means unbounded.
+    pub max_timeline_at: Option<u64>,
 }
 impl From<AccountAttachmentQueryFfi> for app::AccountAttachmentQuery {
     fn from(v: AccountAttachmentQueryFfi) -> Self {
         Self {
             groups: v.groups,
             senders: v.senders,
-            after: v.after,
-            before: v.before,
+            min_timeline_at: v.min_timeline_at,
+            max_timeline_at: v.max_timeline_at,
         }
     }
 }
@@ -59,8 +61,8 @@ impl std::fmt::Debug for AccountAttachmentEntryFfi {
 pub struct AccountAttachmentPageFfi {
     pub entries: Vec<AccountAttachmentEntryFfi>,
     pub version: Arc<AccountAttachmentVersion>,
+    /// Continue while present, including when this filtered page has no entries.
     pub next_cursor: Option<Arc<AccountAttachmentCursor>>,
-    pub has_more: bool,
     pub next_expiry: Option<u64>,
 }
 #[derive(Clone, Debug, uniffi::Enum)]
@@ -70,7 +72,6 @@ pub enum AccountAttachmentPageReadFfi {
     CursorMismatch,
     InvalidQuery,
     InvalidLimit,
-    ResponseTooLarge,
 }
 impl From<app::AccountAttachmentPageRead> for AccountAttachmentPageReadFfi {
     fn from(v: app::AccountAttachmentPageRead) -> Self {
@@ -88,7 +89,6 @@ impl From<app::AccountAttachmentPageRead> for AccountAttachmentPageReadFfi {
                         })
                         .collect(),
                     version: Arc::new(AccountAttachmentVersion { inner: p.version }),
-                    has_more: p.next_cursor.is_some(),
                     next_cursor: p
                         .next_cursor
                         .map(|inner| Arc::new(AccountAttachmentCursor { inner })),
@@ -98,7 +98,6 @@ impl From<app::AccountAttachmentPageRead> for AccountAttachmentPageReadFfi {
             app::AccountAttachmentPageRead::CursorMismatch => Self::CursorMismatch,
             app::AccountAttachmentPageRead::InvalidQuery => Self::InvalidQuery,
             app::AccountAttachmentPageRead::InvalidLimit => Self::InvalidLimit,
-            app::AccountAttachmentPageRead::ResponseTooLarge => Self::ResponseTooLarge,
         }
     }
 }

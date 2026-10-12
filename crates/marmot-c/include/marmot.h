@@ -844,6 +844,36 @@ typedef enum MarmotReportReason {
   MARMOT_REPORT_REASON_OTHER,
 } MarmotReportReason;
 
+typedef enum MarmotNativeStartupStage {
+  MARMOT_NATIVE_STARTUP_STAGE_ATTACHMENT_TASK_QUEUED,
+  MARMOT_NATIVE_STARTUP_STAGE_ACCOUNT_RESOLUTION,
+  MARMOT_NATIVE_STARTUP_STAGE_ACCOUNT_STORAGE_CACHE,
+  MARMOT_NATIVE_STARTUP_STAGE_STORAGE_ADMISSION,
+  MARMOT_NATIVE_STARTUP_STAGE_DATABASE_OPEN_LOCK,
+  MARMOT_NATIVE_STARTUP_STAGE_SIGNING_KEYS,
+  MARMOT_NATIVE_STARTUP_STAGE_EXTERNAL_DATABASE_SECRET,
+  MARMOT_NATIVE_STARTUP_STAGE_KEY_DERIVATION,
+  MARMOT_NATIVE_STARTUP_STAGE_SALT_READ,
+  MARMOT_NATIVE_STARTUP_STAGE_RECOVERY_PROBE,
+  MARMOT_NATIVE_STARTUP_STAGE_RECOVERY_REKEY,
+  MARMOT_NATIVE_STARTUP_STAGE_ENCRYPTED_STORE_OPEN,
+  MARMOT_NATIVE_STARTUP_STAGE_CIPHER_CONFIGURATION,
+  MARMOT_NATIVE_STARTUP_STAGE_CIPHER_KEY_APPLICATION,
+  MARMOT_NATIVE_STARTUP_STAGE_OPERATIONAL_PRAGMAS,
+  MARMOT_NATIVE_STARTUP_STAGE_MIGRATION_INSPECTION,
+  MARMOT_NATIVE_STARTUP_STAGE_MIGRATION_APPLY,
+  MARMOT_NATIVE_STARTUP_STAGE_ATTACHMENT_LOCAL_READ,
+  MARMOT_NATIVE_STARTUP_STAGE_ATTACHMENT_FUTURE_WAIT,
+  MARMOT_NATIVE_STARTUP_STAGE_PRODUCT_ANALYTICS_ADMISSION,
+} MarmotNativeStartupStage;
+
+typedef enum MarmotNativeStartupOutcome {
+  MARMOT_NATIVE_STARTUP_OUTCOME_ACTIVE,
+  MARMOT_NATIVE_STARTUP_OUTCOME_SUCCESS,
+  MARMOT_NATIVE_STARTUP_OUTCOME_FAILURE,
+  MARMOT_NATIVE_STARTUP_OUTCOME_ABANDONED,
+} MarmotNativeStartupOutcome;
+
 /**
  * Why a timeline delta fired.
  */
@@ -1536,7 +1566,6 @@ typedef struct MarmotAccountAttachmentPage {
   uintptr_t entries_len;
   struct MarmotAccountAttachmentVersion *version;
   struct MarmotAccountAttachmentCursor *next_cursor;
-  bool has_more;
   bool has_next_expiry;
   uint64_t next_expiry;
 } MarmotAccountAttachmentPage;
@@ -1547,7 +1576,6 @@ typedef enum MarmotAccountAttachmentPageRead_Tag {
   MARMOT_ACCOUNT_ATTACHMENT_PAGE_READ_CURSOR_MISMATCH,
   MARMOT_ACCOUNT_ATTACHMENT_PAGE_READ_INVALID_QUERY,
   MARMOT_ACCOUNT_ATTACHMENT_PAGE_READ_INVALID_LIMIT,
-  MARMOT_ACCOUNT_ATTACHMENT_PAGE_READ_RESPONSE_TOO_LARGE,
 } MarmotAccountAttachmentPageRead_Tag;
 
 typedef struct MarmotAccountAttachmentPageRead_Page_Body {
@@ -1562,17 +1590,17 @@ typedef struct MarmotAccountAttachmentPageRead {
 } MarmotAccountAttachmentPageRead;
 
 /**
- * Borrowed arrays, at most100 entries each. Empty means all; has_after/has_before are uint8_t flags.
+ * Borrowed arrays, at most 100 entries each. Empty means all; has_min_timeline_at/has_max_timeline_at are uint8_t flags.
  */
 typedef struct MarmotAccountAttachmentQuery {
   const char *const *groups;
   uintptr_t groups_len;
   const char *const *senders;
   uintptr_t senders_len;
-  uint8_t has_after;
-  uint64_t after;
-  uint8_t has_before;
-  uint64_t before;
+  uint8_t has_min_timeline_at;
+  uint64_t min_timeline_at;
+  uint8_t has_max_timeline_at;
+  uint64_t max_timeline_at;
 } MarmotAccountAttachmentQuery;
 
 /**
@@ -4639,6 +4667,30 @@ typedef struct MarmotModerationReportOutcome {
   enum MarmotSendAcceptDisposition accept_disposition;
 } MarmotModerationReportOutcome;
 
+typedef struct MarmotNativeStartupObservation {
+  uint64_t token;
+  enum MarmotNativeStartupStage stage;
+  uint64_t elapsed_ms;
+  uint64_t stage_elapsed_ms;
+  bool has_migration_version;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint32_t migration_version;
+  uint32_t migrations_completed;
+  enum MarmotNativeStartupOutcome outcome;
+} MarmotNativeStartupObservation;
+
+typedef struct MarmotNativeStartupSnapshot {
+  bool enabled;
+  struct MarmotNativeStartupObservation *active;
+  uintptr_t active_len;
+  struct MarmotNativeStartupObservation *events;
+  uintptr_t events_len;
+  uint64_t dropped_events;
+  uint64_t dropped_scopes;
+} MarmotNativeStartupSnapshot;
+
 /**
  * Borrowed private input. Its path is local only and is never published.
  */
@@ -5934,7 +5986,7 @@ MarmotStatus marmot_account_attachment_version_clone(const struct MarmotAccountA
                                                      struct MarmotAccountAttachmentVersion **out);
 
 /**
- * Blocking local read; call off the UI thread. Limit is1..=100 candidates, not a filtered row target.
+ * Blocking local read; call off the UI thread. Limit is 1..=100 candidates, not a filtered row target.
  * # Safety
  * Client, strings and query arrays must be valid, cursor NULL or live, and out writable.
  */
@@ -9658,6 +9710,28 @@ MarmotStatus marmot_configure_moderation_reporting(const struct MarmotClient *cl
 MarmotStatus marmot_verify_public_nostr_event_json(const char *event_json, uint8_t *out);
 
 /**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_startup_diagnostics_enabled(const struct MarmotClient *client,
+                                                    uint8_t enabled);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_startup_diagnostics_snapshot(const struct MarmotClient *client,
+                                                 struct MarmotNativeStartupSnapshot **out);
+
+/**
  * Create a control; free it with marmot_media_file_transfer_control_free after upload returns.
  * # Safety
  * out must be writable.
@@ -12250,6 +12324,16 @@ void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
  * this library.
  */
 void marmot_report_dismissal_page_free(struct MarmotReportDismissalPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_native_startup_snapshot_free(struct MarmotNativeStartupSnapshot *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

@@ -30,7 +30,6 @@ pub enum AccountAttachmentPageRead {
     CursorMismatch,
     InvalidQuery,
     InvalidLimit,
-    ResponseTooLarge,
 }
 impl MarmotAppRuntime {
     /// One bounded local indexed candidate page across the account, with typed shared-parser metadata.
@@ -63,28 +62,12 @@ impl MarmotAppRuntime {
                             version: page.version,
                             next_cursor: page.next_cursor,
                         };
-                        let current =
-                            storage
-                                .account_attachment_history_version()
-                                .map_err(|error| match error {
-                                    E::Storage(error) => AppError::from(error),
-                                    _ => {
-                                        AppError::from(cgka_traits::storage::StorageError::Backend(
-                                            "account attachment version unavailable".into(),
-                                        ))
-                                    }
-                                })?;
-                        if current.requires_restart_since(&parsed.version) {
-                            AccountAttachmentPageRead::RestartRequired
-                        } else {
-                            AccountAttachmentPageRead::Page(Box::new(parsed))
-                        }
+                        AccountAttachmentPageRead::Page(Box::new(parsed))
                     }
                     Err(E::RestartRequired) => AccountAttachmentPageRead::RestartRequired,
                     Err(E::CursorMismatch) => AccountAttachmentPageRead::CursorMismatch,
                     Err(E::InvalidQuery) => AccountAttachmentPageRead::InvalidQuery,
                     Err(E::InvalidLimit) => AccountAttachmentPageRead::InvalidLimit,
-                    Err(E::ResponseTooLarge) => AccountAttachmentPageRead::ResponseTooLarge,
                     Err(E::Storage(error)) => return Err(error.into()),
                 },
             )

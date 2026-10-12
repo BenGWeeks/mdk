@@ -161,6 +161,8 @@ never free handles during concurrent use. Returned plaintext and copies made by 
 remain the host's responsibility, including removal of downstream copies after local deletion.
 
 ### Localization, privacy and diagnostics
+Native startup investigation can explicitly call `set_startup_diagnostics_enabled(true)` before the first account query, then read `startup_diagnostics_snapshot()` while a call remains unfinished. The snapshot uses independent bounded memory and fixed phases, including key lookup, database-open waiting and migration numbers; it contains no paths, account identifiers or error text. Keep normal builds disabled, bound host serialization separately, and revoke capture with `false` when it is no longer needed. Neither method changes upload consent or database state. See the [API reference](API-REFERENCE.md).
+
 
 `record_host_performance` accepts 28 shared host stages for runtime/UI initialization,
 accounts, lists, profiles, timelines, sending/search, media and preferences, plus
@@ -1089,7 +1091,11 @@ check, not a comparison benchmark. It builds Kotlin/Swift generation and every
 Android or Apple native target once in parallel, transfers those inputs only
 within the current workflow run, verifies their source, builder, toolchain,
 profile, feature and run provenance, then assembles and validates the Android,
-iOS and macOS candidate packages. Pull requests restore the trusted release
+iOS and macOS candidate packages. Pull requests build the Apple inputs and
+packages only when they change `crates/marmot-uniffi/` (other than Markdown) or a
+MarmotKit bindings workflow, because macOS runners are scarce; every other pull
+request still builds and validates the Android package, and `master` pushes always
+build the complete matrix. Pull requests restore the trusted release
 cache read-only; only runs using the workflow from `master` may update it. A
 weekly scheduled exact-head run on `master` provides drift detection and
 refreshes those trusted cache seeds; it intentionally executes the complete

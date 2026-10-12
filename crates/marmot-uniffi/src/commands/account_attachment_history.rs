@@ -2,7 +2,7 @@ use crate::{Marmot, MarmotKitError, conversions::*};
 use std::sync::Arc;
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
-    /// Read at most100 indexed account candidates; filtered empty pages can still have a continuation.
+    /// Read at most 100 indexed account candidates; filtered empty pages can still have a continuation.
     /// Cursors are account-incarnation/query bound and must be discarded on runtime reconstruction or source mutation.
     pub async fn account_attachment_history_page(
         &self,
