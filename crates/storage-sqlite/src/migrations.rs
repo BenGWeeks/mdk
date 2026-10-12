@@ -219,10 +219,12 @@ mod migration_0104_file_attachment_retention;
 mod migration_0105_file_attachment_partials;
 #[path = "migrations/0106_retained_attachment_chunks.rs"]
 mod migration_0106_retained_attachment_chunks;
-#[path = "migrations/0107_account_attachment_history.rs"]
-mod migration_0107_account_attachment_history;
-#[path = "migrations/0108_attachment_management.rs"]
-mod migration_0108_attachment_management;
+#[path = "migrations/0107_moderation_report_outbox.rs"]
+mod migration_0107_moderation_report_outbox;
+#[path = "migrations/0108_account_attachment_history.rs"]
+mod migration_0108_account_attachment_history;
+#[path = "migrations/0109_attachment_management.rs"]
+mod migration_0109_attachment_management;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -771,13 +773,18 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 107,
-        name: "0107_account_attachment_history",
-        apply: migration_0107_account_attachment_history::apply,
+        name: "0107_moderation_report_outbox",
+        apply: migration_0107_moderation_report_outbox::apply,
     },
     Migration {
         version: 108,
-        name: "0108_attachment_management",
-        apply: migration_0108_attachment_management::apply,
+        name: "0108_account_attachment_history",
+        apply: migration_0108_account_attachment_history::apply,
+    },
+    Migration {
+        version: 109,
+        name: "0109_attachment_management",
+        apply: migration_0109_attachment_management::apply,
     },
 ];
 

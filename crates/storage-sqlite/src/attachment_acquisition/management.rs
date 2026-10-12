@@ -3,18 +3,10 @@ use super::*;
 use crate::{AccountAttachmentVersion, AttachmentHistoryEntry};
 
 /// Runtime-effective policy for presentation; never persisted as new job authority.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttachmentManagementPermission {
     pub automatic: bool,
     pub categories: [bool; 4],
-}
-impl From<bool> for AttachmentManagementPermission {
-    fn from(automatic: bool) -> Self {
-        Self {
-            automatic,
-            categories: [true; 4],
-        }
-    }
 }
 fn apply_permission(
     status: &mut AttachmentTransferStatus,
@@ -101,31 +93,7 @@ fn attention(s: AttachmentTransferState) -> bool {
             | AttachmentTransferState::CompletedUnretained
     )
 }
-/// Stable observed categories; an opaque transport error is never diagnosed as a network cause.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AttachmentFailureCategory {
-    None,
-    UnclassifiedFailure,
-    RetryExhausted,
-    RetainedBytesUnavailable,
-    CompletedWithoutRetention,
-    PolicyBlocked,
-}
-impl AttachmentFailureCategory {
-    pub fn from_state(s: AttachmentTransferState) -> Self {
-        match s {
-            AttachmentTransferState::Failed => Self::UnclassifiedFailure,
-            AttachmentTransferState::RetryExhausted => Self::RetryExhausted,
-            AttachmentTransferState::PreviouslyAcquiredUnavailable => {
-                Self::RetainedBytesUnavailable
-            }
-            AttachmentTransferState::CompletedUnretained => Self::CompletedWithoutRetention,
-            AttachmentTransferState::PolicyBlocked => Self::PolicyBlocked,
-            _ => Self::None,
-        }
-    }
-}
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentJobCursor {
     identity: Vec<u8>,
     query: AttachmentJobQuery,
@@ -133,19 +101,17 @@ pub struct AttachmentJobCursor {
     cutoff: i64,
     before: i64,
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentJobActionToken {
     history: AccountAttachmentVersion,
     reference: AttachmentAssetRef,
     sequence: i64,
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentJobEntry {
     pub group_id_hex: String,
     pub source: AttachmentHistoryEntry,
     pub explicit: bool,
-    /// Cancellation clears old explicit intent in the authoritative store.
-    pub origin_known: bool,
     pub status: AttachmentTransferStatus,
     pub action: AttachmentJobActionToken,
 }
@@ -161,7 +127,6 @@ pub struct AttachmentJobPage {
 pub struct AttachmentJobCounts {
     pub active: u32,
     pub needs_attention: u32,
-    pub ready: u32,
     pub paused: u32,
     pub cancelled: u32,
     pub policy_blocked: u32,
@@ -203,7 +168,7 @@ fn history(s: &SqliteAccountStorage, now: u64) -> StorageResult<AccountAttachmen
         })
 }
 fn current_sequence(conn: &Connection) -> StorageResult<i64> {
-    conn.query_row(
+    conn.query_row_cached(
         "SELECT value FROM attachment_management_sequence WHERE id=1",
         [],
         |r| r.get(0),
@@ -219,11 +184,18 @@ fn candidates(
     high: i64,
     descending: bool,
     limit: usize,
+    exclude_ready: bool,
 ) -> StorageResult<Vec<Candidate>> {
-    let index = if group.is_some() {
-        "attachment_management_group_sequence"
+    let index = match (group.is_some(), exclude_ready) {
+        (true, true) => "attachment_management_group_work",
+        (false, true) => "attachment_management_work",
+        (true, false) => "attachment_management_group_sequence",
+        (false, false) => "attachment_management_sequence_index",
+    };
+    let work = if exclude_ready {
+        " AND management_ready=0"
     } else {
-        "attachment_management_sequence_index"
+        ""
     };
     let filter = if group.is_some() {
         " AND group_id_hex=?4"
@@ -232,7 +204,7 @@ fn candidates(
     };
     let order = if descending { "DESC" } else { "ASC" };
     let sql = format!(
-        "SELECT management_sequence,token,group_id_hex,message_id_hex,source_message_id_hex,attachment_index,explicit_request FROM attachment_acquisition INDEXED BY {index} WHERE management_sequence>?1 AND management_sequence<=?2{filter} ORDER BY management_sequence {order} LIMIT ?3"
+        "SELECT management_sequence,token,group_id_hex,message_id_hex,source_message_id_hex,attachment_index,explicit_request FROM attachment_acquisition INDEXED BY {index} WHERE management_sequence>?1 AND management_sequence<=?2{filter}{work} ORDER BY management_sequence {order} LIMIT ?3"
     );
     let mut values = vec![
         rusqlite::types::Value::Integer(low),
@@ -242,7 +214,7 @@ fn candidates(
     if let Some(g) = group {
         values.push(g.to_owned().into());
     }
-    conn.prepare(&sql)
+    conn.prepare_cached(&sql)
         .storage()?
         .query_map(rusqlite::params_from_iter(values), |r| {
             Ok((
@@ -269,9 +241,8 @@ impl SqliteAccountStorage {
         limit: usize,
         cursor: Option<&AttachmentJobCursor>,
         now: u64,
-        automatic: impl Into<AttachmentManagementPermission>,
+        permission: AttachmentManagementPermission,
     ) -> StorageResult<AttachmentJobPage> {
-        let permission = automatic.into();
         if !(1..=ATTACHMENT_MANAGEMENT_PAGE_LIMIT).contains(&limit) {
             return Err(invalid("invalid attachment management limit"));
         }
@@ -299,6 +270,10 @@ impl SqliteAccountStorage {
                 cutoff.min(before - 1),
                 true,
                 limit + 1,
+                matches!(
+                    query.view,
+                    AttachmentJobView::Active | AttachmentJobView::NeedsAttention
+                ),
             )?;
             drop(conn);
             let more = rows.len() > limit;
@@ -335,7 +310,6 @@ impl SqliteAccountStorage {
                     group_id_hex: g,
                     source: entry,
                     explicit,
-                    origin_known: status.state != AttachmentTransferState::Cancelled,
                     status,
                     action: AttachmentJobActionToken {
                         history: h.clone(),
@@ -362,33 +336,58 @@ impl SqliteAccountStorage {
             })
         })
     }
-    /// Bounded current counts. `complete=false` explicitly reports lower bounds, never an exact total.
+    /// Bounded non-ready counts. Retained completed downloads are history, not unhealthy work.
     pub fn attachment_job_counts(
         &self,
         group: Option<&str>,
         now: u64,
-        automatic: impl Into<AttachmentManagementPermission>,
+        permission: AttachmentManagementPermission,
     ) -> StorageResult<AttachmentJobCounts> {
-        let permission = automatic.into();
         let q = AttachmentJobQuery {
             group_id_hex: group.map(str::to_owned),
             ..Default::default()
         }
         .canonical()?;
         self.connection.with_read_snapshot(|| {
-            let conn=self.lock()?;let identity=epoch(&conn)?;
-            let rows=candidates(&conn,q.group_id_hex.as_deref(),0,current_sequence(&conn)?,true,ATTACHMENT_MANAGEMENT_COUNT_LIMIT+1)?;
-            let mut counts=AttachmentJobCounts{complete:rows.len()<=ATTACHMENT_MANAGEMENT_COUNT_LIMIT,..Default::default()};
-            for (_,token,g,m,s,i,_) in rows.into_iter().take(ATTACHMENT_MANAGEMENT_COUNT_LIMIT) {
-                // Membership eligibility is checked before the canonical source/expiry state read.
-                let eligible:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE token=?1 AND {ACCEPTED})"),[&token],|r|r.get(0)).storage()?;
-                if !eligible {continue;}
-                // Reuse the canonical state mapping; source/expiry privacy is checked before classification.
-                if let Some(mut status)=super::controls::transfer_status(&conn,&identity,&g,(&m,&s,i),now,permission.automatic,&mut None)? {
-                    if status.reference.as_ref().is_none_or(|r|r.token!=token){continue;}
-                    apply_permission(&mut status,permission);
-                    if active(status.state){counts.active+=1;}else if attention(status.state){counts.needs_attention+=1;}else{match status.state {AttachmentTransferState::Ready=>counts.ready+=1,AttachmentTransferState::Paused=>counts.paused+=1,AttachmentTransferState::Cancelled=>counts.cancelled+=1,AttachmentTransferState::PolicyBlocked=>counts.policy_blocked+=1,_=>counts.other+=1}}
-                }
+            let conn = self.lock()?;
+            let identity = epoch(&conn)?;
+            let (index, group_filter) = if q.group_id_hex.is_some() {
+                ("attachment_management_group_work", " AND group_id_hex=?3")
+            } else { ("attachment_management_work", "") };
+            // The materialized index seek fixes candidate work before privacy/source
+            // joins. Stream rows rather than preparing four statements per candidate.
+            let sql = format!("WITH candidates AS MATERIALIZED (
+                SELECT * FROM attachment_acquisition INDEXED BY {index}
+                WHERE management_ready=0{group_filter} ORDER BY management_sequence DESC LIMIT ?1)
+                SELECT {},CASE WHEN length(CAST(h.slot_json AS BLOB))<=16384 THEN h.slot_json ELSE '[]' END,
+                h.visible=1 AND length(CAST(h.slot_json AS BLOB))<=16384 AND h.source_message_id_hex=q.source_message_id_hex
+                AND h.source_epoch=q.source_epoch AND h.slot_json=q.slot_json
+                AND g.pending_confirmation=0 AND a.message_id_hex IS NOT NULL AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?2)
+                FROM candidates q
+                LEFT JOIN attachment_history h ON h.group_id_hex=q.group_id_hex AND h.message_id_hex=q.message_id_hex AND h.attachment_index=q.attachment_index
+                LEFT JOIN app_events a ON a.group_id_hex=q.group_id_hex AND a.message_id_hex=q.message_id_hex
+                LEFT JOIN account_groups g ON g.group_id_hex=q.group_id_hex", super::controls::TRANSFER_STATUS_COLUMNS);
+            let mut values = vec![rusqlite::types::Value::Integer((ATTACHMENT_MANAGEMENT_COUNT_LIMIT+1) as i64), rusqlite::types::Value::Integer(u64_to_i64(now)?)];
+            if let Some(group) = q.group_id_hex.as_deref() { values.push(group.to_owned().into()); }
+            let mut statement = conn.prepare_cached(&sql).storage()?;
+            let mut rows = statement.query(rusqlite::params_from_iter(values)).storage()?;
+            let mut visited = 0;
+            let mut counts = AttachmentJobCounts { complete: true, ..Default::default() };
+            while let Some(row) = rows.next().storage()? {
+                visited += 1;
+                if visited > ATTACHMENT_MANAGEMENT_COUNT_LIMIT { counts.complete=false; break; }
+                if !row.get::<_,Option<bool>>(17).storage()?.unwrap_or(false) { continue; }
+                let slot: String = row.get(16).storage()?;
+                let mut status = super::controls::transfer_status_row(row, &identity, permission.automatic, &slot).storage()?;
+                apply_permission(&mut status, permission);
+                if active(status.state) { counts.active+=1; }
+                else if attention(status.state) { counts.needs_attention+=1; }
+                else { match status.state {
+                    AttachmentTransferState::Paused => counts.paused+=1,
+                    AttachmentTransferState::Cancelled => counts.cancelled+=1,
+                    AttachmentTransferState::PolicyBlocked => counts.policy_blocked+=1,
+                    _ => counts.other+=1,
+                }}
             }
             Ok(counts)
         })
@@ -423,11 +422,13 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
             if epoch(&conn)?!=cursor.identity{return Err(invalid("attachment cancellation account mismatch"));}
-            let rows=candidates(&conn,cursor.group.as_deref(),cursor.after,cursor.cutoff,false,65)?;
+            let rows=candidates(&conn,cursor.group.as_deref(),cursor.after,cursor.cutoff,false,65,false)?;
             let more=rows.len()>64;let mut next=cursor.clone();let mut visited=0;let mut requested=0;
             for (seq,token,_,_,_,_,_) in rows.into_iter().take(64) {
                 visited+=1;next.after=seq;
-                requested+=conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0 WHERE token=?1 AND management_sequence=?2 AND state<>3 AND cancelled=0 AND (?3=0 OR explicit_request=0) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?4)"),params![token,seq,cursor.automatic_only,u64_to_i64(now)?]).storage()? as u32;
+                let changed=conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=1,state=4,due=NULL,attempt=NULL,explicit_request=0 WHERE token=?1 AND management_sequence=?2 AND state<>3 AND cancelled=0 AND (?3=0 OR explicit_request=0) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?4)"),params![token,seq,cursor.automatic_only,u64_to_i64(now)?]).storage()? as u32;
+                if changed != 0 { advance_intent(&conn,&token)?; }
+                requested+=changed;
             }
             Ok(AttachmentCancellationBatch{visited,requested,preserved:visited-requested,next_cursor:more.then_some(next)})
         })
@@ -443,7 +444,7 @@ impl SqliteAccountStorage {
             if history(self,now)?.requires_restart_since(&token.history){return Ok(false);}
             let conn=self.lock()?;
             if !matches_store(&conn,&token.reference)?{return Ok(false);}
-            let current:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE token=?1 AND management_sequence=?2 AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?3))"),params![token.reference.token,token.sequence,u64_to_i64(now)?],|r|r.get(0)).storage()?;drop(conn);
+            let current:bool=conn.query_row_cached(&format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE token=?1 AND management_sequence=?2 AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?3))"),params![token.reference.token,token.sequence,u64_to_i64(now)?],|r|r.get(0)).storage()?;drop(conn);
             if !current{return Ok(false);}
             if retry{self.explicitly_retry_attachment(&token.reference,now)}else{self.cancel_attachment_acquisition(&token.reference)}
         })
@@ -451,19 +452,24 @@ impl SqliteAccountStorage {
 }
 
 /// Opaque replacement-frame generation; unrelated accounts never compare equal.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentManagementVersion {
     identity: Vec<u8>,
-    revision: i64,
     history: AccountAttachmentVersion,
-    health_fence: [u8; 32],
+    query: AttachmentJobQuery,
+    permission: AttachmentManagementPermission,
+    available: bool,
+    automatic_recovery_failed: Option<bool>,
+    notices: Vec<([u8; 16], u64)>,
+    notices_complete: bool,
+    counts: AttachmentJobCounts,
+    entries: Vec<AttachmentJobEntry>,
+    next_cursor: Option<AttachmentJobCursor>,
+    next_expiry: Option<u64>,
 }
 impl AttachmentManagementVersion {
     pub fn same_as(&self, other: &Self) -> bool {
-        self.identity == other.identity
-            && self.revision == other.revision
-            && self.history == other.history
-            && self.health_fence == other.health_fence
+        self == other
     }
     pub fn same_account(&self, other: &Self) -> bool {
         self.identity == other.identity
@@ -485,30 +491,33 @@ impl SqliteAccountStorage {
         &self,
         query: &AttachmentJobQuery,
         now: u64,
-        automatic: impl Into<AttachmentManagementPermission>,
+        permission: AttachmentManagementPermission,
     ) -> StorageResult<AttachmentManagementFrame> {
-        let permission = automatic.into();
         let q = query.canonical()?;
         self.connection.with_read_snapshot(|| {
             let conn=self.lock()?;
-            let available=if let Some(g)=q.group_id_hex.as_deref(){conn.query_row("SELECT EXISTS(SELECT 1 FROM account_groups WHERE group_id_hex=?1 AND pending_confirmation=0)",[g],|r|r.get(0)).storage()?}else{true};
+            let available=if let Some(g)=q.group_id_hex.as_deref(){conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM account_groups WHERE group_id_hex=?1 AND pending_confirmation=0)",[g],|r|r.get(0)).storage()?}else{true};
             let identity=epoch(&conn)?;
-            let revision=conn.query_row("SELECT revision FROM attachment_management_sequence WHERE id=1",[],|r|r.get(0)).storage()?;
             drop(conn);
             let group=q.group_id_hex.as_deref().map(hex::decode).transpose().map_err(|_|invalid("invalid management group"))?;
             let failure=if available{group.as_ref().map(|g|self.automatic_recovery_failed(&cgka_traits::GroupId::new(g.clone()))).transpose()?}else{None};
             let (notices,notices_complete)=if available{self.bounded_parked_recovery_notices(group.as_deref(),50)?}else{(Vec::new(),true)};
-            let mut hash=Sha256::new();hash.update([u8::from(available),u8::from(failure.unwrap_or(false)),u8::from(notices_complete)]);
-            hash.update(permission.categories.map(u8::from));hash.update([u8::from(permission.automatic)]);
-            hash.update([u8::from(failure.is_some()),q.view as u8,q.origin as u8]);
-            match q.group_id_hex.as_deref(){
-                Some(g)=>{hash.update([1]);hash.update((g.len() as u64).to_be_bytes());hash.update(g.as_bytes());},
-                None=>hash.update([0]),
-            }
-            for n in &notices {hash.update(n.ticket.id);hash.update(n.ticket.revision.to_be_bytes());}
             let counts=if available{self.attachment_job_counts(q.group_id_hex.as_deref(),now,permission)?}else{AttachmentJobCounts::default()};
             let page=self.attachment_jobs_page(&q,50,None,now,permission)?;
-            let version=AttachmentManagementVersion{identity,revision,history:page.history_version.clone(),health_fence:hash.finalize().into()};
+            let version = AttachmentManagementVersion {
+                identity,
+                history: page.history_version.clone(),
+                query: q,
+                permission,
+                available,
+                automatic_recovery_failed: failure,
+                notices: notices.iter().map(|n| (n.ticket.id, n.ticket.revision)).collect(),
+                notices_complete,
+                counts: counts.clone(),
+                entries: page.entries.clone(),
+                next_cursor: page.next_cursor.clone(),
+                next_expiry: page.next_expiry,
+            };
             Ok(AttachmentManagementFrame{available,automatic_recovery_failed:failure,notices,notices_complete,counts,page,version})
         })
     }

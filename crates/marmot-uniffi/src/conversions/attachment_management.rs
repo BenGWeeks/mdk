@@ -41,31 +41,6 @@ impl From<AttachmentJobQueryFfi> for app::AttachmentJobQuery {
         }
     }
 }
-#[derive(Clone, Copy, Debug, uniffi::Enum)]
-pub enum AttachmentFailureCategoryFfi {
-    None,
-    UnclassifiedFailure,
-    RetryExhausted,
-    RetainedBytesUnavailable,
-    CompletedWithoutRetention,
-    PolicyBlocked,
-}
-impl From<app::AttachmentFailureCategory> for AttachmentFailureCategoryFfi {
-    fn from(v: app::AttachmentFailureCategory) -> Self {
-        match v {
-            app::AttachmentFailureCategory::None => Self::None,
-            app::AttachmentFailureCategory::UnclassifiedFailure => Self::UnclassifiedFailure,
-            app::AttachmentFailureCategory::RetryExhausted => Self::RetryExhausted,
-            app::AttachmentFailureCategory::RetainedBytesUnavailable => {
-                Self::RetainedBytesUnavailable
-            }
-            app::AttachmentFailureCategory::CompletedWithoutRetention => {
-                Self::CompletedWithoutRetention
-            }
-            app::AttachmentFailureCategory::PolicyBlocked => Self::PolicyBlocked,
-        }
-    }
-}
 macro_rules! opaque_object {
     ($name:ident,$ty:ty) => {
         #[derive(Debug, uniffi::Object)]
@@ -96,9 +71,7 @@ pub struct ManagedAttachmentEntryFfi {
     pub group_id_hex: String,
     pub entry: AttachmentEntryFfi,
     pub explicit: bool,
-    pub origin_known: bool,
     pub status: AttachmentTransferStatusFfi,
-    pub failure: AttachmentFailureCategoryFfi,
     pub action: Arc<AttachmentJobActionToken>,
 }
 #[derive(Clone, uniffi::Record)]
@@ -118,13 +91,11 @@ impl From<app::ManagedAttachmentPage> for ManagedAttachmentPageFfi {
                     group_id_hex: e.group_id_hex,
                     entry: e.entry.into(),
                     explicit: e.explicit,
-                    origin_known: e.origin_known,
                     status: {
                         let mut status: AttachmentTransferStatusFfi = Some(e.status).into();
                         status.reference = None;
                         status
                     },
-                    failure: e.failure.into(),
                     action: Arc::new(AttachmentJobActionToken { inner: e.action }),
                 })
                 .collect(),
@@ -140,7 +111,6 @@ impl From<app::ManagedAttachmentPage> for ManagedAttachmentPageFfi {
 pub struct AttachmentJobCountsFfi {
     pub active: u32,
     pub needs_attention: u32,
-    pub ready: u32,
     pub paused: u32,
     pub cancelled: u32,
     pub policy_blocked: u32,
@@ -152,7 +122,6 @@ impl From<app::AttachmentJobCounts> for AttachmentJobCountsFfi {
         Self {
             active: c.active,
             needs_attention: c.needs_attention,
-            ready: c.ready,
             paused: c.paused,
             cancelled: c.cancelled,
             policy_blocked: c.policy_blocked,

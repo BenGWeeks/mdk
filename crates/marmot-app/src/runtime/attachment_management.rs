@@ -3,9 +3,9 @@ use super::{MarmotAppRuntime, attachment_history::present, wait_for_runtime_shut
 use crate::{AppError, HistoryNotice};
 use std::{sync::Arc, time::Duration};
 pub use storage_sqlite::{
-    AttachmentCancellationBatch, AttachmentCancellationCursor, AttachmentFailureCategory,
-    AttachmentJobActionToken, AttachmentJobCounts, AttachmentJobCursor, AttachmentJobOrigin,
-    AttachmentJobQuery, AttachmentJobView, AttachmentManagementVersion,
+    AttachmentCancellationBatch, AttachmentCancellationCursor, AttachmentJobActionToken,
+    AttachmentJobCounts, AttachmentJobCursor, AttachmentJobOrigin, AttachmentJobQuery,
+    AttachmentJobView, AttachmentManagementVersion,
 };
 use tokio::sync::{Mutex, broadcast, watch};
 #[derive(Clone)]
@@ -13,9 +13,7 @@ pub struct ManagedAttachmentEntry {
     pub group_id_hex: String,
     pub entry: super::AttachmentEntry,
     pub explicit: bool,
-    pub origin_known: bool,
     pub status: super::AttachmentTransferStatus,
-    pub failure: AttachmentFailureCategory,
     pub action: AttachmentJobActionToken,
 }
 impl std::fmt::Debug for ManagedAttachmentEntry {
@@ -53,7 +51,7 @@ impl std::fmt::Debug for AttachmentManagementSnapshot {
 impl AttachmentManagementSnapshot {
     /// Explicit, capped default diagnostic export. No source identities, names, URLs, timestamps or tokens.
     pub fn redacted_diagnostics(&self) -> String {
-        serde_json::json!({"available":self.available,"automatic_recovery_failed":self.automatic_recovery_failed,"notices_complete":self.notices_complete,"notice_count":self.notices.len(),"counts_complete":self.counts.complete,"active":self.counts.active,"needs_attention":self.counts.needs_attention,"ready":self.counts.ready,"paused":self.counts.paused,"cancelled":self.counts.cancelled,"policy_blocked":self.counts.policy_blocked,"other":self.counts.other}).to_string()
+        serde_json::json!({"available":self.available,"automatic_recovery_failed":self.automatic_recovery_failed,"notices_complete":self.notices_complete,"notice_count":self.notices.len(),"counts_complete":self.counts.complete,"active":self.counts.active,"needs_attention":self.counts.needs_attention,"paused":self.counts.paused,"cancelled":self.counts.cancelled,"policy_blocked":self.counts.policy_blocked,"other":self.counts.other}).to_string()
     }
 }
 fn present_page(
@@ -69,8 +67,6 @@ fn present_page(
                     group_id_hex: e.group_id_hex,
                     entry: present(e.source, loopback)?,
                     explicit: e.explicit,
-                    origin_known: e.origin_known,
-                    failure: AttachmentFailureCategory::from_state(e.status.state),
                     status: e.status,
                     action: e.action,
                 })

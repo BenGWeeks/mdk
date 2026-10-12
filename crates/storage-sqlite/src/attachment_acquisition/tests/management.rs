@@ -1,5 +1,11 @@
 use super::*;
 use crate::attachment_acquisition::management::*;
+fn permitted(automatic: bool) -> AttachmentManagementPermission {
+    AttachmentManagementPermission {
+        automatic,
+        categories: [true; 4],
+    }
+}
 
 #[test]
 fn managed_download_paging_counts_and_filters_are_local_bounded_and_source_bound() {
@@ -14,7 +20,7 @@ fn managed_download_paging_counts_and_filters_are_local_bounded_and_source_bound
     let mut seen = 0;
     loop {
         let p = s
-            .attachment_jobs_page(&query, 17, cursor.as_ref(), 12, true)
+            .attachment_jobs_page(&query, 17, cursor.as_ref(), 12, permitted(true))
             .unwrap();
         assert!(p.entries.len() <= 17);
         seen += p.entries.len();
@@ -24,26 +30,33 @@ fn managed_download_paging_counts_and_filters_are_local_bounded_and_source_bound
         }
     }
     assert_eq!(seen, 73);
-    let counts = s.attachment_job_counts(None, 12, true).unwrap();
+    let counts = s.attachment_job_counts(None, 12, permitted(true)).unwrap();
     assert!(counts.complete);
     assert_eq!(counts.active, 73);
     let q = AttachmentJobQuery {
         view: AttachmentJobView::Ready,
         ..Default::default()
     };
-    let empty = s.attachment_jobs_page(&q, 1, None, 12, true).unwrap();
+    let empty = s
+        .attachment_jobs_page(&q, 1, None, 12, permitted(true))
+        .unwrap();
     assert!(empty.entries.is_empty());
     assert!(empty.next_cursor.is_some());
     assert!(
-        s.attachment_jobs_page(&query, 1, empty.next_cursor.as_ref(), 12, true)
+        s.attachment_jobs_page(&query, 1, empty.next_cursor.as_ref(), 12, permitted(true))
             .is_err()
     );
-    assert!(s.attachment_jobs_page(&query, 51, None, 12, true).is_err());
+    assert!(
+        s.attachment_jobs_page(&query, 51, None, 12, permitted(true))
+            .is_err()
+    );
     let foreign = SqliteAccountStorage::in_memory().unwrap();
-    let p = s.attachment_jobs_page(&query, 1, None, 12, true).unwrap();
+    let p = s
+        .attachment_jobs_page(&query, 1, None, 12, permitted(true))
+        .unwrap();
     assert!(
         foreign
-            .attachment_jobs_page(&query, 1, p.next_cursor.as_ref(), 12, true)
+            .attachment_jobs_page(&query, 1, p.next_cursor.as_ref(), 12, permitted(true))
             .is_err()
     );
     s.lock()
@@ -57,7 +70,7 @@ fn managed_download_paging_counts_and_filters_are_local_bounded_and_source_bound
                 ..Default::default()
             },
             12,
-            true,
+            permitted(true),
         )
         .unwrap();
     assert!(!f.available);
@@ -102,7 +115,13 @@ fn cancellation_freezes_old_intent_and_preserves_promotions_new_work_and_ready_b
         );
     }
     let before = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 50, None, 12, true)
+        .attachment_jobs_page(
+            &AttachmentJobQuery::default(),
+            50,
+            None,
+            12,
+            permitted(true),
+        )
         .unwrap();
     let token = before
         .entries
@@ -117,7 +136,7 @@ fn cancellation_freezes_old_intent_and_preserves_promotions_new_work_and_ready_b
     assert_eq!(replay.requested, 0);
     // Retry is a new intent even when an explicit queued request is retried again.
     let fresh = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 13, true)
+        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 13, permitted(true))
         .unwrap()
         .entries[0]
         .action
@@ -126,7 +145,7 @@ fn cancellation_freezes_old_intent_and_preserves_promotions_new_work_and_ready_b
     assert!(s.control_managed_attachment(&fresh, true, 14).unwrap());
     assert!(!s.control_managed_attachment(&fresh, false, 14).unwrap());
     s.cancel_attachment_batch(&newer_cancel, 14).unwrap();
-    let counts = s.attachment_job_counts(None, 14, true).unwrap();
+    let counts = s.attachment_job_counts(None, 14, permitted(true)).unwrap();
     assert!(counts.active >= 1);
 }
 
@@ -144,9 +163,42 @@ fn counts_are_explicit_lower_bounds_and_queries_seek_management_indexes() {
             Ok::<_, StorageError>(())
         })
         .unwrap();
-    let counts = s.attachment_job_counts(None, 12, true).unwrap();
+    let start = std::time::Instant::now();
+    let frame = s
+        .attachment_management_frame(&AttachmentJobQuery::default(), 12, permitted(true))
+        .unwrap();
+    eprintln!(
+        "management_frame_1027_jobs_us={}",
+        start.elapsed().as_micros()
+    );
+    assert_eq!(frame.page.entries.len(), 50);
+    let counts = s.attachment_job_counts(None, 12, permitted(true)).unwrap();
     assert!(!counts.complete);
     assert_eq!(counts.active, 1024);
+    // Ready lifetime history must never spend the health/count or attention-page budget.
+    sql(&s, "UPDATE attachment_acquisition SET state=3,due=NULL WHERE message_id_hex<>'job-0';
+        INSERT INTO retained_attachment_bytes(token,bytes) SELECT token,x'00' FROM attachment_acquisition WHERE state=3;
+        UPDATE attachment_acquisition SET state=4,due=NULL WHERE message_id_hex='job-0';");
+    let health = s.attachment_job_counts(None, 12, permitted(true)).unwrap();
+    assert!(health.complete);
+    assert_eq!(health.needs_attention, 1);
+    assert_eq!(health.active, 0);
+    let attention_query = AttachmentJobQuery {
+        view: AttachmentJobView::NeedsAttention,
+        ..Default::default()
+    };
+    let attention_page = s
+        .attachment_jobs_page(&attention_query, 1, None, 12, permitted(true))
+        .unwrap();
+    assert_eq!(attention_page.entries[0].source.message_id_hex, "job-0");
+    // Loss of retained bytes rejoins the same derived non-ready index.
+    sql(
+        &s,
+        "DELETE FROM retained_attachment_bytes WHERE token=(SELECT token FROM attachment_acquisition WHERE message_id_hex='job-1');",
+    );
+    let health = s.attachment_job_counts(None, 12, permitted(true)).unwrap();
+    assert!(health.complete);
+    assert_eq!(health.needs_attention, 2);
     let c = s.lock().unwrap();
     for (sql, index) in [
         (
@@ -156,6 +208,10 @@ fn counts_are_explicit_lower_bounds_and_queries_seek_management_indexes() {
         (
             "EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition INDEXED BY attachment_management_group_sequence WHERE group_id_hex='abababababababababababababababab' AND management_sequence>0 AND management_sequence<=99999 ORDER BY management_sequence DESC LIMIT 51",
             "attachment_management_group_sequence",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition INDEXED BY attachment_management_work WHERE management_ready=0 ORDER BY management_sequence DESC LIMIT 51",
+            "attachment_management_work",
         ),
     ] {
         let plan = c
@@ -217,7 +273,9 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
         group_id_hex: Some(GROUP.into()),
         ..Default::default()
     };
-    let f = s.attachment_management_frame(&q, 12, true).unwrap();
+    let f = s
+        .attachment_management_frame(&q, 12, permitted(true))
+        .unwrap();
     assert!(f.available);
     assert_eq!(f.automatic_recovery_failed, Some(false));
     assert_eq!(f.counts.active, 5);
@@ -255,7 +313,7 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
         .iter()
         .find(|e| e.status.state == AttachmentTransferState::Cancelled)
         .unwrap();
-    assert!(!cancelled.origin_known);
+    assert_eq!(cancelled.status.state, AttachmentTransferState::Cancelled);
     let automatic = s
         .attachment_jobs_page(
             &AttachmentJobQuery {
@@ -265,7 +323,7 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
             50,
             None,
             12,
-            true,
+            permitted(true),
         )
         .unwrap();
     assert!(
@@ -276,7 +334,7 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
     );
 
     let global = s
-        .attachment_management_frame(&AttachmentJobQuery::default(), 12, true)
+        .attachment_management_frame(&AttachmentJobQuery::default(), 12, permitted(true))
         .unwrap();
     assert!(!global.version.same_as(&f.version));
     let filtered = s
@@ -286,7 +344,7 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
                 ..q.clone()
             },
             12,
-            true,
+            permitted(true),
         )
         .unwrap();
     assert!(!filtered.version.same_as(&f.version));
@@ -303,18 +361,23 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
             [g.as_slice()],
         )
         .unwrap();
-    let bad = s.attachment_management_frame(&q, 12, true).unwrap();
+    let bad = s
+        .attachment_management_frame(&q, 12, permitted(true))
+        .unwrap();
     assert_eq!(bad.automatic_recovery_failed, Some(true));
     assert!(!bad.version.same_as(&f.version));
     assert!(s.clear_recovery_failure(&g).unwrap());
     assert_eq!(
-        s.attachment_management_frame(&q, 12, true)
+        s.attachment_management_frame(&q, 12, permitted(true))
             .unwrap()
             .automatic_recovery_failed,
         Some(false)
     );
     s.close().unwrap();
-    assert!(s.attachment_management_frame(&q, 12, true).is_err());
+    assert!(
+        s.attachment_management_frame(&q, 12, permitted(true))
+            .is_err()
+    );
 }
 
 #[test]
@@ -323,7 +386,7 @@ fn cancelling_intent_invalidates_old_actions_without_deleting_ready_bytes() {
     seed(&s, "one");
     request(&s, "one");
     let old = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, true)
+        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, permitted(true))
         .unwrap()
         .entries[0]
         .action
@@ -332,9 +395,12 @@ fn cancelling_intent_invalidates_old_actions_without_deleting_ready_bytes() {
     assert_eq!(s.cancel_attachment_batch(&cursor, 12).unwrap().requested, 1);
     assert!(!s.control_managed_attachment(&old, true, 13).unwrap());
     let page = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 13, true)
+        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 13, permitted(true))
         .unwrap();
-    assert!(!page.entries[0].origin_known);
+    assert_eq!(
+        page.entries[0].status.state,
+        AttachmentTransferState::Cancelled
+    );
     assert!(
         s.control_managed_attachment(&page.entries[0].action, true, 13)
             .unwrap()
@@ -348,7 +414,7 @@ fn action_tokens_require_refresh_after_visibility_is_reallowed() {
     seed(&s, "one");
     request(&s, "one");
     let old = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, true)
+        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, permitted(true))
         .unwrap()
         .entries[0]
         .action
@@ -358,7 +424,7 @@ fn action_tokens_require_refresh_after_visibility_is_reallowed() {
     sql(&s, "DELETE FROM user_blocks WHERE public_key='author';");
     assert!(!s.control_managed_attachment(&old, false, 12).unwrap());
     let current = s
-        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, true)
+        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, permitted(true))
         .unwrap();
     assert!(
         s.control_managed_attachment(&current.entries[0].action, false, 12)
@@ -376,14 +442,20 @@ fn management_expiry_replaces_the_frame_once_without_database_writes() {
         "UPDATE app_events SET retention_expires_at=13 WHERE message_id_hex='one';",
     );
     let q = AttachmentJobQuery::default();
-    let before = s.attachment_management_frame(&q, 12, true).unwrap();
+    let before = s
+        .attachment_management_frame(&q, 12, permitted(true))
+        .unwrap();
     assert_eq!(before.page.next_expiry, Some(13));
     assert_eq!(before.page.entries.len(), 1);
-    let after = s.attachment_management_frame(&q, 13, true).unwrap();
+    let after = s
+        .attachment_management_frame(&q, 13, permitted(true))
+        .unwrap();
     assert!(after.page.entries.is_empty());
     assert_eq!(after.page.next_expiry, None);
     assert!(!after.version.same_as(&before.version));
-    let later = s.attachment_management_frame(&q, 14, true).unwrap();
+    let later = s
+        .attachment_management_frame(&q, 14, permitted(true))
+        .unwrap();
     assert!(later.version.same_as(&after.version));
     assert_eq!(later.page.next_expiry, None);
 }

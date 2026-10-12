@@ -13,7 +13,6 @@ use marmot_uniffi::conversions::*;
 use std::{ffi::c_char, sync::Arc};
 c_enum! {MarmotAttachmentJobView from AttachmentJobViewFfi {All,Active,NeedsAttention,Ready,}}
 c_enum! {MarmotAttachmentJobOrigin from AttachmentJobOriginFfi {Any,Automatic,Explicit,}}
-c_enum! {MarmotAttachmentFailureCategory from AttachmentFailureCategoryFfi {None,UnclassifiedFailure,RetryExhausted,RetainedBytesUnavailable,CompletedWithoutRetention,PolicyBlocked,}}
 /// Nullable group selects account scope; enums are checked integer discriminants.
 #[repr(C)]
 pub struct MarmotAttachmentJobQuery {
@@ -73,15 +72,13 @@ handle!(
     MarmotAttachmentManagementVersion,
     AttachmentManagementVersion
 );
-c_mirror! {MarmotAttachmentJobCounts from AttachmentJobCountsFfi {copy active:u32,copy needs_attention:u32,copy ready:u32,copy paused:u32,copy cancelled:u32,copy policy_blocked:u32,copy other:u32,copy complete:bool,}}
+c_mirror! {MarmotAttachmentJobCounts from AttachmentJobCountsFfi {copy active:u32,copy needs_attention:u32,copy paused:u32,copy cancelled:u32,copy policy_blocked:u32,copy other:u32,copy complete:bool,}}
 #[repr(C)]
 pub struct MarmotManagedAttachmentEntry {
     pub group_id_hex: *mut c_char,
     pub entry: MarmotAttachmentEntry,
     pub explicit: bool,
-    pub origin_known: bool,
     pub status: MarmotAttachmentTransferStatus,
-    pub failure: MarmotAttachmentFailureCategory,
     pub action: *mut MarmotAttachmentJobActionToken,
 }
 impl From<ManagedAttachmentEntryFfi> for MarmotManagedAttachmentEntry {
@@ -90,9 +87,7 @@ impl From<ManagedAttachmentEntryFfi> for MarmotManagedAttachmentEntry {
             group_id_hex: owned_c_string(e.group_id_hex),
             entry: e.entry.into(),
             explicit: e.explicit,
-            origin_known: e.origin_known,
             status: e.status.into(),
-            failure: e.failure.into(),
             action: boxed(e.action.into()),
         }
     }

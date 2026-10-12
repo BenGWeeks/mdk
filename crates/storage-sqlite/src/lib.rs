@@ -40,6 +40,8 @@ mod local_submissions;
 mod message_drafts;
 pub use local_submissions::LocalSubmission;
 mod migrations;
+mod moderation_reports;
+pub use moderation_reports::{ModerationReportOutboxEntry, ModerationReportOutboxOutcome};
 mod openmls_storage;
 mod pending_welcome_delivery;
 mod prepared_group_image_upload;
@@ -166,10 +168,10 @@ pub use attachment_acquisition::{
 };
 
 pub use attachment_acquisition::{
-    AttachmentCancellationBatch, AttachmentCancellationCursor, AttachmentFailureCategory,
-    AttachmentJobActionToken, AttachmentJobCounts, AttachmentJobCursor, AttachmentJobEntry,
-    AttachmentJobOrigin, AttachmentJobPage, AttachmentJobQuery, AttachmentJobView,
-    AttachmentManagementFrame, AttachmentManagementVersion,
+    AttachmentCancellationBatch, AttachmentCancellationCursor, AttachmentJobActionToken,
+    AttachmentJobCounts, AttachmentJobCursor, AttachmentJobEntry, AttachmentJobOrigin,
+    AttachmentJobPage, AttachmentJobQuery, AttachmentJobView, AttachmentManagementFrame,
+    AttachmentManagementVersion,
 };
 
 pub use attachment_acquisition::AttachmentManagementPermission;

@@ -10,7 +10,7 @@ pub const MAX_ATTACHMENT_HISTORY_PAGE: usize = 100;
 
 /// One original imeta slot, including malformed slots for the app parser to reject.
 /// No message body or complete album is loaded by this projection.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentHistoryEntry {
     pub message_id_hex: String,
     pub attachment_index: usize,
