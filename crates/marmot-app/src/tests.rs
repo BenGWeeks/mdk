@@ -7,6 +7,7 @@ mod key_package_inventory;
 mod key_package_selection;
 mod message_journeys;
 mod publication_progress;
+mod replaceable_delivery;
 mod report_backfill;
 mod user_blocks;
 
@@ -527,6 +528,8 @@ pub(crate) struct ScriptedPushRelayClient {
     reject_next_publish: std::sync::atomic::AtomicBool,
     fail_publish_unavailable: std::sync::atomic::AtomicBool,
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
+    accept_first_endpoint_only: std::sync::atomic::AtomicBool,
+    accepted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
     publish_release: tokio::sync::Notify,
@@ -903,12 +906,31 @@ impl ScriptedPushRelayClient {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn fail_publishes_of_kind(&self, kind: u64) {
+    pub(crate) fn fail_publishes_of_kind(&self, kind: u64) {
         *self.fail_publish_kind.lock().unwrap() = Some(kind);
     }
 
-    fn allow_all_publish_kinds(&self) {
+    pub(crate) fn allow_all_publish_kinds(&self) {
         self.fail_publish_kind.lock().unwrap().take();
+    }
+
+    /// Model one-ack quorum cancellation: multi-endpoint publishes report only
+    /// their first endpoint, and the others neither accept nor fail.
+    pub(crate) fn accept_first_endpoint_only(&self) {
+        self.accept_first_endpoint_only
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn attempted_routes(&self) -> Vec<(u64, Vec<TransportEndpoint>)> {
+        self.attempted_publish_routes.lock().unwrap().clone()
+    }
+
+    pub(crate) fn accepted_routes(&self) -> Vec<(u64, Vec<TransportEndpoint>)> {
+        self.accepted_publish_routes.lock().unwrap().clone()
+    }
+
+    pub(crate) fn attempted_events(&self) -> Vec<NostrTransportEvent> {
+        self.attempted_events.lock().unwrap().clone()
     }
 
     pub(crate) async fn wait_for_blocked_publish(&self) {
@@ -1292,7 +1314,19 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .unwrap_or(true)
         {
             self.published_events.lock().unwrap().push(event.clone());
-            Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+            let accepted = if self
+                .accept_first_endpoint_only
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                endpoints.first().cloned().into_iter().collect()
+            } else {
+                endpoints.to_vec()
+            };
+            self.accepted_publish_routes
+                .lock()
+                .unwrap()
+                .push((event.kind, accepted.clone()));
+            Ok(NostrPublishOutcome::accepted(accepted))
         } else {
             Err(cgka_traits::TransportAdapterError::Publish(
                 "injected publish failure".to_owned(),
@@ -6609,6 +6643,182 @@ async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
     runtime.shutdown().await;
 }
 
+/// Bootstrap re-stamps the cached profile with its signed kind-0 timestamp,
+/// so a later setup call can return a newer `created_at` for the same profile.
+fn profile_content(profile: &Option<UserProfileMetadata>) -> Option<UserProfileMetadata> {
+    profile.clone().map(|profile| UserProfileMetadata {
+        created_at: 0,
+        ..profile
+    })
+}
+
+#[tokio::test]
+async fn generated_identity_publishes_supplied_initial_profile_as_first_kind0() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let chosen = UserProfileMetadata {
+        name: Some("Chosen Heron".into()),
+        display_name: Some("Chosen Heron".into()),
+        ..UserProfileMetadata::default()
+    };
+
+    let local = runtime
+        .create_identity_local_ready_with_initial_profile(
+            AccountSetupRequest {
+                default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+                bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+            chosen.clone(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime
+            .account_setup_readiness(&local.account.label)
+            .unwrap()
+            != AccountSetupReadiness::NetworkReady
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background setup must reach network readiness");
+
+    let pseudonym = default_profile_pseudonym(&local.account.account_id_hex);
+    let returned = local
+        .profile
+        .expect("local-ready setup returns its profile");
+    assert_eq!(returned.name.as_deref(), Some("Chosen Heron"));
+    assert_eq!(returned.display_name.as_deref(), Some("Chosen Heron"));
+    assert_ne!(
+        returned.created_at, 0,
+        "a zero stamp would lose to any stale relay copy"
+    );
+    let cached = app
+        .directory_entry_for_account_id(&local.account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .unwrap();
+    assert_eq!(cached.name.as_deref(), Some("Chosen Heron"));
+    let kind0 = relay
+        .attempted_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == KIND_NOSTR_METADATA)
+        .map(|event| event.content.clone())
+        .collect::<Vec<_>>();
+    assert!(!kind0.is_empty(), "bootstrap must publish kind-0 metadata");
+    for content in &kind0 {
+        assert!(
+            content.contains("Chosen Heron"),
+            "every bootstrap kind-0 must carry the selected name"
+        );
+        assert!(
+            !content.contains(&pseudonym),
+            "the generated default must never reach a relay"
+        );
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn initial_profile_retry_returns_the_profile_a_running_bootstrap_publishes() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    // Hold the concurrent KeyPackage and bootstrap publication lanes.
+    relay.block_next_publishes(2);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let request = || AccountSetupRequest {
+        default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+
+    let first = runtime
+        .create_identity_local_ready(request())
+        .await
+        .unwrap();
+    // `BootstrapPublicationStarted` follows the bootstrap's profile capture.
+    // Rewind to `LocalReady` to reproduce the window between the two.
+    relay.wait_for_blocked_publishes(2).await;
+    assert_eq!(
+        app.account_home()
+            .account_setup_state(&first.account.label)
+            .unwrap()
+            .unwrap()
+            .phase,
+        marmot_account::AccountSetupPhase::BootstrapPublicationStarted
+    );
+    app.account_home()
+        .set_account_setup_phase(
+            &first.account.label,
+            marmot_account::AccountSetupPhase::LocalReady,
+        )
+        .unwrap();
+
+    let retried = runtime
+        .create_identity_local_ready_with_initial_profile(
+            request(),
+            UserProfileMetadata {
+                name: Some("Chosen Heron".into()),
+                display_name: Some("Chosen Heron".into()),
+                ..UserProfileMetadata::default()
+            },
+        )
+        .await
+        .unwrap();
+    relay.release_publish();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime
+            .account_setup_readiness(&first.account.label)
+            .unwrap()
+            != AccountSetupReadiness::NetworkReady
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background setup must reach network readiness");
+
+    let returned = retried
+        .profile
+        .expect("local-ready setup returns its profile");
+    let published_name = format!(
+        "\"name\":\"{}\"",
+        returned
+            .name
+            .as_deref()
+            .expect("returned profile has a name")
+    );
+    let kind0 = relay
+        .attempted_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == KIND_NOSTR_METADATA)
+        .map(|event| event.content.clone())
+        .collect::<Vec<_>>();
+    assert!(!kind0.is_empty(), "bootstrap must publish kind-0 metadata");
+    assert!(
+        kind0
+            .iter()
+            .all(|content| content.contains(&published_name)),
+        "a retry must return the profile the running bootstrap publishes: \
+         returned {:?}, published {kind0:?}",
+        returned.name
+    );
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     let directory = tempfile::tempdir().unwrap();
@@ -6665,7 +6875,10 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
         .await
         .unwrap();
     assert_eq!(repeated.account, result.account);
-    assert_eq!(repeated.profile, result.profile);
+    assert_eq!(
+        profile_content(&repeated.profile),
+        profile_content(&result.profile)
+    );
     assert_eq!(repeated.key_package_bytes, result.key_package_bytes);
     assert_eq!(repeated.readiness, AccountSetupReadiness::Publishing);
     assert_eq!(
@@ -6975,7 +7188,10 @@ async fn concurrent_generated_identity_calls_converge_on_one_local_attempt() {
     let first = first.unwrap();
     let second = second.unwrap();
     assert_eq!(first.account, second.account);
-    assert_eq!(first.profile, second.profile);
+    assert_eq!(
+        profile_content(&first.profile),
+        profile_content(&second.profile)
+    );
     assert_eq!(first.key_package_bytes, second.key_package_bytes);
     assert_eq!(
         AccountHome::open(directory.path()).accounts().unwrap(),

@@ -178,6 +178,20 @@ enum MarmotStatus
    */
   MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94,
   MARMOT_STATUS_INVALID_APP_COMPONENT = 95,
+  /**
+   * No valid moderation-report destination is installed; nothing was published.
+   */
+  MARMOT_STATUS_MODERATION_REPORTING_NOT_CONFIGURED = 96,
+  /**
+   * The moderation-report destination was rejected as a whole.
+   */
+  MARMOT_STATUS_INVALID_MODERATION_REPORT_CONFIG = 97,
+  MARMOT_STATUS_INVALID_REPORTED_PUBLIC_KEY = 98,
+  MARMOT_STATUS_CANNOT_REPORT_SELF = 99,
+  /**
+   * Local per-account moderation-report cap; retry later.
+   */
+  MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED = 100,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -1146,6 +1160,14 @@ typedef enum MarmotHostPerformanceOutcome {
   MARMOT_HOST_PERFORMANCE_OUTCOME_TIMEOUT,
   MARMOT_HOST_PERFORMANCE_OUTCOME_UNAVAILABLE,
 } MarmotHostPerformanceOutcome;
+
+/**
+ * Which user action produced a private moderation report.
+ */
+typedef enum MarmotModerationReportOrigin {
+  MARMOT_MODERATION_REPORT_ORIGIN_REPORT,
+  MARMOT_MODERATION_REPORT_ORIGIN_BLOCK_AND_REPORT,
+} MarmotModerationReportOrigin;
 
 /**
  * Free before its client. Concurrent next and commands are supported; never free during a call.
@@ -4524,6 +4546,15 @@ typedef struct MarmotReportDismissalPage {
   uintptr_t labels_len;
   char *next_cursor;
 } MarmotReportDismissalPage;
+
+/**
+ * Outcome of marmot_submit_moderation_report. AcceptedPending and
+ * CompletionUnknown are queued and retried on catch-up; never resubmit them.
+ */
+typedef struct MarmotModerationReportOutcome {
+  char *report_id;
+  enum MarmotSendAcceptDisposition accept_disposition;
+} MarmotModerationReportOutcome;
 
 /**
  * Borrowed private input. Its path is local only and is never published.
@@ -8489,6 +8520,29 @@ MarmotStatus marmot_publish_user_profile(const struct MarmotClient *client,
                                          struct MarmotUserProfileMetadata **out);
 
 /**
+ * Create a fresh identity whose first public kind-0 is `profile`, returning
+ * at durable local readiness. Use this instead of
+ * `marmot_create_identity_with_profile` followed by
+ * `marmot_publish_user_profile` when onboarding collects a name, so
+ * contacts never see the generated default. Free with
+ * `marmot_identity_creation_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `profile` a valid borrowed struct (never
+ * freed by the library); relay arrays must hold `len` valid strings (or be
+ * NULL with len 0); `out` valid.
+ */
+MarmotStatus marmot_create_identity_with_initial_profile(const struct MarmotClient *client,
+                                                         const struct MarmotUserProfileMetadata *profile,
+                                                         const char *const *default_relays,
+                                                         uintptr_t default_relays_len,
+                                                         const char *const *bootstrap_relays,
+                                                         uintptr_t bootstrap_relays_len,
+                                                         const char *const *inbox_relays,
+                                                         uintptr_t inbox_relays_len,
+                                                         struct MarmotIdentityCreationResult **out);
+
+/**
  * Replace the group's encrypted-media default blob endpoints as a full
  * component update. Requires admin. Free with
  * `marmot_send_summary_free`.
@@ -9383,6 +9437,42 @@ MarmotStatus marmot_report_message(const struct MarmotClient *client,
                                    uint32_t reason,
                                    const char *explanation,
                                    struct MarmotSendSummary **out);
+
+/**
+ * Privately report a user to the configured moderation team (NIP-56 report,
+ * NIP-59 gift-wrapped). Additive to marmot_report_message, which is unchanged.
+ * `reason` is a MarmotReportReason and `origin` a MarmotModerationReportOrigin
+ * discriminant. Release `*out` with marmot_moderation_report_outcome_free.
+ * # Safety
+ * Client, strings and output pointer must be valid. Inputs are borrowed.
+ */
+MarmotStatus marmot_submit_moderation_report(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             const char *reported_pubkey,
+                                             uint32_t reason,
+                                             const char *explanation,
+                                             uint32_t origin,
+                                             struct MarmotModerationReportOutcome **out);
+
+/**
+ * Write whether a valid moderation-report destination is installed.
+ * # Safety
+ * `client` must be a live handle and `out` writable.
+ */
+MarmotStatus marmot_moderation_reporting_available(const struct MarmotClient *client, bool *out);
+
+/**
+ * Install the moderation-report destination, or clear it when
+ * `recipient_pubkey` is NULL (`relays` is then ignored). An invalid
+ * destination is rejected whole and leaves reporting unconfigured.
+ * # Safety
+ * `client` must be a live handle; `recipient_pubkey` NULL or a valid string;
+ * `relays` must hold `relays_len` valid strings. Inputs are borrowed.
+ */
+MarmotStatus marmot_configure_moderation_reporting(const struct MarmotClient *client,
+                                                   const char *recipient_pubkey,
+                                                   const char *const *relays,
+                                                   uintptr_t relays_len);
 
 /**
  * Verify a public Nostr event's canonical ID and BIP-340 signature.
@@ -11924,6 +12014,16 @@ void marmot_avatar_bytes_free(struct MarmotAvatarBytes *ptr);
  * library.
  */
 void marmot_avatar_bytes_list_free(struct MarmotAvatarBytesList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_moderation_report_outcome_free(struct MarmotModerationReportOutcome *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL
