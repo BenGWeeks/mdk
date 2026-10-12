@@ -220,10 +220,10 @@ impl PublicEventQuerySession {
         }
         let mut connected = Vec::with_capacity(self.connected.len());
         for url in &self.connected {
-            if let Ok(Some(relay)) = self.client.relay(url.clone()).await {
-                if relay.status().is_connected() {
-                    connected.push(url.clone());
-                }
+            if let Ok(Some(relay)) = self.client.relay(url.clone()).await
+                && relay.status().is_connected()
+            {
+                connected.push(url.clone());
             }
         }
         let _ = timeout_at(
