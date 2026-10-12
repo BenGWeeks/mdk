@@ -135,21 +135,16 @@ fn counts_are_explicit_lower_bounds_and_queries_seek_management_indexes() {
     assert!(health.complete);
     assert_eq!(health.needs_attention, 2);
     let c = s.lock().unwrap();
-    for (sql, index) in [(
-        "EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition INDEXED BY attachment_management_group_work WHERE group_id_hex='abababababababababababababababab' AND management_ready=0 AND rowid>0 AND rowid<=99999 ORDER BY rowid DESC LIMIT 51",
-        "attachment_management_group_work",
-    )] {
-        let plan = c
-            .prepare(sql)
-            .unwrap()
-            .query_map([], |r| r.get::<_, String>(3))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .join(" ");
-        assert!(plan.contains(index));
-        assert!(!plan.contains("TEMP B-TREE"));
-    }
+    let plan = c
+        .prepare("EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition INDEXED BY attachment_management_group_work WHERE group_id_hex='abababababababababababababababab' AND management_ready=0 AND rowid>0 AND rowid<=99999 ORDER BY rowid DESC LIMIT 51")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join(" ");
+    assert!(plan.contains("attachment_management_group_work"));
+    assert!(!plan.contains("TEMP B-TREE"));
     drop(c);
 }
 

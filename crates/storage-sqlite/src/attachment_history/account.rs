@@ -184,7 +184,9 @@ impl SqliteAccountStorage {
         self.account_attachment_history_version_at(clock()?)
     }
     /// Same-clock snapshot composition for bounded acquisition projections and retention tests.
-    pub(crate) fn account_attachment_history_version_at(
+    /// Qualify expiry at an existing read's observed clock while checking the
+    /// current persisted source/privacy revision. Starts no network or writes.
+    pub fn account_attachment_history_version_at(
         &self,
         now: u64,
     ) -> Result<AccountAttachmentVersion, AccountAttachmentHistoryError> {

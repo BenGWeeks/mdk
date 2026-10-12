@@ -2,6 +2,48 @@ use super::*;
 use crate::MarmotApp;
 use marmot_account::AccountHome;
 use storage_sqlite::{AttachmentDemand, StoredAccountGroup, StoredAccountState, StoredAppEvent};
+
+#[test]
+fn health_expiry_recheck_keeps_the_snapshot_clock_and_still_fences_privacy() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let s = app.account_storage("alice").unwrap();
+    seed(&s, 1);
+    let message = format!("{:064x}", 1);
+    s.finalize_app_event_source_retention(
+        "aa",
+        &message,
+        Some(&message),
+        0,
+        cgka_traits::app_event::AppMessageRetentionDecision::new(1, 12),
+    )
+    .unwrap();
+    let q = AttachmentJobQuery {
+        group_id_hex: "aa".into(),
+        ..Default::default()
+    };
+    let frame = s
+        .attachment_management_frame(
+            &q,
+            12,
+            storage_sqlite::AttachmentManagementPermission {
+                automatic: true,
+                categories: [true; 4],
+            },
+        )
+        .unwrap();
+    assert_eq!(frame.page.entries.len(), 1);
+    // The wall clock is already later than this injected expiry. A consistent
+    // read at observed_at must not become a terminal observation error.
+    assert!(recheck(&s, &frame.page.history_version, frame.page.observed_at).is_ok());
+    s.invalidate_app_event_by_message_id("aa", &message, "test_privacy_change")
+        .unwrap();
+    assert!(recheck(&s, &frame.page.history_version, frame.page.observed_at).is_err());
+}
+
 fn group(pending: bool) -> StoredAccountGroup {
     StoredAccountGroup {
         group_id_hex: "aa".into(),

@@ -77,12 +77,18 @@ fn present_page(
 fn recheck(
     s: &storage_sqlite::SqliteAccountStorage,
     before: &storage_sqlite::AccountAttachmentVersion,
+    observed_at: u64,
 ) -> Result<(), AppError> {
-    let current = s.account_attachment_history_version().map_err(|_| {
-        AppError::from(cgka_traits::storage::StorageError::Backend(
-            "attachment management unavailable".into(),
-        ))
-    })?;
+    // Keep expiry qualification at the snapshot's clock. A deadline crossing
+    // during presentation must wake the next read, not close the observation.
+    // Current persisted privacy/source revisions are still checked here.
+    let current = s
+        .account_attachment_history_version_at(observed_at)
+        .map_err(|_| {
+            AppError::from(cgka_traits::storage::StorageError::Backend(
+                "attachment management unavailable".into(),
+            ))
+        })?;
     if current.requires_restart_since(before) {
         return Err(AppError::from(cgka_traits::storage::StorageError::Backend(
             "attachment management restart required".into(),
@@ -129,8 +135,9 @@ impl MarmotAppRuntime {
                 automatic,
             )?;
             let h = p.history_version.clone();
+            let observed_at = p.observed_at;
             let p = present_page(p, loopback)?;
-            recheck(&s, &h)?;
+            recheck(&s, &h, observed_at)?;
             Ok(p)
         })
         .await
@@ -159,7 +166,7 @@ impl MarmotAppRuntime {
                 page: present_page(f.page, loopback)?,
                 version: f.version,
             };
-            recheck(&s, &h)?;
+            recheck(&s, &h, result.page.observed_at)?;
             Ok(result)
         })
         .await
