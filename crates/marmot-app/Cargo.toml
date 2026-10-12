@@ -50,8 +50,8 @@ openssl.workspace = true
 opentelemetry-proto = { workspace = true, optional = true }
 # Request-owned, DNS-pinned WebSocket dials for public-event previews. Same
 # tokio-tungstenite release async-wsocket 0.17 links, so frames convert with
-# its `Message` impls; aliased to stay apart from the 0.26 dev-dependency.
-pinned-tokio-tungstenite = { package = "tokio-tungstenite", version = "0.28.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# its `Message` impls.
+tokio-tungstenite.workspace = true
 prost = { workspace = true, optional = true }
 psl.workspace = true
 rand.workspace = true
@@ -64,7 +64,7 @@ sha2.workspace = true
 storage-sqlite.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["fs", "net"] }
+tokio = { workspace = true, features = ["fs", "net", "io-util"] }
 tokio-util.workspace = true
 tracing.workspace = true
 transport-nostr-adapter = { workspace = true, features = ["sdk"] }
@@ -87,7 +87,6 @@ parking_lot = "0.12"
 tls_codec.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-tokio-tungstenite = "0.26"
 
 [[bench]]
 name = "media_download_backlog"

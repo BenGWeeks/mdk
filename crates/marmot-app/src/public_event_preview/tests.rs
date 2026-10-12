@@ -1303,8 +1303,8 @@ fn eviction_removes_whole_cohorts_and_documents_the_end_of_deletion_knowledge() 
 #[tokio::test]
 async fn target_and_evidence_queries_reuse_the_same_relay_connection() {
     use futures::{SinkExt, StreamExt};
-    use pinned_tokio_tungstenite::tungstenite::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_tungstenite::tungstenite::Message;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let connections = Arc::new(AtomicUsize::new(0));
@@ -1314,9 +1314,7 @@ async fn target_and_evidence_queries_reuse_the_same_relay_connection() {
         while let Ok((socket, _)) = listener.accept().await {
             count.fetch_add(1, Ordering::SeqCst);
             sockets.spawn(async move {
-                let mut ws = pinned_tokio_tungstenite::accept_async(socket)
-                    .await
-                    .unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
                 while let Some(Ok(message)) = ws.next().await {
                     let Ok(text) = message.into_text() else {
                         continue;
@@ -1351,7 +1349,7 @@ async fn target_and_evidence_queries_reuse_the_same_relay_connection() {
 #[tokio::test]
 async fn failed_relay_handshakes_do_not_dilute_the_live_relay_event_budget() {
     use futures::{SinkExt, StreamExt};
-    use pinned_tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::Message;
     let good = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let good_url = format!("ws://{}", good.local_addr().unwrap());
     let mut hints = vec![good_url.clone()];
@@ -1370,9 +1368,7 @@ async fn failed_relay_handshakes_do_not_dilute_the_live_relay_event_budget() {
         let mut limit_tx = Some(limit_tx);
         for _ in 0..2 {
             let (socket, _) = good.accept().await.unwrap();
-            let mut websocket = pinned_tokio_tungstenite::accept_async(socket)
-                .await
-                .unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             while let Some(Ok(message)) = websocket.next().await {
                 let Ok(text) = message.into_text() else {
                     continue;
@@ -1455,7 +1451,7 @@ fn batch_lookup_rolls_back_all_recency_touches_on_failure() {
 #[tokio::test]
 async fn slow_target_phase_reserves_time_for_author_evidence() {
     use futures::{SinkExt, StreamExt};
-    use pinned_tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::Message;
     let keys = Keys::generate();
     let profile = signed(&keys, 0, crate::unix_now_seconds(), r#"{"name":"Alice"}"#);
     let expected = profile.as_json();
@@ -1464,9 +1460,7 @@ async fn slow_target_phase_reserves_time_for_author_evidence() {
     let reply = expected.clone();
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let mut websocket = pinned_tokio_tungstenite::accept_async(socket)
-            .await
-            .unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
         while let Some(Ok(message)) = websocket.next().await {
             let Ok(text) = message.to_text() else {
                 continue;

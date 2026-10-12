@@ -406,9 +406,7 @@ mod tests {
         let (requested, request_seen) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut websocket = pinned_tokio_tungstenite::accept_async(socket)
-                .await
-                .unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             while let Some(Ok(message)) = websocket.next().await {
                 if message
                     .to_text()

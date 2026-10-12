@@ -52,12 +52,12 @@ use cgka_traits::app_components::{is_loopback_host, is_loopback_ip, reject_non_p
 use futures::{Sink, Stream, StreamExt};
 use nostr_sdk::error::Error as SdkError;
 use nostr_sdk::transport::websocket::WebSocketTransport;
-use pinned_tokio_tungstenite::tungstenite::Error as TungsteniteError;
-use pinned_tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
-use pinned_tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, Sleep, timeout_at};
+use tokio_tungstenite::tungstenite::Error as TungsteniteError;
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use url::{Host, Url};
 
 use super::{DIRECTORY_RELAY_CONNECT_WAIT, RelaySafetyPolicy};
@@ -334,6 +334,14 @@ impl PublicEventSocketRegistry {
         });
         state.sockets.push(slot.clone());
         Some(slot)
+    }
+
+    /// Retire this phase's sockets without ending the request or refunding its
+    /// socket-attempt allowance. A fresh phase can reconnect within that cap.
+    pub(crate) fn close_open_sockets(&self) {
+        for slot in self.lock().sockets.clone() {
+            slot.close();
+        }
     }
 
     /// Forcibly close every socket and refuse new ones. Idempotent.
@@ -833,12 +841,7 @@ impl PinnedPublicEventTransport {
         // pinned address.
         let (websocket, _response) = timeout_at(
             connect_deadline,
-            pinned_tokio_tungstenite::client_async_tls_with_config(
-                url.as_str(),
-                io,
-                Some(config),
-                None,
-            ),
+            tokio_tungstenite::client_async_tls_with_config(url.as_str(), io, Some(config), None),
         )
         .await
         .map_err(|_| refused())?
@@ -1159,7 +1162,7 @@ mod tests {
         let (listener, addr) = loopback_listener().await;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let mut websocket = pinned_tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(tcp).await.unwrap();
             let raw = websocket.get_mut();
             // An unfinished text frame (FIN clear), then empty continuation
             // frames that never finish the message: the WebSocket parser
@@ -1187,7 +1190,7 @@ mod tests {
         let sockets = PublicEventSocketRegistry::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         let (io, _slot) = pinned_io(addr, &meter, &sockets, deadline).await;
-        let (websocket, _response) = pinned_tokio_tungstenite::client_async_with_config(
+        let (websocket, _response) = tokio_tungstenite::client_async_with_config(
             format!("ws://{addr}"),
             io,
             Some(public_event_websocket_config()),
@@ -1225,7 +1228,7 @@ mod tests {
         let (listener, addr) = loopback_listener().await;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let mut websocket = pinned_tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(tcp).await.unwrap();
             let raw = websocket.get_mut();
             raw.write_all(&[0x01, 0x01, b'[']).await.unwrap();
             // Stall mid-message and wait for the client to drop the socket.
@@ -1236,7 +1239,7 @@ mod tests {
         let sockets = PublicEventSocketRegistry::new();
         let deadline = Instant::now() + Duration::from_millis(500);
         let (io, slot) = pinned_io(addr, &meter, &sockets, deadline).await;
-        let (websocket, _response) = pinned_tokio_tungstenite::client_async_with_config(
+        let (websocket, _response) = tokio_tungstenite::client_async_with_config(
             format!("ws://{addr}"),
             io,
             Some(public_event_websocket_config()),
@@ -1309,7 +1312,7 @@ mod tests {
         let (listener, addr) = loopback_listener().await;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let mut websocket = pinned_tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(tcp).await.unwrap();
             tokio::time::sleep(Duration::from_millis(1500)).await;
             peer_observes_close(websocket.get_mut()).await
         });
@@ -1318,7 +1321,7 @@ mod tests {
         let sockets = PublicEventSocketRegistry::new();
         let deadline = Instant::now() + Duration::from_millis(500);
         let (io, slot) = pinned_io(addr, &meter, &sockets, deadline).await;
-        let (websocket, _response) = pinned_tokio_tungstenite::client_async_with_config(
+        let (websocket, _response) = tokio_tungstenite::client_async_with_config(
             format!("ws://{addr}"),
             io,
             Some(public_event_websocket_config()),

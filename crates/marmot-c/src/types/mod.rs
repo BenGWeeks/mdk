@@ -42,3 +42,5 @@ pub mod avatar;
 pub mod moderation;
 
 pub mod public_event_preview;
+pub mod startup_diagnostics;
+pub use startup_diagnostics::*;

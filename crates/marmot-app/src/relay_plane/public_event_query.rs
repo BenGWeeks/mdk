@@ -5,7 +5,7 @@
 //! for. Every request uses a fresh anonymous SDK client whose only WebSocket
 //! transport is [`PinnedPublicEventTransport`]: endpoints pass
 //! [`super::RelaySafetyPolicy`], hostnames are resolved once, every address is
-//! validated and the socket is pinned before TLS (see
+//! validated and each dial pins its resolved socket before TLS (see
 //! `public_event_transport.rs`). At most four relays, the caller's absolute
 //! deadline, a raw wire-byte budget charged below TLS/WebSocket parsing and an
 //! item budget charged on decoded messages before the SDK verifies or
@@ -24,13 +24,13 @@ use nostr_sdk::prelude::{
     ReqTarget, SingleLetterTag,
 };
 use tokio::task::JoinSet;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, timeout_at};
 
+use super::RelaySafetyPolicy;
 use super::public_event_transport::{
     CloseSocketsOnDrop, PinnedPublicEventTransport, PublicEventPhaseRoute,
     PublicEventSocketRegistry, PublicEventTrafficLimits, PublicEventTrafficMeter,
 };
-use super::{DIRECTORY_RELAY_CONNECT_WAIT, RelaySafetyPolicy};
 
 /// Maximum relays one public-event preview request may contact.
 pub(crate) const PUBLIC_EVENT_QUERY_MAX_RELAYS: usize = 4;
@@ -216,7 +216,10 @@ impl PublicEventQuerySession {
         self.route.route_to(&phase);
         // Switching to the fresh phase precedes reconnection: exhaustion of the
         // target share must not prevent acquisition of reserved deletion evidence.
-        let connected = connect(&self.client, self.urls.clone(), deadline).await;
+        // A stalled relay must not consume the healthy relays' acquisition time.
+        let connect_deadline =
+            Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2;
+        let connected = connect(&self.client, self.urls.clone(), connect_deadline).await;
         let _ = timeout_at(
             deadline,
             acquire(
@@ -231,6 +234,13 @@ impl PublicEventQuerySession {
         .await;
         outcome.received_items = phase.items();
         outcome.received_bytes = phase.bytes();
+        if phase.is_exhausted() {
+            self.sockets.close_open_sockets();
+            // Cancel the SDK's automatic reconnect/backoff before the next phase
+            // activates a fresh meter. Disconnect signals task termination; the
+            // connect helper waits for the replacement's actual Connected state.
+            let _ = timeout_at(self.deadline, self.client.disconnect()).await;
+        }
         outcome
     }
 
@@ -263,27 +273,38 @@ async fn shutdown_before_deadline(
 }
 
 async fn connect(client: &NostrSdkClient, urls: Vec<RelayUrl>, deadline: Instant) -> Vec<RelayUrl> {
+    use futures::StreamExt;
     let mut connects = JoinSet::new();
-    for url in urls {
+    for url in &urls {
         if client.add_relay(url.clone()).await.is_err() {
             continue;
         }
-        let client = client.clone();
+        let Ok(Some(relay)) = client.relay(url.clone()).await else {
+            continue;
+        };
         connects.spawn(async move {
-            let connected = matches!(
-                timeout(
-                    DIRECTORY_RELAY_CONNECT_WAIT,
-                    client.try_connect_relay(url.clone(), DIRECTORY_RELAY_CONNECT_WAIT),
-                )
-                .await,
-                Ok(Ok(()))
-            );
-            (url, connected)
+            if relay.status().is_connected() {
+                return;
+            }
+            // try_connect is a one-shot admission, not a task-exit barrier. A
+            // retiring task can queue a replacement yet return a state error.
+            relay.disconnect();
+            let mut updates = relay.notifications_with_gaps();
+            relay.connect();
+            while !relay.status().is_connected() {
+                if matches!(timeout_at(deadline, updates.next()).await, Ok(Some(_))) {
+                    continue;
+                }
+                break;
+            }
         });
     }
+    while let Ok(Some(_)) = timeout_at(deadline, connects.join_next()).await {}
     let mut connected = Vec::new();
-    while let Ok(Some(result)) = timeout_at(deadline, connects.join_next()).await {
-        if let Ok((url, true)) = result {
+    for url in urls {
+        if let Ok(Some(relay)) = client.relay(url.clone()).await
+            && relay.status().is_connected()
+        {
             connected.push(url);
         }
     }
@@ -524,9 +545,7 @@ mod tests {
         let server = tokio::spawn(async move {
             for connection in 0..2 {
                 let (socket, _) = listener.accept().await.unwrap();
-                let mut ws = pinned_tokio_tungstenite::accept_async(socket)
-                    .await
-                    .unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
                 while let Some(Ok(message)) = ws.next().await {
                     let Ok(text) = message.to_text() else {
                         continue;
@@ -542,7 +561,7 @@ mod tests {
                         for _ in 0..9 {
                             let junk = serde_json::json!(["EVENT", subscription, {}]);
                             if ws
-                                .send(pinned_tokio_tungstenite::tungstenite::Message::text(
+                                .send(tokio_tungstenite::tungstenite::Message::text(
                                     junk.to_string(),
                                 ))
                                 .await
@@ -558,12 +577,12 @@ mod tests {
                         subscription,
                         serde_json::from_str::<serde_json::Value>(&note.as_json()).unwrap()
                     ]);
-                    ws.send(pinned_tokio_tungstenite::tungstenite::Message::text(
+                    ws.send(tokio_tungstenite::tungstenite::Message::text(
                         event.to_string(),
                     ))
                     .await
                     .unwrap();
-                    ws.send(pinned_tokio_tungstenite::tungstenite::Message::text(
+                    ws.send(tokio_tungstenite::tungstenite::Message::text(
                         serde_json::json!(["EOSE", subscription]).to_string(),
                     ))
                     .await

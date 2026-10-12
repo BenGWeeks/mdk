@@ -2193,6 +2193,7 @@ impl MarmotApp {
         gate
     }
 
+    #[cfg(test)]
     pub(crate) fn public_event_cache_for_account(
         &self,
         account: &AccountSummary,
@@ -2203,6 +2204,7 @@ impl MarmotApp {
 
     /// Revalidate under the account's cache-opening fence. Removal first marks
     /// the account tearing down, then takes this same fence before cache eviction.
+    #[cfg(test)]
     pub(crate) fn public_event_cache_for_account_if_current(
         &self,
         account: &AccountSummary,
@@ -2297,20 +2299,6 @@ impl MarmotApp {
             .is_some_and(|current| current.same_incarnation(cache))
     }
 
-    /// One read per reference in input order, duplicates included. The cache
-    /// and directory handles are acquired once for the batch.
-    pub(crate) fn cached_public_events_for_account(
-        &self,
-        account: &AccountSummary,
-        references: &[PublicEventReference],
-    ) -> Result<Vec<PublicEventCacheRead>, AppError> {
-        if references.is_empty() {
-            return Ok(Vec::new());
-        }
-        let cache = self.public_event_cache_for_account(account)?;
-        self.cached_public_events_with_cache(account, &cache, references)
-    }
-
     pub(crate) fn cached_public_events_with_cache(
         &self,
         account: &AccountSummary,
@@ -2331,6 +2319,7 @@ impl MarmotApp {
         Ok(reads)
     }
 
+    #[cfg(test)]
     pub(crate) fn admit_public_events_for_account(
         &self,
         account: &AccountSummary,
