@@ -7,7 +7,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Mirror bounded native startup progress with opt-in enable/snapshot functions and a deep-free snapshot API. The synchronous observation remains usable before native startup completes.
+
 ### Added
+
+- NIP-46 signer sessions and the runtime follow the opt-in `WN_SOCKS5_*`
+  proxy settings described in the marmot-app
+  [SOCKS5 routing](../marmot-app/README.md#socks5-routing) section. With the
+  variables unset, nothing changes. When they are invalid,
+  `marmot_nip46_new` returns `MARMOT_STATUS_INVALID_ARGUMENT` and
+  `marmot_client_new` fails instead of connecting directly. Agent preview
+  publishing and watching are unavailable while SOCKS5 is on.
 
 - `marmot_submit_moderation_report`, `marmot_moderation_reporting_available`,
   `marmot_configure_moderation_reporting` and
