@@ -654,6 +654,8 @@ The whole request is validated first, so an invalid reference or more than 16 re
 event ID needs no age-based refresh; a coordinate sets `refreshRecommended` after 15 minutes but keeps its content.
 Every payload carries `projectionVersion` (currently 1).
 
+Configured SOCKS5 routing keeps local cached reads and admission available. Public-event relay refresh returns an unsupported error while a proxy is enabled; the pinned transport also refuses direct dialing for configured or invalid proxy policies.
+
 `resolvePublicEventPreview(accountRef, reference)` performs the bounded native refresh and returns the resulting
 local state. It asks at most four safe relays (up to two ephemeral reference hints, then the configured directory
 relays) for the exact event ID or complete coordinate, then NIP-09 deletion requests and kind-0 metadata from the
@@ -1153,7 +1155,11 @@ check, not a comparison benchmark. It builds Kotlin/Swift generation and every
 Android or Apple native target once in parallel, transfers those inputs only
 within the current workflow run, verifies their source, builder, toolchain,
 profile, feature and run provenance, then assembles and validates the Android,
-iOS and macOS candidate packages. Pull requests restore the trusted release
+iOS and macOS candidate packages. Pull requests build the Apple inputs and
+packages only when they change `crates/marmot-uniffi/` (other than Markdown) or a
+MarmotKit bindings workflow, because macOS runners are scarce; every other pull
+request still builds and validates the Android package, and `master` pushes always
+build the complete matrix. Pull requests restore the trusted release
 cache read-only; only runs using the workflow from `master` may update it. A
 weekly scheduled exact-head run on `master` provides drift detection and
 refreshes those trusted cache seeds; it intentionally executes the complete

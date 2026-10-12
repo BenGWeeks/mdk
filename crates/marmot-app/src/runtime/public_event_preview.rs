@@ -119,6 +119,13 @@ impl MarmotAppRuntime {
         reference: &str,
     ) -> Result<PublicEventCacheRead, AppError> {
         let (reference, hints) = PublicEventReference::parse_with_hints(reference)?;
+        if crate::network_proxy::socks5_proxy()
+            .map_err(crate::network_proxy::config_error)?
+            .is_some()
+        {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "public event preview refresh is unavailable with SOCKS5; local cached reads remain available").into());
+        }
         let key = reference.cache_key()?;
 
         self.accounts.shared.lifecycle().ensure_running()?;

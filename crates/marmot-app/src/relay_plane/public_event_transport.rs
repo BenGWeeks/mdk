@@ -800,7 +800,12 @@ impl PinnedPublicEventTransport {
     }
 
     async fn dial(&self, raw_url: &str) -> Result<(TransportSink, TransportStream), SdkError> {
-        if self.meter.is_exhausted() || Instant::now() >= self.deadline {
+        // Replacing the SDK transport must not override an authenticated proxy
+        // or an invalid-config refusal with a direct pinned socket.
+        if !matches!(crate::network_proxy::socks5_proxy(), Ok(None))
+            || self.meter.is_exhausted()
+            || Instant::now() >= self.deadline
+        {
             return Err(refused());
         }
         let url = Url::parse(raw_url).map_err(|_| refused())?;

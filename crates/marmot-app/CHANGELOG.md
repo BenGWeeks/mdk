@@ -2,9 +2,32 @@
 
 ## Unreleased
 
-- Opt-in native startup memory capture reports anonymous account/store/key-opening phases, migration progress and async completion, with bounded history/drop counters. Snapshotting does not query storage or the keystore, and ordinary construction keeps capture disabled.
+### Added
+
+- Account-scoped public-event previews provide cached ordered reads, signed-candidate
+  admission and bounded relay refresh through `cached_public_event_previews`,
+  `cache_public_event_preview` and `resolve_public_event_preview`.
+  Each account retains at most 1,024 records and 32 MiB. Cohort eviction removes
+  selections and deletion evidence together, suppressing subsequent deletion
+  and preview writes in the same admission.
+
+## 0.13.0 - 2026-10-12
 
 ### Breaking changes
+
+- External-signer accounts move their device-local SQLCipher key from the
+  plaintext `.external-sqlcipher-secret` file into the configured `SecretStore`
+  (`.external-sqlcipher/<account label>`) on first open, then scrub and remove the
+  file. Older binaries cannot open these databases; downgrade is unsupported.
+  Opening a database with neither credential fails instead of generating a key.
+
+- `PresentedChatRow` adds `draft_version: Option<ChatListDraftVersion>`; struct
+  literals must set it. `MessageDraftRevision::includes_chat_list_version`
+  compares the two. An identical-text draft save now advances the revision.
+
+- `GroupEvent` adds `LocalGroupCopyTerminated`, `LocalGroupCopyRestored` and
+  `GroupMemberLeavesRemoved`; update exhaustive matches. See Fixed for their
+  semantics.
 
 - `AppError` adds `ModerationReportingNotConfigured`, `InvalidModerationReportConfig`,
   `InvalidReportedPublicKey`, `CannotReportSelf` and `ModerationReportRateLimited`;
@@ -21,6 +44,13 @@
   when empty and older ones still deserialize.
 
 ### Added
+
+- `MarmotApp::set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot`
+  (`NativeStartupSnapshot`, `NativeStartupStage`, `NativeStartupOutcome`,
+  `NativeStartupObservation`) report opt-in, in-memory account, store and
+  key-opening phases, migration progress and async completion, with bounded
+  history and drop counters. Snapshotting does not query storage or the keystore,
+  and ordinary construction keeps capture disabled.
 
 - Relay refusals of live subscriptions are no longer dropped silently (#2247).
   When a relay answers an inbox, group or maintenance REQ with `CLOSED`, the
@@ -77,12 +107,6 @@
   its first local step ignores the profile and returns what its bootstrap
   publishes.
 
-- Account-scoped public-event previews provide cached ordered reads, signed-candidate
-  admission and bounded relay refresh through `cached_public_event_previews`,
-  `cache_public_event_preview` and `resolve_public_event_preview`.
-  Each account retains at most 1,024 records and 32 MiB. Cohort eviction removes
-  selections and deletion evidence together, suppressing subsequent deletion
-  and preview writes in the same admission.
 
 - `AccountManager::propose_onboarding_relay_repair` previews exact ordered
   tags, content and minimal relay changes without signing or publishing.
@@ -112,6 +136,9 @@
 
 ### Changed
 
+- Polls can be created in direct conversations as well as groups. Renaming or
+  reclassifying a conversation does not disable an existing open poll.
+
 - A sync drain stops waiting once every relay has answered its history REQs,
   counting a relay that refused one for good as answered, instead of running
   to `SDK_FIRST_SYNC_WAIT` / `SDK_DRAIN_WAIT`. A refusal is not evidence of
@@ -124,6 +151,14 @@
   `relay.damus.io` can be invited again.
 
 ### Fixed
+
+- Invites recover a member's KeyPackage from up to eight discovery relays when
+  their advertised outboxes have no usable one, checking signed deletions and
+  newer slot replacements before using it. Lookup stays within the existing
+  50-second deadline and incomplete coverage stays retryable (#2200).
+- Durably accepted sends no longer wait behind startup recovery, automatic push
+  gossip, a pending retry deadline or an older publication's secondary-relay
+  retry once required acknowledgements and MLS confirmation complete.
 
 - Catch-up downloads a large group backlog oldest first. When more history
   is missing than one comparison pass fetches, the pass narrows to the oldest

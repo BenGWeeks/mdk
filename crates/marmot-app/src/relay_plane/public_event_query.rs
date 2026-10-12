@@ -167,7 +167,7 @@ impl PublicEventQuerySession {
         urls.truncate(PUBLIC_EVENT_QUERY_MAX_RELAYS);
         let sockets = PublicEventSocketRegistry::new();
         let route = PublicEventPhaseRoute::new(request);
-        let client = NostrSdkClient::builder()
+        let client = crate::network_proxy::nostr_builder()
             .websocket_transport(PinnedPublicEventTransport::new(
                 policy,
                 route.clone(),
@@ -742,6 +742,75 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             "expired cleanup is cancelled"
         );
+    }
+
+    #[test]
+    fn configured_process_proxy_never_dials_preview_relays_directly() {
+        const CHILD: &str = "MDK_PREVIEW_PROXY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for (endpoint, user, password) in [
+                ("127.0.0.1:1", "", ""),
+                ("127.0.0.1:1", "fixture-user", "fixture-password"),
+                ("invalid-proxy", "", ""),
+            ] {
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "relay_plane::public_event_query::tests::configured_process_proxy_never_dials_preview_relays_directly", "--nocapture"])
+                    .env(CHILD, "1").env("WN_SOCKS5_PROXY", endpoint)
+                    .env("WN_SOCKS5_USERNAME", user).env("WN_SOCKS5_PASSWORD", password)
+                    .output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "isolated proxy policy regression failed: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let request = request_meter();
+            let result = query_public_events_on(
+                RelaySafetyPolicy::with_allow_loopback(true),
+                vec![TransportEndpoint(url.clone())],
+                id_filters(&["ab".repeat(32)]),
+                PublicEventQueryBudget {
+                    max_items: 8,
+                    max_bytes: 1024 * 1024,
+                },
+                &request,
+                Instant::now() + Duration::from_millis(250),
+            )
+            .await;
+            assert_eq!(result, PublicEventQueryOutcome::default());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "configured proxy was replaced by a direct pinned connection"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            marmot_account::AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let app = crate::MarmotApp::with_relay(dir.path(), &url);
+            let runtime = app.runtime();
+            assert_eq!(
+                runtime
+                    .cached_public_event_previews("alice", &["ab".repeat(32)])
+                    .unwrap()[0]
+                    .result,
+                crate::PublicEventCacheResult::Missing
+            );
+            assert!(
+                runtime
+                    .resolve_public_event_preview("alice", &"ab".repeat(32))
+                    .await
+                    .is_err(),
+                "unsupported or invalid proxy refresh must return an error"
+            );
+            runtime.shutdown_and_close().await.unwrap();
+        });
     }
 
     #[test]
