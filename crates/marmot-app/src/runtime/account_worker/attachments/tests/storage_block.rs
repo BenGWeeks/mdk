@@ -538,8 +538,9 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
         let now = scheduler_now();
         assert_eq!(fixture.state(), AttachmentTransferState::Queued);
         let due = fixture.due().unwrap();
-        // The scheduler read its clock somewhere in this window.
-        delays.push((due - now)..=(due - readmit_from));
+        // The scheduler read its clock somewhere in this window; an immediate
+        // readmission can be due a second before the test reads the clock.
+        delays.push(due.saturating_sub(now)..=due.saturating_sub(readmit_from));
         if due > now {
             // Not a moment earlier: a tick before the due time fetches nothing.
             fixture.advance(due - now - 1);
