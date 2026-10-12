@@ -8,7 +8,6 @@
   `InvalidModerationReportConfig`, `InvalidReportedPublicKey`, `CannotReportSelf`
   and `ModerationReportRateLimited`. Regenerate bindings with the matching
   library and update exhaustive Swift `switch` / Kotlin `when` handling.
-
 - `AttachmentTransferStateFfi` adds `StorageBlocked`: free disk cannot cover
   the publication reserve for the body, checkpoints are kept, and the job
   readmits once space frees or on explicit Retry. Update exhaustive

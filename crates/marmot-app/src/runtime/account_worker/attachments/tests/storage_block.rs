@@ -15,7 +15,9 @@ use super::*;
 use crate::media::attachment_resume::test_free_space;
 use crate::runtime::account_worker::attachments::test_clock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use storage_sqlite::{AttachmentTransferState, STORAGE_READMIT_MARGIN_BYTES};
+use storage_sqlite::{
+    AttachmentTransferState, STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS, STORAGE_READMIT_MARGIN_BYTES,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MIB: u64 = 1024 * 1024;
@@ -507,7 +509,11 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
     let mut target = fixture.park_and_hold(&requests).await;
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     let mut parks = 1;
-    let mut delays: Vec<std::ops::RangeInclusive<u64>> = vec![];
+    // Pin the scheduler's clock, so each readmission delay compares exactly
+    // and the early tick below runs strictly before the due time.
+    let mut clock = crate::unix_now_seconds();
+    test_clock::set_now(fixture._dir.path(), clock);
+    let mut delays = vec![];
     loop {
         // The body needs five of itself (staging plus the publication
         // reserve); no recorded target may ask for more.
@@ -525,9 +531,6 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
         assert_eq!(requests.load(Ordering::SeqCst), before);
         // Free exactly what the last park asked for, as a slowly emptying disk would.
         fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES);
-        let scheduler_now =
-            || crate::unix_now_seconds() + test_clock::skew_for_test(fixture._dir.path());
-        let readmit_from = scheduler_now();
         schedule(
             &fixture.client,
             &fixture.shared,
@@ -535,20 +538,20 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
             &mut fixture.admission,
         )
         .unwrap();
-        let now = scheduler_now();
         assert_eq!(fixture.state(), AttachmentTransferState::Queued);
         let due = fixture.due().unwrap();
-        // The scheduler read its clock somewhere in this window; an immediate
-        // readmission can be due a second before the test reads the clock.
-        delays.push(due.saturating_sub(now)..=due.saturating_sub(readmit_from));
-        if due > now {
-            // Not a moment earlier: a tick before the due time fetches nothing.
-            fixture.advance(due - now - 1);
+        delays.push(due - clock);
+        if due > clock {
+            // Not a moment earlier: a tick one second before the due time
+            // leaves the row queued and fetches nothing.
+            test_clock::set_now(fixture._dir.path(), due - 1);
             fixture.tick().await;
             assert!(fixture.completions.try_recv().is_err());
+            assert_eq!(fixture.state(), AttachmentTransferState::Queued);
             assert_eq!(requests.load(Ordering::SeqCst), before);
-            fixture.advance(1);
         }
+        clock = due;
+        test_clock::set_now(fixture._dir.path(), clock);
         fixture.tick().await;
         let done = fixture.completion().await;
         match &done.completion {
@@ -596,13 +599,7 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
             }
         })
         .collect();
-    assert_eq!(delays.len(), streak.len());
-    for (window, expected) in delays.iter().zip(&streak) {
-        assert!(
-            window.contains(expected),
-            "readmission delay {window:?} does not allow the streak's {expected} s: {delays:?}"
-        );
-    }
+    assert_eq!(delays, streak);
     assert!(
         parks >= 3,
         "the trickle must exercise the streak: {parks} parks"
@@ -616,15 +613,22 @@ async fn unknown_length_restarts_record_the_proven_need_and_back_off() {
     server.await.unwrap();
 }
 
-/// File sink with a strong validator, end to end: free space drops while the
-/// body is mid-transfer, so the mid-transfer check parks with `6T - S` in the
-/// worker's frame (four bodies, the staging and checkpoint still to grow, and
-/// the staging already held). Readmitted at exactly that target plus the
-/// margin, the attempt restores the saved prefix, finishes with one Range
-/// request and publishes without parking again. A target that dropped the
-/// held staging or the remaining checkpoint growth would re-park here.
-#[tokio::test]
-async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
+/// A validated file-sink job parked mid-transfer by free space dropping while
+/// its body streams: what the end-to-end mid-transfer tests start from.
+struct MidTransferPark {
+    fixture: Fixture,
+    plain: Vec<u8>,
+    total: u64,
+    requests: Arc<AtomicUsize>,
+    server: tokio::task::JoinHandle<()>,
+    headroom: u64,
+    saved: u64,
+}
+
+/// Stream a 16 MiB validated body through the file sink, drop free space once
+/// six checkpoints are saved, and complete the park the next mid-transfer
+/// check records. The server pauses only the first full response.
+async fn park_mid_transfer() -> MidTransferPark {
     let plain = vec![0x5a; 16 * MIB as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (reference, cipher) = loopback_reference(&listener, &plain);
@@ -710,13 +714,42 @@ async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
     let headroom = parked_headroom(&done);
     let saved = fixture.storage.attachment_partial_bytes_for_test().unwrap();
     assert!(saved >= 6 * MIB && saved < total, "saved {saved}");
+    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
+    MidTransferPark {
+        fixture,
+        plain,
+        total,
+        requests,
+        server,
+        headroom,
+        saved,
+    }
+}
+
+/// File sink with a strong validator, end to end: free space drops while the
+/// body is mid-transfer, so the mid-transfer check parks with `6T - S` in the
+/// worker's frame (four bodies, the staging and checkpoint still to grow, and
+/// the staging already held). Readmitted at exactly that target plus the
+/// margin, the attempt restores the saved prefix, finishes with one Range
+/// request and publishes without parking again. A target that dropped the
+/// held staging or the remaining checkpoint growth would re-park here.
+#[tokio::test]
+async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
+    let MidTransferPark {
+        mut fixture,
+        plain,
+        total,
+        requests,
+        server,
+        headroom,
+        saved,
+    } = park_mid_transfer().await;
     assert_eq!(
         headroom,
         6 * total - saved,
         "four bodies, the staging and checkpoint growth, and the held staging"
     );
-    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
-    assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
     let before = requests.load(Ordering::SeqCst);
     // Exactly the recorded target plus the margin, in the worker's frame.
     fixture.set_free(headroom + STORAGE_READMIT_MARGIN_BYTES);
@@ -726,6 +759,49 @@ async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
         requests.load(Ordering::SeqCst),
         before + 1,
         "the remembered file sink restores the prefix and one Range request finishes the body"
+    );
+    server.abort();
+}
+
+/// A week after its latest park the prefix is pruned, and its saved bytes go
+/// back into the recorded target in the same step: the job no longer readmits
+/// at the stale `6T - S`, and at exactly `6T` plus the margin the readmitted
+/// attempt refetches the body once and publishes without parking again.
+#[tokio::test]
+async fn an_aged_parked_prefix_returns_its_bytes_to_the_target() {
+    let MidTransferPark {
+        mut fixture,
+        plain,
+        total,
+        requests,
+        server,
+        headroom,
+        saved,
+    } = park_mid_transfer().await;
+    assert_eq!(headroom, 6 * total - saved);
+    // Enough for the stale target only, a week on.
+    fixture.set_free(headroom + STORAGE_READMIT_MARGIN_BYTES);
+    fixture.advance(STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS);
+    fixture.tick().await;
+    assert_eq!(
+        fixture.storage.attachment_partial_bytes_for_test().unwrap(),
+        0,
+        "the aged prefix is pruned"
+    );
+    assert!(fixture.completions.try_recv().is_err());
+    assert_eq!(
+        fixture.state(),
+        AttachmentTransferState::StorageBlocked,
+        "the target grew by the pruned prefix"
+    );
+    let before = requests.load(Ordering::SeqCst);
+    fixture.set_free(6 * total + STORAGE_READMIT_MARGIN_BYTES);
+    fixture.tick().await;
+    fixture.publish_file(&plain).await;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        before + 1,
+        "one fresh request for the whole body, with no re-park"
     );
     server.abort();
 }
@@ -991,6 +1067,126 @@ async fn a_park_the_database_refuses_is_recorded_on_the_next_tick() {
     server.await.unwrap();
 }
 
+/// A pending park that fails with something other than a full database is
+/// neither dropped nor allowed to take the rest of the list with it: the
+/// park not yet tried keeps its place, the failing one moves behind it, and
+/// a later tick records both.
+#[test]
+fn pending_parks_survive_a_non_capacity_failure() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".into(),
+                groups: vec![group(false)],
+                ..Default::default()
+            },
+            100,
+            300,
+        )
+        .unwrap();
+    let claimed = |message: &str| {
+        let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(message.as_bytes()).into();
+        let tag = vec![
+            "imeta".to_string(),
+            "m application/octet-stream".to_string(),
+            format!("x {}", hex::encode(digest)),
+        ];
+        store
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: GROUP.into(),
+                message_id_hex: message.repeat(32),
+                source_message_id_hex: Some(message.repeat(32)),
+                source_epoch: Some(3),
+                direction: "received".into(),
+                sender: "33".repeat(32),
+                plaintext: String::new(),
+                kind: 9,
+                tags: vec![tag.clone()],
+                recorded_at: 10,
+                received_at: 10,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+        let selected = storage_sqlite::AttachmentHistoryEntry {
+            message_id_hex: message.repeat(32),
+            attachment_index: 0,
+            source_message_id_hex: message.repeat(32),
+            source_epoch: Some(3),
+            sender: "33".repeat(32),
+            timeline_at: 10,
+            received_at: 10,
+            slot: serde_json::to_value(&tag).unwrap(),
+            emoji_tags: Vec::new(),
+        };
+        let storage_sqlite::AttachmentDemand::Requested(asset) = store
+            .request_attachment_acquisition(GROUP, &selected, digest, 11)
+            .unwrap()
+        else {
+            panic!("attachment demand");
+        };
+        store
+            .claim_attachment_acquisition(&asset, 12, 1000)
+            .unwrap()
+            .unwrap()
+    };
+    let (first, second) = (claimed("aa"), claimed("bb"));
+    let pending = PendingStorageParks::default();
+    pending.lock().unwrap().extend([
+        PendingStoragePark {
+            job: first.clone(),
+            headroom: 4096,
+            restarts: false,
+        },
+        PendingStoragePark {
+            job: second.clone(),
+            headroom: 8192,
+            restarts: false,
+        },
+    ]);
+    let state = |job: &AttachmentAcquisition| {
+        store
+            .attachment_acquisition_status(&job.reference)
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    store
+        .fail_next_storage_parks_with_backend_error_for_test(1)
+        .unwrap();
+    assert!(!retry_pending_parks(&store, &pending, 20));
+    let kept: Vec<u64> = pending
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|park| park.headroom)
+        .collect();
+    assert_eq!(
+        kept,
+        [8192, 4096],
+        "the untried park keeps its place and the failing one moves behind it"
+    );
+    assert_eq!(
+        state(&first),
+        storage_sqlite::AttachmentAcquisitionState::Fetching
+    );
+    assert_eq!(
+        state(&second),
+        storage_sqlite::AttachmentAcquisitionState::Fetching
+    );
+    assert!(retry_pending_parks(&store, &pending, 21));
+    assert!(pending.lock().unwrap().is_empty());
+    assert_eq!(
+        state(&first),
+        storage_sqlite::AttachmentAcquisitionState::Blocked
+    );
+    assert_eq!(
+        state(&second),
+        storage_sqlite::AttachmentAcquisitionState::Blocked
+    );
+}
+
 /// Parking and readmission both reach a transfer subscription. A parked row
 /// sits outside the one-second refresh set, so a subscriber whose rows are all
 /// parked otherwise polls only every 30 seconds: readmission must wake it
@@ -1120,16 +1316,55 @@ async fn a_remembered_file_sink_never_routes_automatic_work() {
     server.await.unwrap();
 }
 
-/// An automatic body with no declared length grows its buffer geometrically
-/// to half the transfer limit and then once to the limit: the buffer never
-/// exceeds the limit, and the copy while it grows never holds more than 1.5
-/// times it. Plain doubling would hold a 4 MiB buffer and its 4.125 MiB
-/// successor at once here, about twice the limit.
+/// The growth rule itself, chunk by chunk: an undeclared length doubles up to
+/// half the limit, then takes exactly one step to the limit. Plain doubling
+/// would end `.., 2 MiB, 4 MiB, 4.125 MiB` and hold 4 + 4.125 MiB at once.
+#[test]
+fn undeclared_length_growth_doubles_to_half_the_limit_then_steps_once() {
+    let limit = (4 * MIB + 128 * 1024) as usize;
+    let body = (4 * MIB + 32 * 1024) as usize;
+    let chunk = 64 * 1024;
+    let (mut capacity, mut len, mut trajectory) = (0, 0, vec![]);
+    while len < body {
+        let needed = (len + chunk).min(body);
+        if capacity < needed {
+            capacity = crate::media::attachment_resume::next_body_capacity(capacity, needed, limit);
+            trajectory.push(capacity);
+        }
+        len = needed;
+    }
+    let half = limit.div_ceil(2);
+    let kib = 1024;
+    assert_eq!(
+        trajectory,
+        [
+            64 * kib,
+            128 * kib,
+            256 * kib,
+            512 * kib,
+            1024 * kib,
+            2048 * kib,
+            half,
+            limit
+        ]
+    );
+    // Every growth copy holds the old and new buffers at most 1.5 limits.
+    assert!(
+        trajectory
+            .windows(2)
+            .all(|step| step[0] + step[1] <= limit + limit / 2 + 1)
+    );
+}
+
+/// An automatic body with no declared length, measured: the buffer never
+/// exceeds the transfer limit, and the copy while it grows past half the limit
+/// holds at most 1.5 times it. Plain doubling would hold a 16 MiB buffer and its
+/// 16.5 MiB successor at once here, about twice the limit.
 #[test]
 fn automatic_unknown_length_body_stays_within_its_growth_bound() {
     crate::tests::alloc_audit::measure(async {
         use crate::tests::alloc_audit;
-        let plain = vec![0x55; (4 * MIB + 32 * 1024) as usize];
+        let plain = vec![0x55; (16 * MIB + 128 * 1024) as usize];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (reference, cipher) = loopback_reference(&listener, &plain);
         let requests = Arc::new(AtomicUsize::new(0));
@@ -1144,7 +1379,7 @@ fn automatic_unknown_length_body_stays_within_its_growth_bound() {
             Arc::clone(&requests),
             stopped,
         );
-        let limit = 4 * MIB + 128 * 1024;
+        let limit = 16 * MIB + 512 * 1024;
         let mut fixture = fixture(&reference, limit, false).await;
         let baseline = alloc_audit::live();
         alloc_audit::reset_peak();
@@ -1158,10 +1393,10 @@ fn automatic_unknown_length_body_stays_within_its_growth_bound() {
             capacity as u64 <= limit,
             "capacity {capacity} exceeds the transfer limit {limit}"
         );
-        // 1.5 times the limit for the growth copy, plus 1 MiB for the HTTP
-        // client's own buffers.
+        // 1.5 times the limit for the growth copy, plus 3 MiB for the HTTP
+        // client's own buffers; plain doubling needs about 33 MiB here.
         assert!(
-            peak <= limit * 3 / 2 + MIB,
+            peak <= limit * 3 / 2 + 3 * MIB,
             "growth held {peak} bytes against a {limit} byte limit"
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);

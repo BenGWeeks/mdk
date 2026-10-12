@@ -3441,6 +3441,11 @@ fn storage_parked_prefixes_expire_after_the_maximum_parked_age() {
     assert_eq!(partial_usage(&store), 0);
     assert_eq!(reserved(&store), 0, "the quota reservation is released");
     assert_eq!(
+        parked_headroom(&store, &asset),
+        Some(8192 + 3),
+        "the pruned prefix's bytes return to the target the next attempt needs"
+    );
+    assert_eq!(
         transfer(&store, "stale", true).state,
         AttachmentTransferState::StorageBlocked,
         "the row stays parked without its prefix"

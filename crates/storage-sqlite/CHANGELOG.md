@@ -63,11 +63,13 @@
   prefix's idle expiry; size-policy work stays parked, and
   `prune_attachment_partials` leaves parked (not cancelled) prefixes in place
   for at most `STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS` (seven days) after the
-  latest park. `attachment_partial_extent` reports a checkpoint's total and
+  latest park, then prunes them and adds their saved bytes to the row's target
+  in the same transaction. `attachment_partial_extent` reports a checkpoint's total and
   saved bytes, and `record_attachment_file_sink` remembers a body that needs
   the file sink. The new `test-support` feature exposes test hooks to
   dependents' tests: `limit_database_pages_for_test`,
-  `attachment_partial_bytes_for_test` and `fail_next_storage_parks_for_test`
+  `attachment_partial_bytes_for_test`, `fail_next_storage_parks_for_test` and
+  `fail_next_storage_parks_with_backend_error_for_test`
   (mdk#2239).
 
 ### Fixed

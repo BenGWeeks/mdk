@@ -137,9 +137,13 @@ fn retry_at(storage: &SqliteAccountStorage, job: &AttachmentAcquisition, now: u6
 
 /// A storage park the database could not record because the write itself
 /// failed, as it can on a truly full disk. The attempt's lease still fences the
-/// row, so the worker retries the park before it schedules anything else; a
-/// worker restart loses the list, and the reclaimed attempt then parks again at
-/// its first capacity check.
+/// row, so the worker retries the park before it schedules anything else.
+/// Until then the row shows the attempt's last phase and an explicit Retry
+/// changes nothing. A worker restart, or the lease expiring and the row being
+/// claimed again, loses the park: an explicit row's next attempt parks again at
+/// its first capacity check, but an automatic-history row whose verified body
+/// was receipted ends as `CompletedUnretained`, like any receipted body that
+/// was never published.
 #[derive(Clone)]
 pub(super) struct PendingStoragePark {
     job: AttachmentAcquisition,
@@ -180,42 +184,58 @@ fn park(
 
 /// Retry parks the database refused earlier. A superseded attempt (its lease
 /// was reclaimed) drops out; a park that still cannot be written stays.
+///
+/// Any other storage error stops this pass but loses nothing: the entries not
+/// yet tried keep their place and the failing one moves behind them, so a
+/// single entry that keeps failing can neither be dropped nor starve the rest.
+/// The error is logged rather than returned. The attempt's lease still fences
+/// the row, so retrying on the next tick is safe, and failing the tick would
+/// stall all attachment scheduling behind one stale entry.
 fn retry_pending_parks(
     storage: &SqliteAccountStorage,
     pending: &PendingStorageParks,
     now: u64,
-) -> Result<bool, AppError> {
+) -> bool {
     let parks = std::mem::take(
         &mut *pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
     );
     let mut recorded = false;
-    for entry in parks {
+    let mut kept = Vec::with_capacity(parks.len());
+    let mut parks = parks.into_iter();
+    while let Some(entry) = parks.next() {
         match storage.block_attachment_storage(&entry.job, entry.headroom, entry.restarts, now) {
             Ok(parked) => recorded |= parked,
             Err(cgka_traits::StorageError::Capacity(_) | cgka_traits::StorageError::Busy(_)) => {
-                pending
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(entry);
+                kept.push(entry);
             }
-            Err(error) => return Err(error.into()),
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
+                    "pending storage park could not be recorded; retrying next tick");
+                kept.extend(parks.by_ref());
+                kept.push(entry);
+            }
         }
     }
-    Ok(recorded)
+    // Parks queued while this pass ran (by publication tasks) stay behind.
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    kept.append(&mut pending);
+    *pending = kept;
+    recorded
 }
 
-/// The scheduler's clock. Tests may run it ahead of wall time per account
-/// directory to cross readmission backoffs without sleeping; transfers,
-/// leases and publication keep wall time, which only ever lags it.
+/// The scheduler's clock. Tests may run it ahead of wall time, or pin it, per
+/// account directory to cross readmission backoffs without sleeping;
+/// transfers, leases and publication keep wall time.
 #[cfg_attr(not(test), allow(unused_variables))]
 fn scheduler_now(client: &AppClient) -> u64 {
+    let now = crate::unix_now_seconds();
     #[cfg(test)]
-    let skew = test_clock::skew(&client.app.account_dir(&client.state.label));
-    #[cfg(not(test))]
-    let skew = 0;
-    crate::unix_now_seconds().saturating_add(skew)
+    let now = test_clock::adjust(&client.app.account_dir(&client.state.label), now);
+    now
 }
 
 pub(super) fn schedule(
@@ -233,7 +253,7 @@ pub(super) fn schedule(
     let storage = client.app.account_storage(&client.state.label)?;
     let now = scheduler_now(client);
     // A park the database refused is written before anything is scheduled.
-    if retry_pending_parks(&storage, &http.pending_storage_parks, now)? {
+    if retry_pending_parks(&storage, &http.pending_storage_parks, now) {
         shared.attachment_updates.send_modify(|_| {});
     }
     // Abandoned ciphertext expires even after automatic acquisition is disabled.
@@ -662,38 +682,55 @@ fn complete(
     )
 }
 
-/// Per-account-directory scheduler clock skew for tests, read by
-/// [`scheduler_now`].
+/// Per-account-directory scheduler clocks for tests, read by
+/// [`scheduler_now`]: either a skew ahead of wall time or a pinned instant.
 #[cfg(test)]
 pub(super) mod test_clock {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    static SKEWS: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+    #[derive(Clone, Copy)]
+    enum Clock {
+        Skew(u64),
+        At(u64),
+    }
+
+    static CLOCKS: Mutex<BTreeMap<PathBuf, Clock>> = Mutex::new(BTreeMap::new());
 
     /// Run the scheduler for `root` and everything beneath it `seconds` ahead.
     pub(crate) fn advance(root: &Path, seconds: u64) {
-        let mut skews = SKEWS.lock().unwrap();
-        let skew = skews.entry(root.to_path_buf()).or_default();
-        *skew = skew.saturating_add(seconds);
+        let mut clocks = CLOCKS.lock().unwrap();
+        let clock = clocks.entry(root.to_path_buf()).or_insert(Clock::Skew(0));
+        *clock = match *clock {
+            Clock::Skew(skew) => Clock::Skew(skew.saturating_add(seconds)),
+            Clock::At(at) => Clock::At(at.saturating_add(seconds)),
+        };
+    }
+    /// Pin the scheduler for `root` at `at`, so due times compare exactly.
+    pub(crate) fn set_now(root: &Path, at: u64) {
+        CLOCKS
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Clock::At(at));
     }
     /// Return `root` to wall time.
     pub(crate) fn clear(root: &Path) {
-        SKEWS.lock().unwrap().remove(root);
+        CLOCKS.lock().unwrap().remove(root);
     }
-    /// The skew applied to `root`, for tests that compute due times.
-    pub(crate) fn skew_for_test(root: &Path) -> u64 {
-        skew(root)
-    }
-    /// The skew of the root that contains `path`, or zero.
-    pub(super) fn skew(path: &Path) -> u64 {
-        SKEWS
+    /// The scheduler's reading for `path` when wall time is `now`.
+    pub(super) fn adjust(path: &Path, now: u64) -> u64 {
+        match CLOCKS
             .lock()
             .unwrap()
             .iter()
             .find(|(root, _)| path.starts_with(root))
-            .map_or(0, |(_, skew)| *skew)
+            .map(|(_, clock)| *clock)
+        {
+            Some(Clock::Skew(skew)) => now.saturating_add(skew),
+            Some(Clock::At(at)) => at,
+            None => now,
+        }
     }
 }
 

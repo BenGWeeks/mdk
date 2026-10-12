@@ -617,10 +617,8 @@ impl SqliteAccountStorage {
     ) -> StorageResult<bool> {
         // Consumed outside the transaction, which the failure rolls back.
         #[cfg(any(test, feature = "test-support"))]
-        if take_storage_park_fault(&*self.lock()?)? {
-            return Err(StorageError::Capacity(
-                "injected storage park write failure".into(),
-            ));
+        if let Some(fault) = take_storage_park_fault(&*self.lock()?)? {
+            return Err(fault);
         }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
@@ -667,15 +665,32 @@ impl SqliteAccountStorage {
     /// a capacity error, as a truly full disk can. Test support only.
     #[cfg(any(test, feature = "test-support"))]
     pub fn fail_next_storage_parks_for_test(&self, times: u32) -> StorageResult<()> {
+        self.arm_storage_park_faults(times, false)
+    }
+
+    /// Make the next `times` storage-park writes on this connection fail with
+    /// a backend error, which says nothing about free space. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_storage_parks_with_backend_error_for_test(
+        &self,
+        times: u32,
+    ) -> StorageResult<()> {
+        self.arm_storage_park_faults(times, true)
+    }
+
+    /// Arm `times` injected storage-park failures of one kind.
+    #[cfg(any(test, feature = "test-support"))]
+    fn arm_storage_park_faults(&self, times: u32, backend: bool) -> StorageResult<()> {
         let conn = self.lock()?;
         conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS test_storage_park_faults(remaining INTEGER NOT NULL);
+            "CREATE TEMP TABLE IF NOT EXISTS test_storage_park_faults(
+                remaining INTEGER NOT NULL,backend INTEGER NOT NULL);
              DELETE FROM temp.test_storage_park_faults;",
         )
         .storage()?;
         conn.execute(
-            "INSERT INTO temp.test_storage_park_faults(remaining) VALUES(?1)",
-            [times],
+            "INSERT INTO temp.test_storage_park_faults(remaining,backend) VALUES(?1,?2)",
+            params![times, backend],
         )
         .storage()?;
         Ok(())
@@ -974,9 +989,10 @@ pub(super) fn slot_media_type(slot: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Consume one injected storage-park write failure, if any are armed.
+/// Consume one injected storage-park write failure, if any are armed, and
+/// return the error it stands for.
 #[cfg(any(test, feature = "test-support"))]
-fn take_storage_park_fault(conn: &rusqlite::Connection) -> StorageResult<bool> {
+fn take_storage_park_fault(conn: &rusqlite::Connection) -> StorageResult<Option<StorageError>> {
     let armed: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name='test_storage_park_faults')",
@@ -985,13 +1001,22 @@ fn take_storage_park_fault(conn: &rusqlite::Connection) -> StorageResult<bool> {
         )
         .storage()?;
     if !armed {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(conn
-        .execute(
-            "UPDATE temp.test_storage_park_faults SET remaining=remaining-1 WHERE remaining>0",
+    let backend: Option<bool> = conn
+        .query_row(
+            "UPDATE temp.test_storage_park_faults SET remaining=remaining-1 WHERE remaining>0
+             RETURNING backend",
             [],
+            |row| row.get(0),
         )
-        .storage()?
-        == 1)
+        .optional()
+        .storage()?;
+    Ok(backend.map(|backend| {
+        if backend {
+            StorageError::Backend("injected storage park write failure".into())
+        } else {
+            StorageError::Capacity("injected storage park write failure".into())
+        }
+    }))
 }

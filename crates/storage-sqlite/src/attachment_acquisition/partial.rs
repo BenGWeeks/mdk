@@ -595,6 +595,12 @@ impl SqliteAccountStorage {
     /// idle expiry to one TTL past the park, so the exemption ends once that
     /// expiry is more than the remaining age in the past. Cancellation clears
     /// the parked marker, so a cancelled prefix expires as before.
+    ///
+    /// Pruning an aged parked prefix adds its saved bytes back to the row's
+    /// recorded target in the same transaction: the readmitted attempt has to
+    /// write them again (a file-sink target of `6T - S` becomes `6T`, an
+    /// in-memory complete checkpoint's `4P` becomes about `5T`), so it needs
+    /// no extra park to learn that. The common tick is a read-only probe.
     pub fn prune_attachment_partials(&self, now: u64, limit: usize) -> StorageResult<usize> {
         if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
             return Err(invalid("invalid partial prune limit"));
@@ -602,17 +608,39 @@ impl SqliteAccountStorage {
         let exempt_after = now
             .saturating_add(PARTIAL_TTL_SECONDS)
             .saturating_sub(STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS);
-        self.lock()?
-            .execute(
-                "DELETE FROM attachment_partial WHERE token IN (
-                 SELECT p.token FROM attachment_partial p WHERE p.expires_at<=?1
+        const EXPIRED: &str = "SELECT p.token FROM attachment_partial p WHERE p.expires_at<=?1
                  AND NOT (p.expires_at>?3 AND EXISTS(SELECT 1 FROM attachment_acquisition q
                      WHERE q.token=p.token AND q.state=4 AND q.cancelled=0
                      AND q.storage_blocked_headroom IS NOT NULL))
-                 ORDER BY p.expires_at,p.token LIMIT ?2)",
-                params![u64_to_i64(now)?, limit as i64, u64_to_i64(exempt_after)?],
+                 ORDER BY p.expires_at,p.token LIMIT ?2";
+        let params = params![u64_to_i64(now)?, limit as i64, u64_to_i64(exempt_after)?];
+        let due: bool = self
+            .lock()?
+            .query_row(&format!("SELECT EXISTS({EXPIRED})"), params, |row| {
+                row.get(0)
+            })
+            .storage()?;
+        if !due {
+            return Ok(0);
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            conn.execute(
+                &format!(
+                    "UPDATE attachment_acquisition AS q SET storage_blocked_headroom=
+                     storage_blocked_headroom+(SELECT received FROM attachment_partial p WHERE p.token=q.token)
+                     WHERE q.state=4 AND q.cancelled=0 AND q.storage_blocked_headroom IS NOT NULL
+                     AND q.token IN ({EXPIRED})"
+                ),
+                params,
+            )
+            .storage()?;
+            conn.execute(
+                &format!("DELETE FROM attachment_partial WHERE token IN ({EXPIRED})"),
+                params,
             )
             .storage()
+        })
     }
 
     /// Bytes currently held in ciphertext checkpoints. Test support for

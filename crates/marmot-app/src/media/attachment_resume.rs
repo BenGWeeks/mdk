@@ -618,19 +618,9 @@ pub(super) async fn read_body(
             return Err(stop("download exceeds response size bound"));
         }
         if bytes.capacity() < bytes.len() + chunk.len() {
-            // An undeclared length grows the buffer geometrically up to half
-            // the admitted limit, then once to the limit itself. Growth copies
-            // the old buffer into the new one, so the buffer never exceeds the
-            // limit and the transient peak during a copy never exceeds 1.5
-            // times it. A failed reservation never aborts.
-            let needed = bytes.len() + chunk.len();
-            let limit = max as usize;
-            let half = limit.div_ceil(2);
-            let wanted = if needed <= half {
-                bytes.capacity().saturating_mul(2).max(needed).min(half)
-            } else {
-                limit
-            };
+            // A failed reservation never aborts.
+            let wanted =
+                next_body_capacity(bytes.capacity(), bytes.len() + chunk.len(), max as usize);
             bytes
                 .try_reserve_exact(wanted - bytes.len())
                 .map_err(|_| retry("attachment body buffer unavailable"))?;
@@ -679,6 +669,20 @@ pub(super) async fn read_body(
         .await?;
     Ok(bytes)
 }
+/// Next buffer capacity for an undeclared-length body that needs `needed`
+/// bytes, growing from `capacity` under the admitted `limit`: doubling up to
+/// half the limit, then one step to the limit itself. Growth copies the old
+/// buffer into the new one, so the buffer never exceeds the limit and the
+/// transient peak during a copy never exceeds 1.5 times it.
+pub(crate) fn next_body_capacity(capacity: usize, needed: usize, limit: usize) -> usize {
+    let half = limit.div_ceil(2);
+    if needed <= half {
+        capacity.saturating_mul(2).max(needed).min(half)
+    } else {
+        limit
+    }
+}
+
 async fn checkpoint_tail(
     context: &AttachmentResume,
     identity: &AttachmentPartialIdentity,

@@ -8,7 +8,6 @@
   `InvalidReportedPublicKey`, `CannotReportSelf` and `ModerationReportRateLimited`;
   update exhaustive matches. `MarmotAppConfig` adds `moderation_report_config`;
   struct literals that do not use `..Default::default()` must set it.
-
 - `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
   publication reserve for the body. Update exhaustive matches; the job keeps
   its checkpoint and readmits once space frees or on explicit Retry.
@@ -99,7 +98,7 @@
   readmitted attempt sees at least what its parking check wanted; the worker
   readmits it once free space exceeds that by 4 MiB and admission would pass,
   a job that parks again waits out its park streak (15 s doubling to an hour,
-  reset by explicit Retry, checkpoint progress and completion), and explicit
+  reset by explicit Retry, checkpoint progress, completion and cancellation), and explicit
   Retry readmits at once. With a strong validator, the in-memory sink
   checkpoints a body that had already arrived, so readmission publishes
   without another request, and the file sink re-requests at most its unsaved
