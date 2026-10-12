@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a read-only message notification eligibility query using the canonical timeline and persisted read marker. Hosts recheck before initial posts and enrichment; notification cancellation remains host-owned.
+
 ## 0.13.0 - 2026-10-12
 
 Regenerate Swift/Kotlin bindings with the matching native library. See the

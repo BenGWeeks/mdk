@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a read-only message notification eligibility query using the canonical timeline and persisted read marker. Hosts recheck before initial posts and enrichment; notification cancellation remains host-owned.
+
 ## 0.13.0 - 2026-10-12
 
 Account storage advances from migration 101 through 107 on first open; downgrade

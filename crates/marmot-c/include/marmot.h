@@ -654,6 +654,22 @@ typedef enum MarmotPresentationResolution {
 } MarmotPresentationResolution;
 
 /**
+ * Final read eligibility of one message before an OS post. Append-only.
+ */
+typedef enum MarmotNotificationReadEligibility {
+  MARMOT_NOTIFICATION_READ_ELIGIBILITY_UNREAD,
+  MARMOT_NOTIFICATION_READ_ELIGIBILITY_UNREAD_WITHOUT_BASELINE,
+  MARMOT_NOTIFICATION_READ_ELIGIBILITY_READ,
+  MARMOT_NOTIFICATION_READ_ELIGIBILITY_DELETED,
+  MARMOT_NOTIFICATION_READ_ELIGIBILITY_INVALIDATED,
+  MARMOT_NOTIFICATION_READ_ELIGIBILITY_OWN_MESSAGE,
+  MARMOT_NOTIFICATION_READ_ELIGIBILITY_SENDER_BLOCKED,
+  MARMOT_NOTIFICATION_READ_ELIGIBILITY_NOT_READ_TRACKED,
+  MARMOT_NOTIFICATION_READ_ELIGIBILITY_NOT_TIMELINE_MESSAGE,
+  MARMOT_NOTIFICATION_READ_ELIGIBILITY_ABSENT,
+} MarmotNotificationReadEligibility;
+
+/**
  * How far an account's setup has progressed.
  */
 typedef enum MarmotAccountSetupReadiness {
@@ -7511,6 +7527,21 @@ MarmotStatus marmot_mark_timeline_message_read(const struct MarmotClient *client
                                                const char *group_id_hex,
                                                const char *message_id_hex,
                                                struct MarmotChatListRow **out);
+
+/**
+ * Final read eligibility for a received chat message; non-OK status forbids posting.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_notification_read_eligibility(const struct MarmotClient *client,
+                                                  const char *account_ref,
+                                                  const char *group_id_hex,
+                                                  const char *message_id_hex,
+                                                  enum MarmotNotificationReadEligibility *out);
 
 /**
  * Mark a conversation manually unread (or clear that mark); writes

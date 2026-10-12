@@ -62,6 +62,45 @@ pub enum ChatPinError {
 /// stays free of nostr/NIP parsing.
 pub type MentionClassifier<'a> = dyn Fn(&str, &[Vec<String>]) -> bool + 'a;
 
+/// Final read eligibility of one `(group, message)` in this account, derived in
+/// one read transaction from the canonical `message_timeline` row and the
+/// persisted conversation read state (its canonical retained anchor, or the
+/// legacy wall-clock marker when no anchor was recorded). The unread decision
+/// reuses the chat-list per-message unread predicate rather than restating it.
+///
+/// Exactly one variant applies; the exclusions are checked in declaration
+/// order after the row lookup, so e.g. an own deleted row reports
+/// [`Self::OwnMessage`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MessageNotificationReadState {
+    /// The row is unread past the persisted read marker.
+    Unread,
+    /// The row would be read-tracked, but this conversation has no persisted
+    /// read state yet, so no read marker can cover it. The chat list treats
+    /// such a conversation as having no unread badge; the native app policy permits an alert because no persisted read
+    /// marker covers this valid received row.
+    UnreadWithoutBaseline,
+    /// The persisted read marker already covers the row.
+    Read,
+    /// The canonical row is a deletion tombstone.
+    Deleted,
+    /// Convergence invalidated the canonical row.
+    Invalidated,
+    /// The local account authored the row.
+    OwnMessage,
+    /// The row's sender is currently blocked.
+    SenderBlocked,
+    /// A canonical timeline row whose kind never contributes to unread state
+    /// (for example agent activity, custom kinds, or unpromoted system rows).
+    NotReadTracked,
+    /// A raw app event exists but is not a timeline row (for example a
+    /// reaction, edit, or deletion). It is not a chat message.
+    NotTimelineMessage,
+    /// No row with this id exists in this group for this account. A message id
+    /// from another group or account is reported here.
+    Absent,
+}
+
 /// Cheap per-account unread aggregate computed directly from the materialized
 /// `chat_list_rows` projection — no timeline/session load required. Archived
 /// conversations are excluded so the total matches what the unarchived chat
@@ -925,6 +964,106 @@ impl SqliteAccountStorage {
             )
         })
     }
+
+    /// Read-only final notification eligibility for one message. See
+    /// [`MessageNotificationReadState`]. The row and the read state are read
+    /// inside one transaction, so a concurrent mark-read either fully precedes
+    /// or fully follows this answer. Storage failures are returned as errors
+    /// and are never reported as an unread state.
+    pub fn message_notification_read_state(
+        &self,
+        local_account_id_hex: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<MessageNotificationReadState> {
+        self.connection.with_deferred_read(|conn| {
+            message_notification_read_state_tx(
+                conn,
+                local_account_id_hex,
+                group_id_hex,
+                message_id_hex,
+            )
+        })
+    }
+}
+
+fn message_notification_read_state_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<MessageNotificationReadState> {
+    let activity_filter = chat_list_activity_filter_sql("");
+    let sql = format!(
+        "SELECT sender,
+                deleted != 0,
+                invalidation_status IS NOT NULL,
+                sender IN (SELECT public_key FROM user_blocks),
+                direction = 'received' AND {activity_filter}
+         FROM message_timeline
+         WHERE group_id_hex = ?1 AND message_id_hex = ?2"
+    );
+    let row = tx
+        .query_row_cached(&sql, params![group_id_hex, message_id_hex], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })
+        .optional()
+        .storage()?;
+    let Some((sender, deleted, invalidated, blocked, read_tracked)) = row else {
+        let raw_event_exists = tx
+            .query_row_cached(
+                "SELECT EXISTS(
+                    SELECT 1 FROM app_events WHERE group_id_hex = ?1 AND message_id_hex = ?2
+                 )",
+                params![group_id_hex, message_id_hex],
+                |row| row.get::<_, bool>(0),
+            )
+            .storage()?;
+        return Ok(if raw_event_exists {
+            MessageNotificationReadState::NotTimelineMessage
+        } else {
+            MessageNotificationReadState::Absent
+        });
+    };
+    if sender == local_account_id_hex {
+        return Ok(MessageNotificationReadState::OwnMessage);
+    }
+    if deleted {
+        return Ok(MessageNotificationReadState::Deleted);
+    }
+    if invalidated {
+        return Ok(MessageNotificationReadState::Invalidated);
+    }
+    if blocked {
+        return Ok(MessageNotificationReadState::SenderBlocked);
+    }
+    if !read_tracked {
+        return Ok(MessageNotificationReadState::NotReadTracked);
+    }
+    let Some(read_state) = read_state_tx(tx, group_id_hex)? else {
+        return Ok(MessageNotificationReadState::UnreadWithoutBaseline);
+    };
+    // Every other conjunct of the canonical predicate was checked above, so a
+    // miss here means only the persisted read marker covers the row.
+    let unread = unread_membership_for_message_tx(
+        tx,
+        local_account_id_hex,
+        group_id_hex,
+        message_id_hex,
+        Some(&read_state),
+        &|_, _| false,
+    )?;
+    Ok(if unread.is_some() {
+        MessageNotificationReadState::Unread
+    } else {
+        MessageNotificationReadState::Read
+    })
 }
 
 fn pinned_chat_order_tx(tx: &Connection) -> Result<Vec<String>, ChatPinError> {

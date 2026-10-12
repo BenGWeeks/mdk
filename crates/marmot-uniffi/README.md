@@ -1136,3 +1136,20 @@ python3 crates/marmot-uniffi/measure-release-profile.py \
 Apple exporters use raw static-library slices and publish a matching privacy manifest for the consuming Swift target.
 See the [privacy audit and adoption guide](apple-privacy/README.md) for declarations, archive validation, host
 integration changes, and unresolved release questions.
+
+## Final notification read checks
+
+Call `notification_read_eligibility(account_ref, group_id_hex, message_id_hex)`
+on an off-main lane immediately before posting a received chat-message alert,
+and again before replacing it with enriched content. Only `Unread` and
+`UnreadWithoutBaseline` permit a chat-message post. The latter means there is no
+persisted read marker covering the valid received row. Errors and all other
+results forbid the post. Invites and reactions retain their separate policy.
+
+The query reads the canonical timeline row and read boundary together and never
+changes either. The retained canonical anchor still applies after its marker
+row is pruned. Platform posting is a separate operation: retain dismissal and
+generation fences, and cancel a matching current notification when reading wins
+the race. Preserve any newer unread message in the same conversation. Recheck
+account and runtime ownership after awaiting the query. This read gate supplements
+notification settings, permissions and delivery policy.

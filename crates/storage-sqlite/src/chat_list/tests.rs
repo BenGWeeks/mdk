@@ -5058,3 +5058,169 @@ fn deletion_provenance_changes_refresh_chat_preview() {
     assert!(preview.plaintext.is_empty());
     assert_eq!(preview.deletion_source, crate::DeletionSource::Admin);
 }
+
+fn read_state(store: &SqliteAccountStorage, group: &str, id: &str) -> MessageNotificationReadState {
+    store
+        .message_notification_read_state(LOCAL, group, id)
+        .unwrap()
+}
+
+#[test]
+fn notification_read_state_follows_baseline_marker_and_canonical_order() {
+    let store = setup_store();
+    let mut first = chat("first", REMOTE, 100, "before baseline");
+    first.source_epoch = Some(5);
+    store.record_app_event(&first).unwrap();
+    // No persisted read state: nothing can have been marked read yet.
+    assert_eq!(
+        read_state(&store, GROUP, "first"),
+        MessageNotificationReadState::UnreadWithoutBaseline
+    );
+
+    // The baseline covers retained history, exactly like the unread badge.
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    assert_eq!(
+        read_state(&store, GROUP, "first"),
+        MessageNotificationReadState::Read
+    );
+
+    let mut second = chat("second", REMOTE, 200, "after baseline");
+    second.source_epoch = Some(6);
+    store.record_app_event(&second).unwrap();
+    assert_eq!(
+        read_state(&store, GROUP, "second"),
+        MessageNotificationReadState::Unread
+    );
+
+    // A notification emitted while unread becomes ineligible once the user
+    // reads the message; the final check observes the committed marker.
+    store
+        .mark_timeline_message_read(LOCAL, GROUP, "second", &no_mentions)
+        .unwrap();
+    assert_eq!(
+        read_state(&store, GROUP, "second"),
+        MessageNotificationReadState::Read
+    );
+
+    // A late arrival from an older accepted epoch sorts before the canonical
+    // anchor even though its sender clock and local arrival are newer.
+    let mut late_older = chat("late-older", REMOTE, 900, "late older epoch");
+    late_older.source_epoch = Some(4);
+    store.record_app_event(&late_older).unwrap();
+    assert_eq!(
+        read_state(&store, GROUP, "late-older"),
+        MessageNotificationReadState::Read
+    );
+    let mut newer = chat("newer", REMOTE, 50, "newer epoch, old clock");
+    newer.source_epoch = Some(7);
+    store.record_app_event(&newer).unwrap();
+    assert_eq!(
+        read_state(&store, GROUP, "newer"),
+        MessageNotificationReadState::Unread
+    );
+}
+
+#[test]
+fn notification_read_state_uses_retained_anchor_after_marker_row_is_pruned() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    let mut marker = chat("marker", REMOTE, 150, "marker");
+    marker.source_epoch = Some(8);
+    store.record_app_event(&marker).unwrap();
+    store
+        .mark_timeline_message_read(LOCAL, GROUP, "marker", &no_mentions)
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "DELETE FROM message_timeline WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![GROUP, "marker"],
+        )
+        .unwrap();
+    }
+    let mut older = chat("older", REMOTE, 900, "older epoch");
+    older.source_epoch = Some(7);
+    store.record_app_event(&older).unwrap();
+    let mut later = chat("later", REMOTE, 10, "later epoch");
+    later.source_epoch = Some(9);
+    store.record_app_event(&later).unwrap();
+    assert_eq!(
+        read_state(&store, GROUP, "older"),
+        MessageNotificationReadState::Read
+    );
+    assert_eq!(
+        read_state(&store, GROUP, "later"),
+        MessageNotificationReadState::Unread
+    );
+}
+
+#[test]
+fn notification_read_state_excludes_non_eligible_rows() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    let own = chat("own", LOCAL, 300, "mine");
+    store.record_app_event(&own).unwrap();
+    assert_eq!(
+        read_state(&store, GROUP, "own"),
+        MessageNotificationReadState::OwnMessage
+    );
+
+    let deleted_target = "02".repeat(32);
+    store
+        .record_app_event(&chat(&deleted_target, REMOTE, 301, "retracted"))
+        .unwrap();
+    let mut deletion = reaction("retraction", REMOTE, &deleted_target, 302);
+    deletion.kind = 5;
+    store.record_app_event(&deletion).unwrap();
+    assert_eq!(
+        read_state(&store, GROUP, &deleted_target),
+        MessageNotificationReadState::Deleted
+    );
+
+    store
+        .record_app_event(&chat("losing", REMOTE, 303, "losing branch"))
+        .unwrap();
+    store
+        .invalidate_app_event_by_message_id(GROUP, "losing", "LosingBranch")
+        .unwrap();
+    assert_eq!(
+        read_state(&store, GROUP, "losing"),
+        MessageNotificationReadState::Invalidated
+    );
+
+    let target = "03".repeat(32);
+    store
+        .record_app_event(&chat(&target, LOCAL, 304, "reacted to"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("thumbs", REMOTE, &target, 305))
+        .unwrap();
+    // A reaction is never evaluated as if it were a chat message.
+    assert_eq!(
+        read_state(&store, GROUP, "thumbs"),
+        MessageNotificationReadState::NotTimelineMessage
+    );
+
+    store
+        .record_app_event(&chat("present", REMOTE, 306, "present"))
+        .unwrap();
+    assert_eq!(
+        read_state(&store, GROUP, "missing"),
+        MessageNotificationReadState::Absent
+    );
+    // The key is (group, message): another group's id is absent here.
+    assert_eq!(
+        read_state(&store, "22", "present"),
+        MessageNotificationReadState::Absent
+    );
+    assert_eq!(
+        read_state(&store, GROUP, "present"),
+        MessageNotificationReadState::Unread
+    );
+}

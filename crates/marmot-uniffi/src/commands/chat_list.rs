@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::conversions::{
     ChatListRowFfi, ChatNotificationSettingsFfi, ChatPinStateFfi, ExistingDirectConversationFfi,
-    group_id_from_hex,
+    NotificationReadEligibilityFfi, group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 use crate::{Marmot, optional_message_id_hex};
@@ -133,6 +133,28 @@ impl Marmot {
             .runtime
             .mark_timeline_message_read(&account_ref, &group_id_hex, &message_id_hex)?
             .map(Into::into))
+    }
+
+    /// Check a received chat message immediately before posting or enriching.
+    /// Post only for Unread or UnreadWithoutBaseline; on error do not post.
+    /// Invites and reactions use their own policy. Keep cancellation on read,
+    /// because this answer cannot be atomic with the platform write.
+    pub fn notification_read_eligibility(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        message_id_hex: String,
+    ) -> Result<NotificationReadEligibilityFfi, MarmotKitError> {
+        let group_id_hex = hex::encode(group_id_from_hex(&group_id_hex)?.as_slice());
+        let message_id_hex = optional_message_id_hex(Some(message_id_hex))?.ok_or_else(|| {
+            MarmotKitError::InvalidHex {
+                details: "message id is required".to_owned(),
+            }
+        })?;
+        Ok(self
+            .runtime
+            .notification_read_eligibility(&account_ref, &group_id_hex, &message_id_hex)?
+            .into())
     }
 
     /// Set or clear a manual unread reminder without moving the durable

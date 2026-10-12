@@ -2,9 +2,9 @@
 //! plus the wake-path cursor-persistence policy.
 
 use marmot_app::{
-    CursorPersistence, NotificationCollectionStatus, NotificationSettings,
-    NotificationTrafficClass, NotificationTrigger, NotificationUpdate, NotificationUser,
-    NotificationWakeSource,
+    CursorPersistence, NotificationCollectionStatus, NotificationReadEligibility,
+    NotificationSettings, NotificationTrafficClass, NotificationTrigger, NotificationUpdate,
+    NotificationUser, NotificationWakeSource,
 };
 
 /// Durable transport-cursor persistence policy, chosen at [`crate::Marmot`]
@@ -240,5 +240,53 @@ mod tests {
             NotificationTriggerFfi::from(marmot_app::NotificationTrigger::RemovedAsAdmin),
             NotificationTriggerFfi::RemovedAsAdmin
         ));
+    }
+}
+
+/// Final read eligibility of one message for a host's last check before
+/// posting or enriching an OS notification. Variant order is stable; new
+/// variants are appended only. Full semantics:
+/// `marmot_app::NotificationReadEligibility`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum NotificationReadEligibilityFfi {
+    /// Unread past the persisted read marker. May post.
+    Unread,
+    /// Read-tracked, but the conversation has no persisted read state yet.
+    /// May post.
+    UnreadWithoutBaseline,
+    /// The persisted read marker covers it. Do not post; cancel if posted.
+    Read,
+    /// Deleted. Do not post; cancel if posted.
+    Deleted,
+    /// Invalidated by convergence. Do not post; cancel if posted.
+    Invalidated,
+    /// Authored by this account. Do not post.
+    OwnMessage,
+    /// Sender is blocked. Do not post; cancel if posted.
+    SenderBlocked,
+    /// A timeline row with no read state (for example agent activity). Do not post it as a received chat message.
+    NotReadTracked,
+    /// A non-timeline event such as a reaction. Never evaluated as a chat
+    /// message; use the separate reaction policy instead.
+    NotTimelineMessage,
+    /// No such message in this group for this account. Do not post; cancel
+    /// if posted.
+    Absent,
+}
+
+impl From<NotificationReadEligibility> for NotificationReadEligibilityFfi {
+    fn from(value: NotificationReadEligibility) -> Self {
+        match value {
+            NotificationReadEligibility::Unread => Self::Unread,
+            NotificationReadEligibility::UnreadWithoutBaseline => Self::UnreadWithoutBaseline,
+            NotificationReadEligibility::Read => Self::Read,
+            NotificationReadEligibility::Deleted => Self::Deleted,
+            NotificationReadEligibility::Invalidated => Self::Invalidated,
+            NotificationReadEligibility::OwnMessage => Self::OwnMessage,
+            NotificationReadEligibility::SenderBlocked => Self::SenderBlocked,
+            NotificationReadEligibility::NotReadTracked => Self::NotReadTracked,
+            NotificationReadEligibility::NotTimelineMessage => Self::NotTimelineMessage,
+            NotificationReadEligibility::Absent => Self::Absent,
+        }
     }
 }

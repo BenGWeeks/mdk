@@ -93,6 +93,7 @@ mod conversions;
 mod directory;
 mod drafts;
 mod local_submissions;
+mod notification_eligibility;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod error;
 mod external_signer;
@@ -259,6 +260,7 @@ pub use media::{
 pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;
 pub use nostr_verification::verify_public_nostr_event_json;
+pub use notification_eligibility::NotificationReadEligibility;
 pub use notifications::{
     BackgroundNotificationCollection, ChatNotificationSettings, GroupPushDebugInfo,
     GroupPushTokenDebugEntry, GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR,
@@ -6516,6 +6518,28 @@ impl MarmotApp {
             }
             self.app_projection_update(label, storage_update)
         })
+    }
+
+    /// Read-only canonical eligibility immediately before a host notification post.
+    pub fn notification_read_eligibility(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<NotificationReadEligibility, AppError> {
+        let group_id_hex = crate::ids::normalize_group_id_hex_app(group_id_hex)?;
+        let mut message_id = [0_u8; 32];
+        hex::decode_to_slice(message_id_hex.trim(), &mut message_id)?;
+        let message_id_hex = hex::encode(message_id);
+        let account = self.account_home().account(label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .message_notification_read_state(
+                &account.account_id_hex,
+                &group_id_hex,
+                &message_id_hex,
+            )?
+            .into())
     }
 
     /// Reconcile a local publication with its engine-stamped source authority.

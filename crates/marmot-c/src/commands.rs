@@ -73,8 +73,8 @@ use crate::types::message::{
     MarmotAppMessageRecordList, MarmotRetentionSweepReport, MarmotSecureDeleteExpiredResult,
 };
 use crate::types::notification::{
-    MarmotBackgroundNotificationCollection, MarmotNotificationSettings,
-    MarmotNotificationWakeSource,
+    MarmotBackgroundNotificationCollection, MarmotNotificationReadEligibility,
+    MarmotNotificationSettings, MarmotNotificationWakeSource,
 };
 use crate::types::push::{
     MarmotGroupPushDebugInfo, MarmotPushPlatform, MarmotPushRegistration,
@@ -946,6 +946,9 @@ c_cmd! {
     /// Mark a timeline message read; writes the refreshed row, or NULL
     /// with `MARMOT_STATUS_OK`. Free with `marmot_chat_list_row_free`.
     sync fn marmot_mark_timeline_message_read(account_ref: str, group_id_hex: str, message_id_hex: str) -> opt_rec(MarmotChatListRow) = mark_timeline_message_read;
+
+    /// Final read eligibility for a received chat message; non-OK status forbids posting.
+    sync fn marmot_notification_read_eligibility(account_ref: str, group_id_hex: str, message_id_hex: str) -> enum_ret(MarmotNotificationReadEligibility) = notification_read_eligibility;
 
     /// Mark a conversation manually unread (or clear that mark); writes
     /// the refreshed row, or NULL with `MARMOT_STATUS_OK` when the group

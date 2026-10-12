@@ -2,8 +2,8 @@
 
 use marmot_uniffi::conversions::{
     BackgroundNotificationCollectionFfi, CursorPersistenceFfi, NotificationCollectionStatusFfi,
-    NotificationSettingsFfi, NotificationTrafficClassFfi, NotificationTriggerFfi,
-    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
+    NotificationReadEligibilityFfi, NotificationSettingsFfi, NotificationTrafficClassFfi,
+    NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
 };
 
 use crate::macros::{c_enum, c_mirror};
@@ -132,5 +132,21 @@ c_mirror! {
         copy status: MarmotNotificationCollectionStatus,
         vec notifications/notifications_len: MarmotNotificationUpdate,
         opt_str error,
+    }
+}
+
+c_enum! {
+    /// Final read eligibility of one message before an OS post. Append-only.
+    MarmotNotificationReadEligibility from NotificationReadEligibilityFfi {
+        Unread,
+        UnreadWithoutBaseline,
+        Read,
+        Deleted,
+        Invalidated,
+        OwnMessage,
+        SenderBlocked,
+        NotReadTracked,
+        NotTimelineMessage,
+        Absent,
     }
 }

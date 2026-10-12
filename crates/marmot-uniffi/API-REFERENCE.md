@@ -899,6 +899,16 @@ Mark a kind-9 timeline message visible/read. Own kind-9 messages can advance the
 
 [Source](src/commands/chat_list.rs#L120)
 
+### `Marmot::notification_read_eligibility`
+
+```rust
+pub fn notification_read_eligibility( &self, account_ref: String, group_id_hex: String, message_id_hex: String, ) -> Result<NotificationReadEligibilityFfi, MarmotKitError>
+```
+
+Read the canonical received-message row and persisted read boundary immediately before an initial notification or enrichment. Only `Unread` and `UnreadWithoutBaseline` permit a received-chat post. Errors and the other results forbid it; invites and reactions retain their separate policy. Run the synchronous query off the main thread, recheck account/runtime ownership afterward, and keep matching-notification cancellation because the result is not atomic with a platform write.
+
+[Source](src/commands/chat_list.rs#L142)
+
 ### `Marmot::set_chat_manually_unread`
 
 **Current.**
@@ -909,7 +919,7 @@ pub fn set_chat_manually_unread( &self, account_ref: String, group_id_hex: Strin
 
 Set or clear a manual unread reminder without moving the durable timeline read marker backwards.
 
-[Source](src/commands/chat_list.rs#L140)
+[Source](src/commands/chat_list.rs#L162)
 
 ### `Marmot::set_chat_pinned`
 
@@ -921,7 +931,7 @@ pub fn set_chat_pinned( &self, account_ref: String, group_id_hex: String, pinned
 
 Pin or unpin one local chat. Newly pinned chats enter at the top of the manually ordered pinned section.
 
-[Source](src/commands/chat_list.rs#L155)
+[Source](src/commands/chat_list.rs#L177)
 
 ### `Marmot::set_pinned_chat_order`
 
@@ -933,7 +943,7 @@ pub fn set_pinned_chat_order( &self, account_ref: String, ordered_group_ids: Vec
 
 Atomically replace the order of the current pinned set. The input must contain every currently pinned group exactly once.
 
-[Source](src/commands/chat_list.rs#L170)
+[Source](src/commands/chat_list.rs#L192)
 
 ### `Marmot::chat_notification_settings`
 
@@ -945,7 +955,7 @@ pub fn chat_notification_settings( &self, account_ref: String, group_id_hex: Str
 
 Read the current MDK timed/indefinite mute state for one chat.
 
-[Source](src/commands/chat_list.rs#L188)
+[Source](src/commands/chat_list.rs#L210)
 
 ### `Marmot::set_chat_muted`
 
@@ -958,7 +968,7 @@ pub fn set_chat_muted( &self, account_ref: String, group_id_hex: String, muted_u
 Mute one chat until an absolute Unix epoch millisecond timestamp, or indefinitely when `muted_until_ms` is `None`.
 Ordinary notification updates stay suppressed, while direct mentions of the receiving account reach subscriptions with `NotificationUpdateFfi.is_mention = true`; blocked senders remain suppressed. Hosts apply their own notification permission and channel settings.
 
-[Source](src/commands/chat_list.rs#L202)
+[Source](src/commands/chat_list.rs#L224)
 
 ### `Marmot::clear_chat_muted`
 
@@ -970,7 +980,7 @@ pub fn clear_chat_muted( &self, account_ref: String, group_id_hex: String, ) -> 
 
 Clear either a finite or indefinite MDK chat mute.
 
-[Source](src/commands/chat_list.rs#L216)
+[Source](src/commands/chat_list.rs#L238)
 
 </details>
 

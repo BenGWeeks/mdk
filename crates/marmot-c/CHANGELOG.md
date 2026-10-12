@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add `marmot_notification_read_eligibility` and its typed result for final received-chat notification checks. Errors never authorize a post.
+
 ## [0.13.0] - 2026-10-12
 
 Recompile against the matching `marmot.h` and library: several record layouts changed and new event, Markdown and

@@ -8237,6 +8237,156 @@ mod tests {
         assert_released_message_batch_projects(ReleasedBatchObservation::Inbound).await;
     }
 
+    async fn released_chat_effects(
+        client: &mut crate::AppClient,
+        group_id: &cgka_traits::GroupId,
+        local_hex: &str,
+        author_hex: &str,
+        content: &str,
+        recorded_at: u64,
+    ) -> (marmot_account::AccountDeviceEffects, String, String) {
+        use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
+        use cgka_traits::MemberId;
+        let carrier = encode_inner_event(
+            &build_inner_event(
+                &AppMessageIntent::Chat {
+                    content: format!("carrier for {content}"),
+                },
+                local_hex,
+                recorded_at,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let sent = client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: carrier,
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        assert!(sent.failures.is_empty());
+        let inner = build_inner_event(
+            &AppMessageIntent::Chat {
+                content: content.to_owned(),
+            },
+            author_hex,
+            recorded_at,
+        )
+        .unwrap();
+        let effects = marmot_account::AccountDeviceEffects {
+            events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+                authority: None,
+                group_id: group_id.clone(),
+                message_id: sent.reports[0].message_id.clone(),
+                sender: MemberId::new(hex::decode(author_hex).unwrap()),
+                epoch: client.runtime.group_record(group_id).unwrap().epoch,
+                payload: encode_inner_event(&inner).unwrap(),
+                retention: None,
+                encrypted_media_secret: None,
+            }],
+            ..Default::default()
+        };
+        (
+            effects,
+            inner.id.clone(),
+            hex::encode(sent.reports[0].message_id.as_slice()),
+        )
+    }
+
+    #[tokio::test]
+    async fn notification_read_eligibility_tracks_marker_and_account() {
+        use crate::NotificationReadEligibility as E;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let alice = home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://eligibility.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("eligibility", &[]).await.unwrap();
+        let group_hex = hex::encode(group_id.as_slice());
+        app.initialize_chat_read_state("alice", &group_hex).unwrap();
+        let recorded_at = crate::unix_now_seconds().saturating_add(1);
+        let (first, first_id, first_source) = released_chat_effects(
+            &mut client,
+            &group_id,
+            &alice.account_id_hex,
+            &bob.account_id_hex,
+            "first",
+            recorded_at,
+        )
+        .await;
+        client
+            .observe_account_device_effects(
+                &first,
+                &mut SyncSummary::default(),
+                &first_source,
+                crate::unix_now_seconds(),
+            )
+            .await
+            .unwrap();
+        // The explicit empty-chat baseline precedes this received message.
+        assert_eq!(
+            app.notification_read_eligibility("alice", &group_hex, &first_id)
+                .unwrap(),
+            E::Unread
+        );
+        app.mark_timeline_message_read("alice", &group_hex, &first_id)
+            .unwrap();
+        assert_eq!(
+            app.notification_read_eligibility("alice", &group_hex, &first_id)
+                .unwrap(),
+            E::Read
+        );
+
+        let (second, second_id, second_source) = released_chat_effects(
+            &mut client,
+            &group_id,
+            &alice.account_id_hex,
+            &bob.account_id_hex,
+            "second",
+            recorded_at.saturating_add(1),
+        )
+        .await;
+        client
+            .observe_account_device_effects(
+                &second,
+                &mut SyncSummary::default(),
+                &second_source,
+                crate::unix_now_seconds(),
+            )
+            .await
+            .unwrap();
+        let eligibility = app
+            .notification_read_eligibility("alice", &group_hex, &second_id)
+            .unwrap();
+        assert_eq!(eligibility, E::Unread);
+        assert!(eligibility.permits_post());
+        // Read after the notification was emitted: the final check vetoes it.
+        app.mark_timeline_message_read("alice", &group_hex, &second_id)
+            .unwrap();
+        let eligibility = app
+            .notification_read_eligibility("alice", &group_hex, &second_id)
+            .unwrap();
+        assert_eq!(eligibility, E::Read);
+        assert!(!eligibility.permits_post());
+
+        // Another account on the same device never sees alice's rows.
+        assert_eq!(
+            app.notification_read_eligibility("bob", &group_hex, &second_id)
+                .unwrap(),
+            E::Absent
+        );
+        assert_eq!(
+            app.notification_read_eligibility("alice", &group_hex, &"00".repeat(32))
+                .unwrap(),
+            E::Absent
+        );
+    }
+
     fn armed_backfill(
         group_id: &cgka_traits::GroupId,
         stalled_epoch: u64,

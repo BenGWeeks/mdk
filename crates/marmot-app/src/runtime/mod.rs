@@ -5248,6 +5248,22 @@ impl MarmotAppRuntime {
         Ok(row)
     }
 
+    /// Read-only canonical eligibility before initial post and enrichment.
+    pub fn notification_read_eligibility(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<crate::NotificationReadEligibility, AppError> {
+        let _opening = self.shared.lifecycle().begin_account_open()?;
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts.app.notification_read_eligibility(
+            &account.label,
+            group_id_hex,
+            message_id_hex,
+        )
+    }
+
     pub fn set_chat_manually_unread(
         &self,
         account_ref: &str,
