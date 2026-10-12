@@ -5430,7 +5430,7 @@ MarmotStatus marmot_cached_public_event_previews(const struct MarmotClient *clie
 ```
 
 Read up to sixteen references from one account's local cache without network I/O. The returned list preserves input
-order and duplicates, and each row carries its canonical key and exactly the payload for its state. `Busy` is lifecycle
+order and duplicates, and each row carries its canonical key and exactly the payload for its state. `Busy` is retryable lifecycle, cache or refresh
 contention, not a cache miss; `Missing` is local absence, not durable proof that an event does not exist. This synchronous
 call validates the complete input before reading and can return an error for damaged deletion evidence. Inputs are
 borrowed; `out` owns the list and all nested records. Release it once with `marmot_public_event_cache_read_list_free`.

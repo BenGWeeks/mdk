@@ -684,7 +684,7 @@ typedef enum MarmotPublicEventCacheState {
    */
   MARMOT_PUBLIC_EVENT_CACHE_STATE_MISSING,
   /**
-   * Account lifecycle work is in progress; retry. Never a miss.
+   * Retryable lifecycle, cache or refresh contention. Never a miss.
    */
   MARMOT_PUBLIC_EVENT_CACHE_STATE_BUSY,
 } MarmotPublicEventCacheState;

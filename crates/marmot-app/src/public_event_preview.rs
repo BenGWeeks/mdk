@@ -133,7 +133,7 @@ pub struct PublicEventDeletion {
 }
 
 /// Local state for one reference. `Missing` is never durable negative truth and
-/// `Busy` is retryable, never a miss: account lifecycle work holds the account,
+/// `Busy` is retryable, never a miss: lifecycle/cache work, a pending refresh,
 /// or the account cache this request started with was removed, wiped,
 /// reimported or closed meanwhile (a retry reads the current incarnation).
 #[derive(Clone, Debug, PartialEq, Eq)]

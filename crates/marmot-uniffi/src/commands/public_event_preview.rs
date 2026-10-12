@@ -31,7 +31,7 @@ pub enum PublicEventCacheStateFfi {
     AuthoritativeDeleted,
     /// Nothing is known locally. Not durable negative truth.
     Missing,
-    /// Account lifecycle work is in progress; retry. Never a miss.
+    /// Retryable lifecycle, cache or refresh contention. Never a miss.
     Busy,
 }
 
