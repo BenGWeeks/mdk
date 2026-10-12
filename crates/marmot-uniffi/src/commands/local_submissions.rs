@@ -53,6 +53,30 @@ impl Marmot {
             .into())
     }
 
+    /// Submit text with the exact NIP-27 recipients chosen by the host. An empty
+    /// list sends informational references. Up to 64 hex/npub recipients are
+    /// normalized and retained with the client token for restart-safe retries.
+    pub async fn send_text_with_mention_recipients(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        text: String,
+        client_token: String,
+        mention_recipients: Vec<String>,
+    ) -> Result<LocalSendAcceptanceFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .submit_text_with_mention_recipients(
+                &account_ref,
+                &group_id_from_hex(&group_id_hex)?,
+                text,
+                client_token,
+                mention_recipients,
+            )
+            .await?
+            .into())
+    }
+
     /// Durably queue an edit for a text or reply submitted with a client token.
     /// The edit survives restart, targets the original's authoritative ID, and
     /// is rejected if that original never reaches the engine's durable queue.

@@ -957,15 +957,17 @@ fn message_text_mentions_account_matches_message_mentions_account() {
 
 #[test]
 fn mention_classification_covers_bare_npub_mention() {
-    // The form clients actually emit is the bare `@npub1…` handle (no
-    // `nostr:` scheme and no `p`-tag). It must still classify as a mention so
-    // `is_mention` / unread-mention surfaces fire. Regression for
-    // mdk#617.
+    // Bare and URI references require the sender’s explicit p-tag.
     let receiver = nostr::prelude::Keys::generate().public_key().to_hex();
     let npub = crate::npub_for_account_id(&receiver).unwrap();
 
     let message = received_chat(&format!("hey @{npub} ping"), Vec::new());
-    assert!(message_mentions_account(&message, &receiver));
+    assert!(!message_mentions_account(&message, &receiver));
+    let tagged = received_chat(
+        &format!("hey @{npub} ping"),
+        vec![vec!["p".into(), receiver.clone()]],
+    );
+    assert!(message_mentions_account(&tagged, &receiver));
 
     // A bare `@npub1…` for a different account is not a mention of `receiver`.
     let other = nostr::prelude::Keys::generate().public_key().to_hex();

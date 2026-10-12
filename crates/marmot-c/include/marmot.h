@@ -9543,6 +9543,24 @@ MarmotStatus marmot_startup_diagnostics_snapshot(const struct MarmotClient *clie
                                                  struct MarmotNativeStartupSnapshot **out);
 
 /**
+ * Durably submit text with an explicit NIP-27 recipient set. Empty means no
+ * mention attention; the list and text are retained with the client token.
+ * Free the acceptance with `marmot_local_send_acceptance_free`.
+ *
+ * # Safety
+ * `client` must be live; strings and `out` valid. `mention_recipients` must
+ * point to `mention_recipients_len` valid strings, or NULL with length zero.
+ */
+MarmotStatus marmot_send_text_with_mention_recipients(const struct MarmotClient *client,
+                                                      const char *account_ref,
+                                                      const char *group_id_hex,
+                                                      const char *text,
+                                                      const char *client_token,
+                                                      const char *const *mention_recipients,
+                                                      uintptr_t mention_recipients_len,
+                                                      struct MarmotLocalSendAcceptance **out);
+
+/**
  * Create a control; free it with marmot_media_file_transfer_control_free after upload returns.
  * # Safety
  * out must be writable.

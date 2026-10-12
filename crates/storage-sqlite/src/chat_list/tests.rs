@@ -5058,3 +5058,51 @@ fn deletion_provenance_changes_refresh_chat_preview() {
     assert!(preview.plaintext.is_empty());
     assert_eq!(preview.deletion_source, crate::DeletionSource::Admin);
 }
+
+/// A complete older projection must not retain a previous mention policy.
+#[test]
+fn mention_classifier_upgrade_rebuilds_retained_attention_flags() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("reference", REMOTE, 10, "profile reference"))
+        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &|_, _| true).unwrap();
+    assert_eq!(
+        store
+            .chat_list_rows(crate::ChatListQuery::default())
+            .unwrap()[0]
+            .unread_mention_count,
+        1
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE chat_list_projection_meta SET mention_counts_version=4 WHERE id=1",
+            [],
+        )
+        .unwrap();
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = store
+        .chat_list_rows(crate::ChatListQuery::default())
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(row.unread_mention_count, 0);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT mention_counts_version FROM chat_list_projection_meta WHERE id=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        5
+    );
+}

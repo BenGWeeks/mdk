@@ -3664,3 +3664,48 @@ c_cmd! {
     sync fn marmot_set_startup_diagnostics_enabled(enabled: flag) -> unit = set_startup_diagnostics_enabled;
     sync fn marmot_startup_diagnostics_snapshot() -> rec(MarmotNativeStartupSnapshot) = startup_diagnostics_snapshot;
 }
+
+/// Durably submit text with an explicit NIP-27 recipient set. Empty means no
+/// mention attention; the list and text are retained with the client token.
+/// Free the acceptance with `marmot_local_send_acceptance_free`.
+///
+/// # Safety
+/// `client` must be live; strings and `out` valid. `mention_recipients` must
+/// point to `mention_recipients_len` valid strings, or NULL with length zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_text_with_mention_recipients(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    text: *const c_char,
+    client_token: *const c_char,
+    mention_recipients: *const *const c_char,
+    mention_recipients_len: usize,
+    out: *mut *mut MarmotLocalSendAcceptance,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let text = try_arg!(unsafe { required_str(text) });
+        let client_token = try_arg!(unsafe { required_str(client_token) });
+        if mention_recipients_len > 64 {
+            crate::status::set_last_error("at most 64 mention recipients are accepted");
+            return MarmotStatus::InvalidArgument;
+        }
+        let recipients = try_arg!(unsafe { str_array(mention_recipients, mention_recipients_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_text_with_mention_recipients(
+                    account_ref,
+                    group_id_hex,
+                    text,
+                    client_token,
+                    recipients,
+                )),
+                out,
+            )
+        }
+    })
+}

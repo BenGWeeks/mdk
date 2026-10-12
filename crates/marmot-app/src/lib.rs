@@ -6016,10 +6016,9 @@ impl MarmotApp {
 
     /// Build the unread-mention classifier injected into the chat-list
     /// projection. The storage layer never parses nostr/NIP-21, so it calls back
-    /// into the same notification mention classification (explicit received
-    /// `p` tags and attention-bearing inline mentions such as `@npub1…`) used
-    /// for push notifications, scoped to the local account. Untagged informational
-    /// `nostr:npub` and `nostr:nprofile` links are not mention attention. The
+    /// into the same received `p`-tag classification used for push notifications,
+    /// scoped to the local account. Profile spelling does not override the
+    /// sender’s recipient choice. The
     /// unread window is already kind-9 filtered, but the real chat kind is
     /// passed for correctness.
     fn chat_list_mention_classifier(

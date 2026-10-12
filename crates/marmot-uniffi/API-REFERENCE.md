@@ -4361,7 +4361,7 @@ Read a retained submission's local state without relay I/O. `None` means no reta
 association. `Completed` describes the worker attempt; inspect its summary disposition
 and follow timeline updates for later delivery. See [local sends](LOCAL-SENDS.md).
 
-[Source](src/commands/local_submissions.rs#L178)
+[Source](src/commands/local_submissions.rs#L202)
 
 ### `Marmot::edit_local_message_with_client_token`
 
@@ -4376,7 +4376,7 @@ delivery; follow the edit token with `local_send_status` and preserve rejected
 text for retry. The original token must belong to the same account and group.
 See [pending edits](LOCAL-SENDS.md#edits-of-a-pending-local-send-0110).
 
-[Source](src/commands/local_submissions.rs#L59)
+[Source](src/commands/local_submissions.rs#L83)
 
 ### `Marmot::reply_to_message_with_client_token`
 
@@ -4388,7 +4388,7 @@ Durably admit a reply and bind its optimistic bubble to an opaque local token.
 Returns local acceptance before relay publication. Repeating the original request
 and token returns the same identity; changed requests are rejected. See [local sends](LOCAL-SENDS.md).
 
-[Source](src/commands/local_submissions.rs#L81)
+[Source](src/commands/local_submissions.rs#L105)
 
 ### `Marmot::send_message_draft_with_client_token`
 
@@ -4400,7 +4400,7 @@ Atomically consume exactly the supplied draft revision and retain its token-boun
 message. Prepared attachments must match selected descriptors. Returns local
 acceptance, not delivery; never clear a newer composer on completion. See [local sends](LOCAL-SENDS.md).
 
-[Source](src/commands/local_submissions.rs#L103)
+[Source](src/commands/local_submissions.rs#L127)
 
 ### `Marmot::send_text_with_client_token`
 
@@ -4414,6 +4414,16 @@ caller cancellation and restart; delivery uses ordinary subscriptions. See [loca
 
 [Source](src/commands/local_submissions.rs#L37)
 
+### `Marmot::send_text_with_mention_recipients`
+
+```rust
+pub async fn send_text_with_mention_recipients( &self, account_ref: String, group_id_hex: String, text: String, client_token: String, mention_recipients: Vec<String>, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit ordinary text with the host’s exact NIP-27 recipient set. An empty list keeps profile references informational. Up to 64 hex/npub recipients are normalized and retained with the token; changed text or recipients require a new token. See [explicit text mention recipients](LOCAL-SENDS.md#explicit-text-mention-recipients).
+
+[Source](src/commands/local_submissions.rs#L59)
+
 ### `Marmot::upload_media_with_client_token`
 
 ```rust
@@ -4425,7 +4435,7 @@ The result includes uploaded references and optional local acceptance. Uploads t
 are not idempotent or restart-resumable; query token status after unknown outcomes.
 See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handling.
 
-[Source](src/commands/local_submissions.rs#L125)
+[Source](src/commands/local_submissions.rs#L149)
 
 ### `Marmot::upload_media_files_with_client_token`
 
@@ -4437,7 +4447,7 @@ pub async fn upload_media_files_with_client_token( &self, account_ref: String, g
 
 File-backed `upload_media_with_client_token`: every attachment is prepared and uploaded before durable token admission. Cancellation observed before admission starts returns an error and admits nothing. Once admission starts it is not interruptible, even before durable acceptance returns; follow `local_send_status` and timeline delivery, including uncertain-delivery handling. Admission rejects references from a source epoch that is no longer current. There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
 
-[Source](src/commands/local_submissions.rs#L152)
+[Source](src/commands/local_submissions.rs#L176)
 
 </details>
 

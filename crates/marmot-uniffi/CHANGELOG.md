@@ -35,6 +35,8 @@
 
 ### Added
 
+- `send_text_with_mention_recipients` admits text with an explicit NIP-27 recipient set, retained with its client token for retries. Use an empty list for informational references.
+
 - The runtime follows the opt-in `WN_SOCKS5_*` proxy settings described in
   the marmot-app [SOCKS5 routing](../marmot-app/README.md#socks5-routing)
   section. With the variables unset, nothing changes. When they are invalid,

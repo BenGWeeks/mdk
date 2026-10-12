@@ -11,6 +11,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `send_text_with_mention_recipients` admits text with an explicit NIP-27 recipient set, retained with its client token for retries. Use an empty list for informational references.
+
 - NIP-46 signer sessions and the runtime follow the opt-in `WN_SOCKS5_*`
   proxy settings described in the marmot-app
   [SOCKS5 routing](../marmot-app/README.md#socks5-routing) section. With the

@@ -129,3 +129,20 @@ fn null_out_is_rejected_before_a_subscription_read_dequeues() {
     unsafe { marmot_client_shutdown(client) };
     unsafe { marmot_client_free(client) };
 }
+
+#[test]
+fn explicit_mention_send_checks_output_before_any_input() {
+    let status = unsafe {
+        marmot_c::commands::marmot_send_text_with_mention_recipients(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            usize::MAX,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, MarmotStatus::NullPointer);
+}

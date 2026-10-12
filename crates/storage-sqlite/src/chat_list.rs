@@ -1111,7 +1111,8 @@ fn dirty_unread_messages_are_covered_tx(
 /// (#822). Version 3 materializes per-message unread membership so incremental
 /// refreshes do not rescan the unread window. The persisted column keeps its legacy `mention_counts_version` name
 /// for schema compatibility, but now gates the complete derived-row contract.
-const CHAT_LIST_PROJECTION_VERSION: i64 = 4;
+// Version 5 rebuilds cached attention flags after the mention classifier changed.
+const CHAT_LIST_PROJECTION_VERSION: i64 = 5;
 
 const CHAT_LIST_GROUP_ACTIVITY_TYPES: [&str; 5] = [
     GROUP_SYSTEM_TYPE_MEMBER_ADDED,

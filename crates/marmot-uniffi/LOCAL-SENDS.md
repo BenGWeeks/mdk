@@ -137,3 +137,18 @@ Revisioned draft saves no longer hydrate an unused return copy of attachment
 plaintext. Selected-draft descriptors use a blob-free covering index. Attachment
 comparison still reads existing bytes; these changes do not promise constant-time
 attachment saves.
+
+## Explicit text mention recipients
+
+`send_text_with_mention_recipients` takes the host's complete recipient list,
+including an empty list for informational references. Up to 64 hex/npub values
+are normalized, sorted and deduplicated before admission. The text and selection
+are retained together; a changed selection cannot reuse the token. Default text
+submission derives recipients from both bare and NIP-21 profile references.
+Received `p` tags determine attention; profile text alone does not. Recovery by
+client token retains the original selection. This method submits ordinary text;
+reply, draft, edit and media methods retain their existing default tagging.
+
+Older receiving SDKs can infer attention from untagged text; the sender cannot change a peer’s installed classifier.
+
+The native projection version invalidates cached unread-mention flags once on upgrade, preserving unread membership while rebuilding attention under the received-tag classifier.

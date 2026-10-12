@@ -6,6 +6,8 @@
 
 ### Breaking changes
 
+- Notification and unread-mention classification uses received NIP-27 `p` tags; untagged profile references no longer imply attention. Default sends continue deriving mention tags for bare and NIP-21 references. Existing unread-mention projections are rebuilt under the updated classifier.
+
 - `AppError` adds `ModerationReportingNotConfigured`, `InvalidModerationReportConfig`,
   `InvalidReportedPublicKey`, `CannotReportSelf` and `ModerationReportRateLimited`;
   update exhaustive matches. `MarmotAppConfig` adds `moderation_report_config`;
@@ -21,6 +23,8 @@
   when empty and older ones still deserialize.
 
 ### Added
+
+- `submit_text_with_mention_recipients` durably retains an explicit recipient list with the client token. An empty list sends informational references.
 
 - Relay refusals of live subscriptions are no longer dropped silently (#2247).
   When a relay answers an inbox, group or maintenance REQ with `CLOSED`, the

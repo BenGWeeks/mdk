@@ -185,6 +185,7 @@ impl MarmotAppRuntime {
             group,
             client_token,
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: caption.unwrap_or_default(),
                 reply_to: None,
                 attachments,
@@ -211,6 +212,34 @@ impl MarmotAppRuntime {
             group,
             client_token,
             LocalMessageRequest {
+                mention_pubkeys: None,
+                content: text,
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Durably submit text with an explicit NIP-27 recipient set. An empty set
+    /// keeps every profile reference informational, independent of URI spelling.
+    /// Recipients are normalized and retained with the token across restart.
+    pub async fn submit_text_with_mention_recipients(
+        &self,
+        account: &str,
+        group: &GroupId,
+        text: String,
+        client_token: String,
+        mention_recipients: Vec<String>,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_local_message(
+            account,
+            group,
+            client_token,
+            LocalMessageRequest {
+                mention_pubkeys: Some(mention_recipients),
                 content: text,
                 reply_to: None,
                 attachments: vec![],
@@ -234,6 +263,7 @@ impl MarmotAppRuntime {
             group,
             client_token,
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: text,
                 reply_to: Some(target),
                 attachments: vec![],
@@ -257,6 +287,7 @@ impl MarmotAppRuntime {
             group,
             client_token,
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: String::new(),
                 reply_to: None,
                 attachments,
@@ -282,6 +313,7 @@ impl MarmotAppRuntime {
             group,
             edit_client_token,
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content,
                 reply_to: None,
                 attachments: vec![],

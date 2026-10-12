@@ -86,6 +86,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
         .save_message_draft_if_revision("alice", &selected.revision, "same text", None, vec![])
         .unwrap();
     let request = LocalMessageRequest {
+        mention_pubkeys: None,
         content: String::new(),
         reply_to: None,
         attachments: vec![],
@@ -139,6 +140,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
     assert_eq!(event.content, "same text");
     assert!(event.tags.is_empty(), "correlation must not add wire tags");
     let changed = LocalMessageRequest {
+        mention_pubkeys: None,
         content: "different".into(),
         reply_to: None,
         attachments: vec![],
@@ -160,6 +162,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
             &h.group,
             "another-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: String::new(),
                 reply_to: None,
                 attachments: vec![],
@@ -198,6 +201,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
             &h.group,
             "another-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: "same text".into(),
                 reply_to: None,
                 attachments: vec![],
@@ -302,6 +306,7 @@ async fn pending_edit_requires_an_existing_local_original() {
             &h.group,
             "edit-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: "revision".into(),
                 reply_to: None,
                 attachments: vec![],
@@ -332,6 +337,7 @@ async fn rapid_edit_limit_reports_a_stable_retryable_error() {
             &h.group,
             "original-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: "original".into(),
                 reply_to: None,
                 attachments: vec![],
@@ -347,6 +353,7 @@ async fn rapid_edit_limit_reports_a_stable_retryable_error() {
             &h.group,
             format!("edit-{revision}"),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: format!("revision {revision}"),
                 reply_to: None,
                 attachments: vec![],
@@ -378,6 +385,7 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
             &h.group,
             "original-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: "before revision".into(),
                 reply_to: None,
                 attachments: vec![],
@@ -393,6 +401,7 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
             &h.group,
             "edit-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: "after revision".into(),
                 reply_to: None,
                 attachments: vec![],
@@ -408,6 +417,7 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
             &h.group,
             "latest-edit-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: "latest revision".into(),
                 reply_to: None,
                 attachments: vec![],
@@ -527,6 +537,7 @@ async fn rejected_original_cannot_publish_a_retained_pending_edit() {
             &h.group,
             "original-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: "not accepted".into(),
                 reply_to: None,
                 attachments: vec![],
@@ -541,6 +552,7 @@ async fn rejected_original_cannot_publish_a_retained_pending_edit() {
             &h.group,
             "edit-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: "must not publish".into(),
                 reply_to: None,
                 attachments: vec![],
@@ -665,6 +677,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
             &h.group,
             "restart-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: "retained before worker startup".into(),
                 reply_to: None,
                 attachments: vec![],
@@ -746,6 +759,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
             &h.group,
             "restart-token".into(),
             LocalMessageRequest {
+                mention_pubkeys: None,
                 content: "retained before worker startup".into(),
                 reply_to: None,
                 attachments: vec![],
@@ -762,6 +776,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
 async fn rejected_submission_requires_a_new_token_after_restart() {
     let h = History::new(0).await;
     let request = LocalMessageRequest {
+        mention_pubkeys: None,
         content: "rejected attempt".into(),
         reply_to: None,
         attachments: vec![],
@@ -838,6 +853,7 @@ async fn completion_write_failure_does_not_stall_later_submissions() {
                     &h.group,
                     format!("finish-failure-{i}"),
                     LocalMessageRequest {
+                        mention_pubkeys: None,
                         content: format!("queued message {i}"),
                         reply_to: None,
                         attachments: vec![],
@@ -896,5 +912,133 @@ async fn completion_write_failure_does_not_stall_later_submissions() {
             "fault injection must prevent outcome persistence"
         );
     }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Recipient choices are part of durable request identity and survive recovery.
+#[tokio::test]
+async fn explicit_mention_recipients_are_retained_and_fence_token_replay() {
+    let h = History::new(0).await;
+    let recipient = nostr::prelude::Keys::generate().public_key().to_hex();
+    let npub = crate::npub_for_account_id(&recipient).unwrap();
+    let profile = crate::nprofile_for_account_id(&recipient, &[]).unwrap();
+    let content = format!("@{npub} nostr:{profile}");
+    let request = LocalMessageRequest {
+        content: content.clone(),
+        reply_to: None,
+        attachments: vec![],
+        mention_pubkeys: Some(vec![npub.clone(), recipient.clone()]),
+    };
+    let (first, _) = h
+        .app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "explicit".into(),
+            request.clone(),
+            None,
+            42,
+        )
+        .unwrap();
+    let (again, update) = h
+        .app
+        .admit_local_message_at("alice", &h.group, "explicit".into(), request, None, 43)
+        .unwrap();
+    assert_eq!(first, again);
+    assert!(update.is_none());
+    let store = h.app.account_storage("alice").unwrap();
+    let group = hex::encode(h.group.as_slice());
+    let retained = store.local_submission(&group, "explicit").unwrap().unwrap();
+    let (decoded, _) =
+        LocalMessageRequest::decode_retained(retained.request_json.as_deref().unwrap()).unwrap();
+    assert_eq!(decoded.mention_pubkeys, Some(vec![recipient.clone()]));
+    let event =
+        cgka_traits::app_event::MarmotAppEvent::decode(retained.payload.as_deref().unwrap())
+            .unwrap();
+    assert_eq!(event.tags, vec![vec!["p".to_owned(), recipient.clone()]]);
+    assert!(crate::notifications::message_text_mentions_account(
+        event.kind,
+        &event.content,
+        &event.tags,
+        &recipient
+    ));
+    let silent = LocalMessageRequest {
+        content,
+        reply_to: None,
+        attachments: vec![],
+        mention_pubkeys: Some(vec![]),
+    };
+    assert!(
+        h.app
+            .admit_local_message_at(
+                "alice",
+                &h.group,
+                "explicit".into(),
+                silent.clone(),
+                None,
+                44
+            )
+            .is_err()
+    );
+    h.app
+        .admit_local_message_at("alice", &h.group, "silent".into(), silent, None, 45)
+        .unwrap();
+    let retained = store.local_submission(&group, "silent").unwrap().unwrap();
+    let event =
+        cgka_traits::app_event::MarmotAppEvent::decode(retained.payload.as_deref().unwrap())
+            .unwrap();
+    assert!(event.tags.is_empty());
+    assert!(!crate::notifications::message_text_mentions_account(
+        event.kind,
+        &event.content,
+        &event.tags,
+        &recipient
+    ));
+    let (decoded, _) =
+        LocalMessageRequest::decode_retained(retained.request_json.as_deref().unwrap()).unwrap();
+    assert_eq!(decoded.mention_pubkeys, Some(vec![]));
+    let invalid = LocalMessageRequest {
+        content: "invalid".into(),
+        reply_to: None,
+        attachments: vec![],
+        mention_pubkeys: Some(vec!["invalid".into()]),
+    };
+    assert!(
+        h.app
+            .admit_local_message_at("alice", &h.group, "invalid".into(), invalid, None, 46)
+            .is_err()
+    );
+    assert!(store.local_submission(&group, "invalid").unwrap().is_none());
+    drop(store);
+    h.app.close_storage().unwrap();
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    let retained = reopened
+        .account_storage("alice")
+        .unwrap()
+        .local_submission(&group, "silent")
+        .unwrap()
+        .unwrap();
+    let (decoded, _) =
+        LocalMessageRequest::decode_retained(retained.request_json.as_deref().unwrap()).unwrap();
+    assert_eq!(decoded.mention_pubkeys, Some(vec![]));
+    assert!(
+        cgka_traits::app_event::MarmotAppEvent::decode(retained.payload.as_deref().unwrap())
+            .unwrap()
+            .tags
+            .is_empty()
+    );
+    let runtime = MarmotAppRuntime::new(reopened);
+    let retry = runtime
+        .submit_text_with_mention_recipients(
+            "alice",
+            &h.group,
+            format!("@{npub} nostr:{profile}"),
+            "explicit".into(),
+            vec![npub],
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry, first);
     runtime.shutdown_and_close().await.unwrap();
 }

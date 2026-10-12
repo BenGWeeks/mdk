@@ -39,7 +39,7 @@ use cgka_traits::engine::{GroupEvent, GroupStateChange};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::{GroupId, MemberId};
 
-use crate::messages::{PUBKEY_REF_TAG, inline_mention_pubkey_hexes, mention_pubkey_hex};
+use crate::messages::{PUBKEY_REF_TAG, mention_pubkey_hex};
 use crate::{
     AppError, AppGroupRecord, AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppEvent,
     ReceivedMessage, RuntimeGroupEvent, RuntimeMessageReceived, group_system_event_from_message,
@@ -309,9 +309,8 @@ pub struct NotificationUpdate {
     pub group_name: Option<String>,
     pub is_dm: bool,
     /// True when this notification's receiving account is mentioned by a NIP-27
-    /// pubkey-reference (`p`) tag or an attention-bearing inline pubkey mention
-    /// (such as `@npub1…`) on the inbound app event. An untagged informational
-    /// `nostr:npub` or `nostr:nprofile` link alone does not set this flag.
+    /// pubkey-reference (`p`) tag on the inbound app event. Untagged profile
+    /// references do not override the sender’s recipient choice.
     /// This is computed from event semantics, not the rendered preview text.
     /// A durable chat mute still emits direct mentions with this flag set;
     /// blocked senders remain suppressed before an update is emitted.
@@ -2051,19 +2050,12 @@ fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> 
     )
 }
 
-/// Pure mention predicate over a timeline message's raw fields. A message
-/// mentions `account_id_hex` when it is a kind-9 chat that either carries a
-/// NIP-27 pubkey-reference (`p`) tag resolving to the account, or an inline
-/// nostr mention token referencing it (for example a bare `@npub1…` handle).
-/// Explicit NIP-21 profile links alone are informational. Existing received
-/// `p` tags remain authoritative, including those authored by older clients.
-/// Shared with the chat-list unread projection so the @-badge
-/// reuses the exact notification classification. The inline Markdown fallback
-/// is intentionally bounded (mdk#654); send-side / wire `p` tags are the
-/// authoritative mention signal for content beyond that cap.
+/// A kind-9 message mentions an account only through its received NIP-27 `p`
+/// tags. Content spelling and rendered names do not override the sender's
+/// recipient choice. Shared by notifications and the unread-mention projection.
 pub(crate) fn message_text_mentions_account(
     kind: u64,
-    plaintext: &str,
+    _plaintext: &str,
     tags: &[Vec<String>],
     account_id_hex: &str,
 ) -> bool {
@@ -2079,12 +2071,7 @@ pub(crate) fn message_text_mentions_account(
     }) {
         return true;
     }
-    // Keep this fallback bounded with the sender-side p-tag derivation. Do not
-    // reintroduce full-content Markdown parsing here: hostile received content
-    // can otherwise spend unbounded CPU before notification classification.
-    inline_mention_pubkey_hexes(plaintext)
-        .iter()
-        .any(|mentioned| mentioned.eq_ignore_ascii_case(account_id_hex))
+    false
 }
 
 /// Shared preview rule for an inner app event's kind/plaintext. Push-gossip

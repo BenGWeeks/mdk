@@ -61,6 +61,9 @@ pub(crate) fn retained_event(
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct LocalMessageRequest {
+    /// None derives default mentions; Some uses the exact caller-selected recipients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_pubkeys: Option<Vec<String>>,
     pub content: String,
     pub reply_to: Option<String>,
     pub attachments: Vec<MediaAttachmentReference>,
@@ -212,6 +215,23 @@ impl MarmotApp {
                 "invalid original client token for pending edit".into(),
             ));
         }
+        if let Some(recipients) = &mut request.mention_pubkeys {
+            if recipients.len() > 64
+                || draft.is_some()
+                || edit_of_client_token.is_some()
+                || request.reply_to.is_some()
+                || !request.attachments.is_empty()
+            {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "explicit mention recipients require a text submission and at most 64 recipients".into(),
+                ));
+            }
+            for recipient in recipients.iter_mut() {
+                *recipient = crate::ids::parse_account_id_hex(recipient)?;
+            }
+            recipients.sort_unstable();
+            recipients.dedup();
+        }
         let account = self.account_home().account(account_ref)?;
         let storage = self.draft_storage(&account.label)?;
         let group_hex = hex::encode(group.as_slice());
@@ -342,6 +362,20 @@ impl MarmotApp {
                 event_created_at,
                 media_reply,
             )?;
+            let event = if let Some(recipients) = &request.mention_pubkeys {
+                let mut tags = event.tags;
+                tags.retain(|tag| tag.first().is_none_or(|name| name != "p"));
+                tags.extend(recipients.iter().map(|key| vec!["p".into(), key.clone()]));
+                MarmotInnerEvent::new(
+                    event.pubkey,
+                    event.created_at,
+                    event.kind,
+                    tags,
+                    event.content,
+                )
+            } else {
+                event
+            };
             // Keep the existing wire identity. A new token must not overwrite
             // another admission's correlation or adopt an existing legacy row.
             // Same-token retries returned above, before rebuilding an event.
