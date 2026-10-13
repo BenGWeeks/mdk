@@ -759,7 +759,7 @@ async fn sibling_device_membership_preserves_activity_targets() {
 /// Two admin installations request departure in the same source epoch.
 async fn concurrent_admin_sibling_leaves() -> (
     [Engine<SqliteAccountStorage>; 3],
-    SqliteAccountStorage,
+    [SqliteAccountStorage; 2],
     GroupId,
     [TransportMessage; 2],
 ) {
@@ -773,7 +773,8 @@ async fn concurrent_admin_sibling_leaves() -> (
             .unwrap()
     };
     let mut a1 = device(b"alice", SqliteAccountStorage::in_memory().unwrap());
-    let mut a2 = device(b"alice", SqliteAccountStorage::in_memory().unwrap());
+    let a2_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut a2 = device(b"alice", a2_storage.clone());
     let bob_storage = SqliteAccountStorage::in_memory().unwrap();
     let mut bob = device(b"bob", bob_storage.clone());
     let kp = bob.fresh_key_package().await.unwrap();
@@ -829,7 +830,7 @@ async fn concurrent_admin_sibling_leaves() -> (
     }
     (
         [a1, a2, bob],
-        bob_storage,
+        [a2_storage, bob_storage],
         group_id,
         proposals.try_into().unwrap(),
     )
@@ -837,9 +838,10 @@ async fn concurrent_admin_sibling_leaves() -> (
 
 #[tokio::test]
 async fn concurrent_admin_sibling_leaves_publish_only_one_departure() {
-    for reverse in [false, true] {
-        let ([mut a1, mut a2, mut bob], _, group_id, mut proposals) =
+    for (reverse, reopen) in [(false, false), (true, false), (false, true), (true, true)] {
+        let ([mut a1, mut a2, mut bob], [a2_storage, _], group_id, mut proposals) =
             concurrent_admin_sibling_leaves().await;
+        let own_leave = proposals[1].clone();
         if reverse {
             proposals.reverse();
         }
@@ -884,12 +886,98 @@ async fn concurrent_admin_sibling_leaves_publish_only_one_departure() {
         assert_eq!(a2.admin_pubkeys(&group_id).unwrap(), admins);
         advance_selfremove_auto_commit(&mut bob, &group_id).await;
         assert!(bob.drain_auto_publish().is_empty());
+
+        let reopen_a2 = || {
+            EngineBuilder::new(a2_storage.clone())
+                .identity(pad32(b"alice"))
+                .account_identity_proof_signer(proof_signer(b"alice"))
+                .feature_registry(selfremove_registry())
+                .peeler(Box::new(MockPeeler))
+                .build()
+                .unwrap()
+        };
+        if reopen {
+            drop(a2);
+            a2 = reopen_a2();
+            a2.hydrate_all_stored_groups().unwrap();
+            assert!(a2.leave_in_progress(&group_id).unwrap());
+        }
+
+        // An explicit retry surfaces the refusal and cancels the obsolete
+        // durable intent, rather than stranding the only remaining admin leaf.
+        let refused = a2
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await;
+        assert!(matches!(
+            refused,
+            Err(EngineError::AdminCannotSelfRemove { .. })
+        ));
+        assert!(a2_storage.leave_request(&group_id).unwrap().is_none());
+        assert!(!a2.leave_in_progress(&group_id).unwrap());
+        // Keep authenticated proposal bytes for replay, but retire the Sent
+        // markers that legacy hydration uses to recover a leave intent.
+        let record = a2_storage.get_message(&own_leave.id).unwrap();
+        assert_ne!(record.state, MessageState::Sent);
+        assert_eq!(
+            StoredMessagePayload::decode(&record.payload)
+                .unwrap()
+                .as_openmls_wire()
+                .unwrap()
+                .payload,
+            own_leave.payload
+        );
+        if reopen {
+            drop(a2);
+            a2 = reopen_a2();
+            a2.hydrate_all_stored_groups().unwrap();
+            assert!(!a2.leave_in_progress(&group_id).unwrap());
+        }
+        let payload = app_payload_for(&a2, "retained admin can send");
+        assert!(matches!(
+            a2.send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+                expected_epoch: None,
+            })
+            .await
+            .unwrap(),
+            SendResult::ApplicationMessage { .. }
+        ));
+        let SendResult::GroupEvolution { pending, .. } = a2
+            .send(SendIntent::UpdateAppComponents {
+                group_id: group_id.clone(),
+                updates: vec![cgka_traits::app_components::AppComponentData {
+                    component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                    data: encode_admin_policy_for_test(&[
+                        a2.self_id().as_slice().to_vec(),
+                        bob.self_id().as_slice().to_vec(),
+                    ]),
+                }],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("admin promotion")
+        };
+        a2.confirm_published(pending).await.unwrap();
+        assert_eq!(a2.admin_pubkeys(&group_id).unwrap().len(), 2);
+        assert!(matches!(
+            a2.send(SendIntent::Disband {
+                group_id: group_id.clone()
+            })
+            .await
+            .unwrap(),
+            SendResult::DisbandRequested { .. }
+        ));
     }
 }
 
 #[tokio::test]
 async fn concurrent_admin_sibling_leaves_cannot_confirm_orphaned_admin() {
-    let ([_, _, mut bob], storage, group_id, proposals) = concurrent_admin_sibling_leaves().await;
+    let ([_, _, mut bob], [_, storage], group_id, proposals) =
+        concurrent_admin_sibling_leaves().await;
     // Obtain a legitimate pending handle for a single sibling departure.
     bob.ingest(proposals[0].clone()).await.unwrap();
     advance_selfremove_auto_commit(&mut bob, &group_id).await;
