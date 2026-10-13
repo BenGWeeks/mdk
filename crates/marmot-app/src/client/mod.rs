@@ -726,7 +726,19 @@ pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 
 type MemberDeviceLabels = HashMap<(String, Vec<u8>), String>;
 
+/// Two current sources per account: its selected directory slot and our publication.
+/// Replacing either source drops its old validation result, including rejections.
+#[derive(Clone)]
+pub(crate) struct MemberDevicePackageValidation {
+    bytes: Vec<u8>,
+    metadata: Option<cgka_engine::key_package::KeyPackageMetadata>,
+}
+
 pub struct AppClient {
+    pub(crate) member_device_package_validations:
+        std::sync::Mutex<HashMap<(String, bool), MemberDevicePackageValidation>>,
+    #[cfg(test)]
+    pub(crate) member_device_validation_count: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
         Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,
@@ -2423,9 +2435,8 @@ impl AppClient {
         } else {
             self.runtime
                 .session()
-                .canonical_group_membership(group_id)
-                .map(|membership| membership.devices)
-                .unwrap_or_default()
+                .canonical_group_membership(group_id)?
+                .devices
         };
         let mut members = std::collections::BTreeMap::new();
         for member in self.runtime.members(group_id)? {
@@ -2444,7 +2455,7 @@ impl AppClient {
         let labels = if let Some(labels) = cached_labels {
             labels
         } else {
-            owned_labels = self.member_device_labels(members.keys().cloned())?;
+            owned_labels = self.member_device_labels(members.keys().cloned());
             &owned_labels
         };
         for leaf in devices {
@@ -2478,8 +2489,8 @@ impl AppClient {
             client_label,
             ..
         } = &mut device
-            && let Ok(labels) = self.member_device_labels(std::iter::once(sender.to_owned()))
         {
+            let labels = self.member_device_labels(std::iter::once(sender.to_owned()));
             *client_label = labels.into_iter().find_map(|((_, key), label)| {
                 (cgka_traits::message::member_device_id(group_id, &key) == *device_id)
                     .then_some(label)
@@ -2488,63 +2499,119 @@ impl AppClient {
         device
     }
 
+    fn member_device_package_metadata(
+        &self,
+        account_id: &str,
+        publication: bool,
+        package: &KeyPackage,
+    ) -> Result<cgka_engine::key_package::KeyPackageMetadata, AppError> {
+        let mut cache = self
+            .member_device_package_validations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (account_id.to_owned(), publication);
+        let same_package = [publication, !publication].into_iter().find_map(|source| {
+            cache
+                .get(&(account_id.to_owned(), source))
+                .filter(|cached| cached.bytes == package.bytes())
+        });
+        let validated = if let Some(cached) = same_package {
+            cached.clone()
+        } else {
+            #[cfg(test)]
+            self.member_device_validation_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MemberDevicePackageValidation {
+                bytes: package.bytes().to_vec(),
+                metadata: cgka_engine::key_package::key_package_metadata(package).ok(),
+            }
+        };
+        let metadata = validated.metadata.clone();
+        cache.insert(key, validated);
+        metadata
+            .ok_or_else(|| AppError::InvalidKeyPackageEvent("invalid advisory KeyPackage".into()))
+    }
+
     /// Read each requested account cache once; never discover devices here.
+    /// Optional enrichment cannot change the outcome of authoritative roster reads.
     fn member_device_labels(
         &self,
         account_ids: impl IntoIterator<Item = String>,
-    ) -> Result<MemberDeviceLabels, AppError> {
-        // A cache miss is ordinary: enrichment never fetches or changes authority.
-        let mut account_ids = account_ids.into_iter().peekable();
-        if account_ids.peek().is_none() {
-            return Ok(HashMap::new());
+    ) -> MemberDeviceLabels {
+        let account_ids = account_ids.into_iter().collect::<Vec<_>>();
+        if account_ids.is_empty() {
+            return HashMap::new();
         }
         let mut labels = HashMap::new();
-        let caches = self.app.directory_caches()?;
-        let shared = self.app.shared_storage()?;
-        let local_accounts = self.app.local_accounts_by_id()?;
-        for account_id in account_ids {
-            if let Some(package) = self
-                .app
-                .directory_entry_for_account_id_with_handles(
-                    &account_id,
-                    &caches,
-                    &shared,
-                    &local_accounts,
-                )?
-                .and_then(|entry| entry.key_package)
-                && let Some(label) = package
-                    .client_label
-                    .as_deref()
-                    .and_then(crate::key_package_records::sanitize_client_label)
-                && let Ok(bytes) = hex::decode(&package.key_package_hex)
-                && let Ok(metadata) = cgka_engine::key_package::key_package_metadata(
-                    &KeyPackage::new(bytes)
-                        .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current),
-                )
-                && metadata.credential_identity_hex == account_id
-            {
-                labels.insert((account_id.clone(), metadata.signature_key), label);
+        let mut failed_advisory_reads = 0usize;
+        match self.app.member_device_key_packages(&account_ids) {
+            Ok(packages) => {
+                for (account_id, package) in packages {
+                    let result = (|| -> Result<(), AppError> {
+                        let Some(package) = package? else {
+                            return Ok(());
+                        };
+                        let Some(label) = package
+                            .client_label
+                            .as_deref()
+                            .and_then(crate::key_package_records::sanitize_client_label)
+                        else {
+                            return Ok(());
+                        };
+                        let bytes = hex::decode(&package.key_package_hex)?;
+                        let metadata = self.member_device_package_metadata(
+                            &account_id,
+                            false,
+                            &KeyPackage::new(bytes).with_protocol_profile(
+                                cgka_traits::group::ProtocolProfile::Current,
+                            ),
+                        )?;
+                        if metadata.credential_identity_hex == account_id {
+                            labels.insert((account_id, metadata.signature_key), label);
+                        } else {
+                            return Err(AppError::InvalidKeyPackageEvent(
+                                "advisory identity mismatch".into(),
+                            ));
+                        }
+                        Ok(())
+                    })();
+                    failed_advisory_reads += usize::from(result.is_err());
+                }
             }
+            Err(_) => failed_advisory_reads += 1,
         }
-        // Our durable signed publication survives directory slot replacement by
-        // another installation of the same account. Bind its label to its key.
-        if let Some(artifact) = self
-            .runtime
-            .key_package_maintenance_status()?
-            .and_then(|state| state.authored_signed_event)
-            && let Ok(event) = serde_json::from_slice(&artifact.bytes)
-            && let Ok(fetched) =
-                crate::key_package_records::key_package_from_record(crate::RelayEventRecord {
-                    event,
-                    endpoints: Vec::new(),
-                })
-            && let Some(label) = fetched.client_label
-            && let Ok(metadata) =
-                cgka_engine::key_package::key_package_metadata(&fetched.key_package)
-        {
-            labels.insert((fetched.account_id_hex, metadata.signature_key), label);
+        // The durable signed publication survives replacement by a sibling.
+        // Reuse its validated metadata, including when also present in the directory.
+        let publication = (|| -> Result<(), AppError> {
+            let Some(artifact) = self
+                .runtime
+                .key_package_maintenance_status()?
+                .and_then(|state| state.authored_signed_event)
+            else {
+                return Ok(());
+            };
+            let event: transport_nostr_peeler::NostrTransportEvent =
+                serde_json::from_slice(&artifact.bytes)?;
+            let account_id = event.pubkey.clone();
+            let (fetched, metadata) =
+                crate::key_package_records::key_package_from_record_with_metadata(
+                    &crate::RelayEventRecord {
+                        event,
+                        endpoints: Vec::new(),
+                    },
+                    |package| self.member_device_package_metadata(&account_id, true, package),
+                )?;
+            if let Some(label) = fetched.client_label {
+                labels.insert((fetched.account_id_hex, metadata.signature_key), label);
+            }
+            Ok(())
+        })();
+        failed_advisory_reads += usize::from(publication.is_err());
+        if failed_advisory_reads > 0 {
+            tracing::warn!(target: "marmot_app::client", method = "member_device_labels",
+                failed_advisory_reads, "advisory device label enrichment unavailable");
         }
-        Ok(labels)
+        labels
     }
 
     pub fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
@@ -2721,7 +2788,7 @@ impl AppClient {
                 }
             }
         }
-        let labels = self.member_device_labels(account_ids)?;
+        let labels = self.member_device_labels(account_ids);
         let mut skipped_malformed_group_records = 0usize;
         for group in &self.state.groups {
             let Ok(bytes) = hex::decode(&group.group_id_hex) else {

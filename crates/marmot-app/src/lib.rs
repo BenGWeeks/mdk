@@ -1992,6 +1992,9 @@ impl MarmotApp {
         let recovery_loss_imports = open.recovery_loss_imports;
         let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
         let mut client = AppClient {
+            member_device_package_validations: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            member_device_validation_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             test_recovery_selection_witness: None,
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),

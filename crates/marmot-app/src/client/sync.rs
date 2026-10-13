@@ -5347,9 +5347,7 @@ impl AppClient {
         let buffered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress_updates = buffered.clone();
         let sender_account = hex::encode(self.runtime.session().self_id().as_slice());
-        let cached_labels = self
-            .member_device_labels(std::iter::once(sender_account.clone()))
-            .unwrap_or_default();
+        let cached_labels = self.member_device_labels(std::iter::once(sender_account.clone()));
         let observe = std::sync::Arc::new(
             move |session: &cgka_session::AccountDeviceSession,
                   published: &marmot_account::PublishedApplicationMessage| {
