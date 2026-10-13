@@ -186,6 +186,18 @@ pub struct DirectoryKeyPackage {
     pub source_relays: Vec<String>,
 }
 
+pub(crate) type MemberDeviceKeyPackages =
+    std::collections::HashMap<String, Result<Option<MemberDeviceKeyPackage>, AppError>>;
+
+/// Only the fields roster enrichment needs; ignored JSON fields are not hydrated.
+#[derive(serde::Deserialize)]
+pub(crate) struct MemberDeviceKeyPackage {
+    #[serde(default)]
+    pub(crate) client_label: Option<String>,
+    pub(crate) key_package_hex: String,
+    pub(crate) created_at: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FetchedFollowList {
     pub(crate) follows: Vec<String>,

@@ -2028,3 +2028,205 @@ async fn member_devices_group_accounts_and_survive_self_update_reopen_and_leaf_r
     );
     assert!(!new[0].is_this_installation);
 }
+
+async fn member_device_label_fixture() -> (tempfile::TempDir, MarmotApp, AppClient, GroupId, String)
+{
+    let dir = tempfile::tempdir().unwrap();
+    let remote_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let bob = AccountHome::open(remote_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    let remote = app_at(&remote_dir, relay);
+    let mut bob_client = remote.client("bob").await.unwrap();
+    bob_client.publish_key_package().await.unwrap();
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice
+        .create_group("label regression", &[&bob.account_id_hex])
+        .await
+        .unwrap();
+    (dir, app, alice, group, bob.account_id_hex)
+}
+
+#[tokio::test]
+async fn member_device_labels_unreadable_advisory_row_preserves_roster_and_snapshot() {
+    let (_dir, app, mut alice, group, bob_id) = member_device_label_fixture().await;
+    let second = alice.create_group("second roster", &[]).await.unwrap();
+    let second_members = alice.members(&second).unwrap();
+    let before = alice.members(&group).unwrap();
+    let shared = app.shared_storage().unwrap();
+    let mut record = shared.public_directory_user(&bob_id).unwrap().unwrap();
+    record.key_package_json = Some("unreadable json".into());
+    shared.put_public_directory_user(&record).unwrap();
+    let mut expected = before;
+    for member in &mut expected {
+        if member.member_id_hex == bob_id {
+            for device in member.devices.as_mut().unwrap() {
+                device.client_label = None;
+            }
+        }
+    }
+    assert_eq!(alice.members(&group).unwrap(), expected);
+    assert_eq!(
+        alice.group_roster_session(&group).unwrap().members,
+        expected
+    );
+    assert_eq!(
+        alice
+            .group_read_snapshot()
+            .unwrap()
+            .members(&group)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        alice
+            .group_read_snapshot()
+            .unwrap()
+            .members(&second)
+            .unwrap(),
+        second_members
+    );
+    // A failed advisory store read must also be harmless.
+    let connection = rusqlite::Connection::open(app.shared_storage_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE directory_users SET key_package_json = X'FF' WHERE account_id_hex = ?1",
+            [&bob_id],
+        )
+        .unwrap();
+    assert_eq!(
+        alice
+            .members(&group)
+            .unwrap()
+            .iter()
+            .map(|m| m.devices.as_ref().unwrap().len())
+            .sum::<usize>(),
+        2
+    );
+    // Authoritative failures still fail roster capture.
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let authoritative = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &authoritative,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    authoritative
+        .execute(
+            "UPDATE cgka_groups SET record = 'unreadable json' WHERE id = ?1",
+            [group.as_slice()],
+        )
+        .unwrap();
+    assert!(alice.members(&group).is_err());
+    assert!(alice.group_roster_session(&group).is_err());
+    assert!(alice.group_read_snapshot().is_err());
+}
+
+#[tokio::test]
+async fn member_device_labels_capture_ignores_follow_edges_and_relay_metadata() {
+    let (_dir, app, alice, group, bob_id) = member_device_label_fixture().await;
+    let expected = alice.members(&group).unwrap();
+    let path = app.directory_cache_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key(
+            "alice",
+            &keys,
+            &path,
+            crate::sqlcipher::SqlcipherDatabaseKind::DirectoryCache,
+        )
+        .unwrap();
+    let private = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &private,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    private.execute_batch("DROP TABLE directory_user_follows; UPDATE directory_users SET relay_lists_json = 'unreadable json'").unwrap();
+    let connection = rusqlite::Connection::open(app.shared_storage_path()).unwrap();
+    connection.execute("INSERT INTO directory_user_follows (account_id_hex, follow_account_id_hex, position) VALUES (?1, X'FF', 0)", [&bob_id]).unwrap();
+    connection.execute("UPDATE directory_users SET relay_lists_json = 'unreadable json' WHERE account_id_hex = ?1", [&bob_id]).unwrap();
+    assert_eq!(
+        alice
+            .group_read_snapshot()
+            .unwrap()
+            .members(&group)
+            .unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn member_device_labels_reuse_validation_until_package_changes() {
+    let (_dir, app, alice, group, bob_id) = member_device_label_fixture().await;
+    let expected = alice.members(&group).unwrap();
+    let warmed = alice
+        .member_device_validation_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        warmed, 2,
+        "each package, including the local publication, validates once"
+    );
+    assert_eq!(
+        alice
+            .group_read_snapshot()
+            .unwrap()
+            .members(&group)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(alice.members(&group).unwrap(), expected);
+    assert_eq!(
+        alice
+            .member_device_validation_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        warmed,
+        "unchanged packages must not be revalidated"
+    );
+    let shared = app.shared_storage().unwrap();
+    let mut record = shared.public_directory_user(&bob_id).unwrap().unwrap();
+    let mut package: DirectoryKeyPackage =
+        serde_json::from_str(record.key_package_json.as_ref().unwrap()).unwrap();
+    package.created_at += 1;
+    package.key_package_hex = "00".into();
+    record.key_package_json = Some(serde_json::to_string(&package).unwrap());
+    shared.put_public_directory_user(&record).unwrap();
+    let members = alice.members(&group).unwrap();
+    assert!(
+        members
+            .iter()
+            .find(|m| m.member_id_hex == bob_id)
+            .unwrap()
+            .devices
+            .as_ref()
+            .unwrap()[0]
+            .client_label
+            .is_none()
+    );
+    assert_eq!(
+        alice
+            .member_device_validation_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        warmed + 1
+    );
+    alice.members(&group).unwrap();
+    assert_eq!(
+        alice
+            .member_device_validation_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        warmed + 1,
+        "unchanged rejected packages must not be revalidated"
+    );
+}

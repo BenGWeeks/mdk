@@ -529,6 +529,23 @@ pub(crate) fn key_package_from_record(
 fn key_package_from_borrowed_record(
     record: &RelayEventRecord,
 ) -> Result<FetchedKeyPackage, AppError> {
+    key_package_from_record_with_metadata(record, |package| {
+        key_package_metadata(package)
+            .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))
+    })
+    .map(|(fetched, _)| fetched)
+}
+
+pub(crate) fn key_package_from_record_with_metadata(
+    record: &RelayEventRecord,
+    validate: impl FnOnce(&KeyPackage) -> Result<cgka_engine::key_package::KeyPackageMetadata, AppError>,
+) -> Result<
+    (
+        FetchedKeyPackage,
+        cgka_engine::key_package::KeyPackageMetadata,
+    ),
+    AppError,
+> {
     let event = &record.event;
     require_key_package_tag(event, "mls_protocol_version", |value| value == "1.0")?;
     let key_package_id = event
@@ -559,8 +576,7 @@ fn key_package_from_borrowed_record(
         key_package_event_id_from_hex(&event.id)?,
     )
     .with_protocol_profile(ProtocolProfile::Current);
-    let metadata = key_package_metadata(&key_package)
-        .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+    let metadata = validate(&key_package)?;
     require_key_package_tag(event, "mls_ciphersuite", |value| {
         value == format!("0x{:04x}", metadata.ciphersuite)
     })?;
@@ -603,17 +619,20 @@ fn key_package_from_borrowed_record(
             .map(|endpoint| endpoint.0.clone())
             .collect::<Vec<_>>(),
     );
-    Ok(FetchedKeyPackage {
-        client_label: key_package_client_label(event),
-        account_id_hex: event.pubkey.clone(),
-        key_package,
-        key_package_id,
-        key_package_ref_hex: metadata.key_package_ref_hex,
-        key_package_event_id: event.id.clone(),
-        created_at: event.created_at,
-        source_relays,
-        relay_lists: AccountRelayListStatus::empty(),
-    })
+    Ok((
+        FetchedKeyPackage {
+            client_label: key_package_client_label(event),
+            account_id_hex: event.pubkey.clone(),
+            key_package,
+            key_package_id,
+            key_package_ref_hex: metadata.key_package_ref_hex.clone(),
+            key_package_event_id: event.id.clone(),
+            created_at: event.created_at,
+            source_relays,
+            relay_lists: AccountRelayListStatus::empty(),
+        },
+        metadata,
+    ))
 }
 
 pub(crate) fn account_key_package_record_from_fetched(
