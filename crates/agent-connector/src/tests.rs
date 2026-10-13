@@ -8378,89 +8378,164 @@ async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
     );
 }
 
-async fn multi_device_group_info_snapshot() -> marmot_app::AppGroupConversationSnapshot {
-    let dir = tempfile::tempdir().unwrap();
+// Separate homes give one human identity independent device credentials and
+// MLS keys. Add the second human device to the authenticated agent invite.
+async fn multi_device_group_fixture() -> (
+    Vec<tempfile::TempDir>,
+    MockRelay,
+    AgentConnector,
+    String,
+    GroupId,
+) {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let human_dir = tempfile::tempdir().unwrap();
+    let second_device_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
-    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), relay_url.clone()));
-    let setup = AccountSetupRequest {
-        default_relays: vec![crate::validation::endpoint(&relay_url)],
-        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
-        publish_initial_key_package: true,
-        ..AccountSetupRequest::default()
-    };
-    let agent = runtime
-        .create_identity(setup.relay_options_only())
+    let human = AccountHome::open(human_dir.path())
+        .import_account("human", &"11".repeat(32))
+        .unwrap();
+    let second_device = AccountHome::open(second_device_dir.path())
+        .import_account("human", &"11".repeat(32))
+        .unwrap();
+    assert_eq!(human.account_id_hex, second_device.account_id_hex);
+    let human_runtime =
+        MarmotAppRuntime::new(MarmotApp::with_relay(human_dir.path(), relay_url.clone()));
+    let second_runtime = MarmotAppRuntime::new(MarmotApp::with_relay(
+        second_device_dir.path(),
+        relay_url.clone(),
+    ));
+    let connector = AgentConnector::open(test_config(
+        agent_dir.path(),
+        agent_dir.path().join("dev/wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&agent.label)
         .await
         .unwrap();
-    let peer = runtime.create_identity(setup).await.unwrap();
-    let group = runtime
+    let group = human_runtime
         .create_group(
-            &agent.account.account_id_hex,
+            &human.label,
             "Named pair",
-            std::slice::from_ref(&peer.account.account_id_hex),
+            std::slice::from_ref(&agent.account_id_hex),
             None,
         )
         .await
         .unwrap();
-    let mut snapshot = runtime
-        .group_conversation_snapshot(&agent.account.account_id_hex, &group)
+    // Replaceable relay events use second timestamps; make device two newest.
+    sleep(Duration::from_secs(1)).await;
+    second_runtime
+        .publish_key_package(&second_device.label)
         .await
         .unwrap();
-    runtime.shutdown().await;
-    assert_eq!(snapshot.members.len(), 2);
-    snapshot.members = [
-        vec![snapshot.members[0].clone(); 4],
-        vec![snapshot.members[1].clone(); 10],
-    ]
-    .concat();
-    snapshot.mls_state.member_count = 14;
-    snapshot
+    human_runtime
+        .invite_members(
+            &human.label,
+            &group,
+            std::slice::from_ref(&human.account_id_hex),
+        )
+        .await
+        .unwrap();
+    let creator_snapshot = human_runtime
+        .group_conversation_snapshot(&human.label, &group)
+        .await
+        .unwrap();
+    assert_eq!(
+        creator_snapshot.members.len(),
+        3,
+        "fixture must contain real device leaves"
+    );
+    assert_eq!(creator_snapshot.mls_state.member_count, 3);
+    assert_eq!(creator_snapshot.group.member_count, Some(2));
+    let group_hex = hex::encode(group.as_slice());
+    wait_for_group_state(&connector.app, &agent.label, &group_hex, |group| {
+        group.pending_confirmation
+    })
+    .await;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let snapshot = connector
+                .runtime
+                .group_conversation_snapshot(&agent.label, &group)
+                .await
+                .unwrap();
+            if snapshot.mls_state.member_count == 3 {
+                assert_eq!(snapshot.members.len(), 3);
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("agent must ingest the second device commit");
+    human_runtime.shutdown().await;
+    second_runtime.shutdown().await;
+    (
+        vec![agent_dir, human_dir, second_device_dir],
+        relay,
+        connector,
+        agent.account_id_hex,
+        group,
+    )
 }
 
 #[tokio::test]
 async fn multi_device_group_info_counts_accounts_for_activation() {
-    let mut snapshot = multi_device_group_info_snapshot().await;
-    assert_eq!(crate::messaging::group_info_member_count(&snapshot), 2);
-    // A named pair retains the connector's existing effective-DM activation policy.
-    assert_eq!(snapshot.group.profile.name, "Named pair");
-    let mut third = snapshot.members[0].clone();
-    third.member_id_hex = "cc".repeat(32);
-    snapshot.members = vec![
-        snapshot.members[0].clone(),
-        snapshot.members[4].clone(),
-        third,
-    ];
-    snapshot.mls_state.member_count = 3;
-    assert_eq!(crate::messaging::group_info_member_count(&snapshot), 3);
-    snapshot.members.truncate(1);
-    snapshot.mls_state.member_count = 1;
-    assert_eq!(crate::messaging::group_info_member_count(&snapshot), 1);
+    let (_dirs, _relay, connector, agent, group) = multi_device_group_fixture().await;
+    let group_hex = hex::encode(group.as_slice());
+    let response = connector
+        .group_info_response(&agent, &group_hex)
+        .await
+        .unwrap();
+    assert_group_info(response, &agent, &group_hex, 2, true, Some("Named pair"));
+    connector.runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn multi_device_group_info_home_diagnostics_use_projected_account_count() {
-    let snapshot = multi_device_group_info_snapshot().await;
-    assert_eq!(
-        crate::diagnostics::diagnostic_home_membership(Some(&snapshot.group)),
-        (Some(2), Some(true))
-    );
+    let (_dirs, _relay, connector, agent, group) = multi_device_group_fixture().await;
+    let AgentControlResponse::DiagnosticStatus { report } = connector
+        .diagnostic_status_response(Some(&agent), Some(&hex::encode(group.as_slice())))
+        .await
+        .unwrap()
+    else {
+        panic!("expected diagnostic status")
+    };
+    assert!(report.home.resolved);
+    assert_eq!(report.home.member_count, Some(2));
+    assert_eq!(report.home.is_direct, Some(true));
+    connector.runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn multi_device_group_info_direct_invite_admission_counts_accounts() {
-    let snapshot = multi_device_group_info_snapshot().await;
-    let direct = crate::messaging::group_info_member_count(&snapshot) == 2;
-    assert!(crate::invite_policy::invite_policy_allows(
-        agent_control::AgentControlInvitePolicy::AnyAuthenticatedDirect,
-        true,
-        false,
-        direct,
-    ));
-    assert!(!crate::invite_policy::invite_policy_allows(
-        agent_control::AgentControlInvitePolicy::AnyAuthenticatedDirect,
-        false,
-        false,
-        direct,
-    ));
+    let (_dirs, _relay, connector, agent, group) = multi_device_group_fixture().await;
+    connector
+        .allowlists
+        .set_policy(&agent, AgentControlInvitePolicy::AnyAuthenticatedDirect)
+        .unwrap();
+    let worker = tokio::spawn(
+        connector
+            .clone()
+            .run_invite_policy_worker(Default::default()),
+    );
+    let group_hex = hex::encode(group.as_slice());
+    wait_for_group_state(&connector.app, "agent", &group_hex, |group| {
+        !group.pending_confirmation
+    })
+    .await;
+    let admitted = connector.app.group("agent", &group_hex).unwrap().unwrap();
+    assert!(
+        !admitted.archived,
+        "authenticated multi-device pair must be accepted"
+    );
+    worker.abort();
+    let _ = worker.await;
+    connector.runtime.shutdown().await;
 }
