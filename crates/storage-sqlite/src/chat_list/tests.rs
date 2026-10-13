@@ -2016,6 +2016,96 @@ fn upgrade_to_distinct_accounts_rebuilds_unread_after_direct_reclassification() 
 }
 
 #[test]
+fn upgrade_to_distinct_accounts_rebuilds_unread_after_unknown_or_direct_classification() {
+    for (previous_count, accounts, before_kind, after_kind, unread_count, first_unread) in [
+        (
+            None,
+            3,
+            ChatConversationKind::Unknown,
+            ChatConversationKind::Group,
+            2,
+            "made-admin",
+        ),
+        (
+            None,
+            2,
+            ChatConversationKind::Unknown,
+            ChatConversationKind::Direct,
+            1,
+            "newer-chat",
+        ),
+        (
+            Some(2),
+            3,
+            ChatConversationKind::Direct,
+            ChatConversationKind::Group,
+            2,
+            "made-admin",
+        ),
+    ] {
+        let mut projected = group();
+        projected.profile_name.clear();
+        projected.member_count = previous_count;
+        let store = setup_store_with_group(projected);
+        let mut roster = sample_group(GroupId::new(vec![0x11]), 7, 0);
+        roster.members = (0..accounts)
+            .map(|byte| cgka_traits::group::Member {
+                id: cgka_traits::types::MemberId::new(vec![byte; 32]),
+                credential: Vec::new(),
+            })
+            .collect();
+        store.put_group(&roster).unwrap();
+        store
+            .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+            .unwrap();
+        store
+            .record_app_event(&group_system(
+                "made-admin",
+                REMOTE,
+                10,
+                GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+                r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
+            ))
+            .unwrap();
+        let mut newer_chat = chat("newer-chat", REMOTE, 20, "hello");
+        newer_chat.source_epoch = Some(11);
+        store.record_app_event(&newer_chat).unwrap();
+        store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        let before = store.chat_list_row(GROUP).unwrap().unwrap();
+        assert_eq!(before.conversation_kind, before_kind);
+        assert_eq!(before.unread_count, 1);
+        assert_eq!(
+            before.first_unread_message_id_hex.as_deref(),
+            Some("newer-chat")
+        );
+        assert_eq!(before.last_message.unwrap().message_id_hex, "newer-chat");
+
+        // Restore the version-107 ledger around this populated legacy projection.
+        {
+            let mut conn = store.lock().unwrap();
+            conn.execute("DELETE FROM cgka_schema_migrations WHERE version = 108", [])
+                .unwrap();
+            crate::migrations::run_all(&mut conn).unwrap();
+            let readiness: (bool, bool) = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chat_list_unread_ready_groups WHERE group_id_hex=?1),
+                        EXISTS(SELECT 1 FROM chat_presentation_row_work WHERE group_id_hex=?1)",
+                [GROUP], |r| Ok((r.get(0)?, r.get(1)?)),
+            ).unwrap();
+            assert_eq!(readiness, (false, true));
+        }
+        store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        let after = store.chat_list_row(GROUP).unwrap().unwrap();
+        assert_eq!(after.conversation_kind, after_kind);
+        assert_eq!(after.unread_count, unread_count);
+        assert_eq!(
+            after.first_unread_message_id_hex.as_deref(),
+            Some(first_unread)
+        );
+        assert_eq!(after.last_message.unwrap().message_id_hex, "newer-chat");
+    }
+}
+
+#[test]
 fn ensure_chat_list_rows_backfills_missing_projection_rows() {
     let store = setup_store();
     store
