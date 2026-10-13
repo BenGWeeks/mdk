@@ -2452,6 +2452,30 @@ async fn welcome_device_labels_read_time_fixture(reject_history: bool) {
     let runtime = crate::MarmotAppRuntime::new(receiver.clone());
     let mut notifications = runtime.subscribe();
     runtime.start().await.unwrap();
+    let mut timeline_subscription = runtime
+        .subscribe_timeline_messages(
+            "bob",
+            crate::TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group.as_slice())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        timeline_subscription
+            .take_snapshot()
+            .messages
+            .iter()
+            .any(|row| row.message_id_hex == raw_before.message_id_hex
+                && matches!(
+                    &row.sender_device,
+                    crate::SenderDevice::Exact {
+                        client_label: None,
+                        ..
+                    }
+                ))
+    );
     tokio::time::timeout(Duration::from_secs(10), entered.notified())
         .await
         .expect("missing labels schedule a background fetch");
@@ -2486,14 +2510,33 @@ async fn welcome_device_labels_read_time_fixture(reject_history: bool) {
     let mut notified_group = false;
     let mut notified_timeline = false;
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !notified_group || !notified_timeline {
-            match notifications.recv().await.unwrap() {
-                crate::MarmotAppEvent::GroupStateUpdated { group_id, .. } => notified_group |= group_id == group,
-                crate::MarmotAppEvent::ProjectionUpdated(update) => notified_timeline |= update.update.timeline_messages.iter().any(|m| matches!(&m.sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Lightning Piggy")),
-                _ => {}
+        // Keep recv alive while the independent roster notification arrives:
+        // cancelling it during its store read would consume the refresh signal.
+        let roster_updates = async {
+            while !notified_group {
+                if let crate::MarmotAppEvent::GroupStateUpdated { group_id, .. } = notifications.recv().await.unwrap() {
+                    notified_group |= group_id == group;
+                }
             }
-        }
-    }).await.expect("roster and timeline hosts are notified");
+        };
+        let timeline_updates = async {
+            while !notified_timeline {
+                timeline_subscription.recv().await.expect("timeline subscription remains open");
+                notified_timeline |= timeline_subscription.take_snapshot().messages.iter().any(|row|
+                    row.message_id_hex == raw_before.message_id_hex && matches!(&row.sender_device,
+                        crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Lightning Piggy"));
+            }
+        };
+        tokio::join!(roster_updates, timeline_updates);
+    }).await.unwrap_or_else(|_| {
+        let has_label = |row: &crate::TimelineMessageRecord| matches!(&row.sender_device,
+            crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Lightning Piggy");
+        let reread = receiver.timeline_message("bob", &raw_before.group_id_hex, &raw_before.message_id_hex).unwrap();
+        let snapshot = timeline_subscription.take_snapshot();
+        let displayed = snapshot.messages.iter().find(|row| row.message_id_hex == raw_before.message_id_hex);
+        panic!("roster and timeline hosts are notified: group={notified_group}, timeline={notified_timeline}, stored_present={}, stored_label={}, displayed_present={}, displayed_label={}, window_size={}",
+            reread.is_some(), reread.as_ref().is_some_and(has_label), displayed.is_some(), displayed.is_some_and(has_label), snapshot.messages.len());
+    });
     let after = runtime
         .group_members("bob", &group)
         .await

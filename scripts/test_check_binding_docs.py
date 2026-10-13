@@ -21,6 +21,20 @@ class BindingDocsTests(unittest.TestCase):
         self.assertEqual(check((REPO / "crates/marmot-uniffi/API-REFERENCE.md").read_text(), "rust", uniffi_catalog()), [])
         self.assertEqual(check((REPO / "crates/marmot-c/API-REFERENCE.md").read_text(), "c", c_exports_in((REPO / "crates/marmot-c/include/marmot.h").read_text())), [])
 
+    def test_device_label_refresh_scope_is_consistent(self) -> None:
+        for relative in (
+            "crates/marmot-app/README.md",
+            "crates/marmot-uniffi/README.md",
+            "crates/marmot-uniffi/API-REFERENCE.md",
+        ):
+            with self.subTest(path=relative):
+                text = " ".join((REPO / relative).read_text().split())
+                self.assertIn("64-row tail comparison", text)
+                self.assertIn("bounded open-viewport re-read", text)
+                self.assertIn("evicted labels", text)
+                self.assertIn("current edits and deletions", text)
+                self.assertNotIn("at most 64 recent timeline rows per group", text)
+
     def test_rejects_omitted_method(self) -> None:
         self.assertIn("missing method", "\n".join(check("", "rust", self.expected)))
 

@@ -334,16 +334,12 @@ pub(crate) fn publish_conversation_captures_from_session(
 }
 pub(crate) fn conversation_label_viewports(
     client: &AppClient,
-    groups: &std::collections::HashSet<GroupId>,
 ) -> Vec<(Weak<SendCapture>, Vec<crate::TimelineMessageRecord>)> {
     client
         .conversation_captures
         .iter()
         .filter_map(|weak| {
             let observer = weak.upgrade()?;
-            if !groups.contains(&observer.group) {
-                return None;
-            }
             let rows = observer
                 .state
                 .lock()

@@ -805,9 +805,14 @@ including misses and failures, have a one-hour cooldown per account worker.
 Only demanded keys and invitation selections enter the validated cache, capped at
 16 entries per account with least-recently-confirmed eviction. Labels survive
 directory slot replacement and resolve at read time; stored message rows never
-change. Completion coalesces `GroupStateUpdated` and `ProjectionUpdated` for changed
-roster or recent sender labels (at most 64 recent timeline rows per group), so hosts
-re-read their roster or refresh their timeline subscription. Shutdown stops waiting
+change. Completion uses a 64-row tail comparison per demand-associated group for
+changed roster/sender `GroupStateUpdated` notifications. Separately, a bounded
+open-viewport re-read refreshes affected timeline subscriptions and conversation
+windows from storage, coalesced per window and bounded by loaded size/query limit.
+All loaded rows are compared, including older departed devices and evicted labels
+in groups that supplied no demand. Displayed rows are never republished as message
+upserts; hosts receive current edits and deletions with read-time labels. Unchanged
+windows receive no label refresh. Shutdown stops waiting
 and admitting results; coalesced directory fetches finish independently within
 relay connect/fetch timeouts.
 `joined_at` is always `None`; no join timestamp is inferred or backfilled. Treat

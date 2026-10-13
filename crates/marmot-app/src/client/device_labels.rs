@@ -116,9 +116,10 @@ pub(crate) struct FetchedLabel {
 thread_local! { pub(crate) static LABEL_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 type TimelineView = std::sync::Weak<Mutex<crate::runtime::TimelineWindow>>;
+type LabelRefresh = std::sync::Weak<tokio::sync::Notify>;
 #[derive(Clone, Default)]
 pub(crate) struct TimelineLabelViews {
-    views: Arc<Mutex<Vec<(String, TimelineView)>>>,
+    views: Arc<Mutex<Vec<(String, TimelineView, LabelRefresh)>>>,
     workers: Arc<Mutex<HashMap<String, DeviceLabelEnrichment>>>,
 }
 impl TimelineLabelViews {
@@ -138,10 +139,15 @@ impl TimelineLabelViews {
         &self,
         label: &str,
         window: &Arc<Mutex<crate::runtime::TimelineWindow>>,
+        refresh: &Arc<tokio::sync::Notify>,
     ) {
         let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
-        views.retain(|(_, view)| view.strong_count() > 0);
-        views.push((label.to_owned(), Arc::downgrade(window)));
+        views.retain(|(_, view, _)| view.strong_count() > 0);
+        views.push((
+            label.to_owned(),
+            Arc::downgrade(window),
+            Arc::downgrade(refresh),
+        ));
         drop(views);
         self.schedule(
             label,
@@ -173,14 +179,36 @@ impl TimelineLabelViews {
             }
         }
     }
+    /// Signal only changed loaded windows. Notify retains one permit per window,
+    /// so completions coalesce without buffering copies of displayed records.
+    fn invalidate_changed(&self, label: &str, resolver: &mut DeviceLabelResolver<'_>) {
+        let views = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        for (owner, view, refresh) in views.iter() {
+            if owner != label {
+                continue;
+            }
+            let (Some(view), Some(refresh)) = (view.upgrade(), refresh.upgrade()) else {
+                continue;
+            };
+            let window = view.lock().unwrap_or_else(|e| e.into_inner());
+            if window.page.messages.iter().any(|message| {
+                let mut after = message.sender_device.clone();
+                resolver.enrich(&message.group_id_hex, &message.sender, &mut after);
+                after != message.sender_device
+            }) {
+                refresh.notify_one();
+            }
+        }
+    }
+
     fn messages(&self, label: &str) -> Vec<crate::TimelineMessageRecord> {
         let views = {
             let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
-            views.retain(|(_, view)| view.strong_count() > 0);
+            views.retain(|(_, view, _)| view.strong_count() > 0);
             views
                 .iter()
-                .filter(|(owner, _)| owner == label)
-                .filter_map(|(_, view)| view.upgrade())
+                .filter(|(owner, _, _)| owner == label)
+                .filter_map(|(_, view, _)| view.upgrade())
                 .collect::<Vec<_>>()
         };
         views
@@ -563,11 +591,12 @@ impl AppClient {
     /// Admit only demanded leaves and publish bounded, read-time display changes.
     pub(crate) fn finish_device_label_pass(&mut self, labels: Vec<FetchedLabel>) -> Vec<GroupId> {
         let demand = self.device_label_enrichment.finish();
-        let groups = demand
+        let mut groups = demand
             .values()
             .flat_map(|groups| groups.keys().cloned())
             .collect::<HashSet<_>>();
-        let conversation_views = crate::runtime::conversation_label_viewports(self, &groups);
+        let demand_groups = groups.clone();
+        let conversation_views = crate::runtime::conversation_label_viewports(self);
         let displayed = self
             .app
             .device_label_timeline_views
@@ -579,24 +608,34 @@ impl AppClient {
                     .flat_map(|(_, rows)| rows.iter().cloned()),
             )
             .collect::<Vec<_>>();
+        // Admission can evict any cached key for an account, including keys in
+        // windows whose groups supplied no demand in this pass.
+        groups.extend(
+            displayed
+                .iter()
+                .filter_map(|row| hex::decode(&row.group_id_hex).ok().map(GroupId::new)),
+        );
         let mut before = HashMap::new();
         for group in groups {
             let roster = self.members(&group).unwrap_or_default();
-            let mut messages = self
-                .app
-                .timeline_messages_with_query(
-                    &self.state.label,
-                    crate::TimelineMessageQuery {
-                        group_id_hex: Some(hex::encode(group.as_slice())),
-                        pagination: crate::TimelinePagination {
-                            limit: Some(DEVICE_LABEL_RECENT_SENDERS),
+            let mut messages = if demand_groups.contains(&group) {
+                self.app
+                    .timeline_messages_with_query(
+                        &self.state.label,
+                        crate::TimelineMessageQuery {
+                            group_id_hex: Some(hex::encode(group.as_slice())),
+                            pagination: crate::TimelinePagination {
+                                limit: Some(DEVICE_LABEL_RECENT_SENDERS),
+                                ..Default::default()
+                            },
                             ..Default::default()
                         },
-                        ..Default::default()
-                    },
-                )
-                .map(|page| page.messages)
-                .unwrap_or_default();
+                    )
+                    .map(|page| page.messages)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let group_hex = hex::encode(group.as_slice());
             messages.extend(
                 displayed
@@ -646,17 +685,12 @@ impl AppClient {
         let mut labels = DeviceLabelResolver::new(&self.app);
         for (group, (roster, messages)) in before {
             let roster_changed = self.members(&group).is_ok_and(|after| after != roster);
-            let mut changed_messages = Vec::new();
-            for mut message in messages {
-                let before = message.sender_device.clone();
-                labels.timeline(&mut message);
-                if before != message.sender_device {
-                    changed_messages.push(message);
-                }
-            }
-            changed_messages.sort_by(|a, b| a.message_id_hex.cmp(&b.message_id_hex));
-            changed_messages.dedup_by(|a, b| a.message_id_hex == b.message_id_hex);
-            if roster_changed || !changed_messages.is_empty() {
+            let sender_changed = messages.iter().any(|message| {
+                let mut after = message.sender_device.clone();
+                labels.enrich(&message.group_id_hex, &message.sender, &mut after);
+                after != message.sender_device
+            });
+            if roster_changed || sender_changed {
                 changed_groups.push(group.clone());
                 let group_hex = hex::encode(group.as_slice());
                 let observers = conversation_views
@@ -681,25 +715,11 @@ impl AppClient {
                     &group,
                 );
             }
-            if !changed_messages.is_empty() {
-                let changes = changed_messages
-                    .iter()
-                    .cloned()
-                    .map(|message| crate::TimelineMessageChange::Upsert {
-                        trigger: crate::TimelineUpdateTrigger::MessageEditedOrReprojected,
-                        message: Box::new(message),
-                    })
-                    .collect();
-                self.pending_projection_updates
-                    .push(crate::AppProjectionUpdate {
-                        group_id_hex: hex::encode(group.as_slice()),
-                        timeline_messages: changed_messages,
-                        timeline_changes: changes,
-                        chat_list_row: None,
-                        chat_list_trigger: crate::ChatListUpdateTrigger::SnapshotRefresh,
-                    });
-            }
         }
+        self.app
+            .device_label_timeline_views
+            .invalidate_changed(&self.state.label, &mut labels);
+
         if failed_admissions > 0 {
             tracing::debug!(target: "marmot_app::device_labels", method = "finish_device_label_pass", failed_admissions, "optional label admission unavailable");
         }

@@ -1218,6 +1218,7 @@ fn timeline_subscription_with(
 ) -> RuntimeTimelineMessagesSubscription {
     RuntimeTimelineMessagesSubscription {
         label_app: None,
+        label_refresh: Arc::new(tokio::sync::Notify::new()),
         policy_window_size: window.messages.len().max(1),
         policy_storage: storage_sqlite::SqliteAccountStorage::in_memory().unwrap(),
         window: timeline_window_handle(store, window, window_limit),

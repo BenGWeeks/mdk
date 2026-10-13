@@ -251,10 +251,15 @@ account, with one pass in flight and a one-hour re-fetch interval even for misse
 or failures. Only demanded leaf keys and invitation selections enter the sanitized
 label cache, capped at 16 entries per account with least-recently-confirmed eviction.
 Labels survive directory slot replacement and resolve at read time for Exact
-senders; message rows and retained history are never rewritten. Completion coalesces
-`GroupStateUpdated` and `ProjectionUpdated` only for changed roster or recent sender
-labels (at most 64 recent timeline rows per group). Hosts refresh their roster/timeline
-through the existing subscriptions; unavailable labels remain `None`. Shutdown stops
+senders; message rows and retained history are never rewritten. Completion uses a
+64-row tail comparison per demand-associated group for changed roster/sender
+`GroupStateUpdated` notifications. Separately, a bounded open-viewport re-read
+refreshes each affected timeline subscription or conversation window from storage,
+coalesced per window and bounded by its loaded size/query limit. All loaded rows are
+compared, including older departed devices and evicted labels in groups that supplied
+no demand. Displayed rows are never republished as message upserts: hosts receive
+current edits and deletions with read-time labels. Unchanged windows receive no
+label refresh; unavailable labels remain `None`. Shutdown stops
 waiting and admitting results; shared directory fetches can finish independently
 within their relay connect/fetch timeouts.
 

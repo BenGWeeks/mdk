@@ -435,6 +435,7 @@ pub struct RuntimeTimelineMessagesSubscription {
     // Hosted subscriptions resolve advisory labels after policy rehydration.
     // In-memory window tests have no shared app cache.
     pub(crate) label_app: Option<MarmotApp>,
+    pub(crate) label_refresh: Arc<tokio::sync::Notify>,
     pub(crate) policy_window_size: usize,
     pub(crate) policy_storage: storage_sqlite::SqliteAccountStorage,
     pub(crate) window: TimelineWindowHandle,
@@ -473,8 +474,12 @@ impl RuntimeTimelineMessagesSubscription {
     pub async fn recv(&mut self) -> Option<RuntimeTimelineMessageUpdate> {
         loop {
             let signal = tokio::select! {
-                signal = self.updates.recv() => signal?,
+                // Consume queued edits/removals first. Label invalidation carries
+                // no row data and re-reads the current bounded window from storage.
+                biased;
                 _ = wait_for_runtime_shutdown(&mut self.stopping) => return None,
+                signal = self.updates.recv() => signal?,
+                _ = self.label_refresh.notified() => TimelineSubscriptionSignal::Refresh,
             };
             self.policy_window_size = self.policy_window_size.max(self.window.message_count());
             // Refresh only the affected records under current policy, including
@@ -1223,10 +1228,12 @@ impl MarmotAppRuntime {
                 generation: 0,
             })),
         };
-        self.accounts
-            .app
-            .device_label_timeline_views
-            .register(&account.label, &window.inner);
+        let label_refresh = Arc::new(tokio::sync::Notify::new());
+        self.accounts.app.device_label_timeline_views.register(
+            &account.label,
+            &window.inner,
+            &label_refresh,
+        );
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -1288,6 +1295,7 @@ impl MarmotAppRuntime {
         });
         Ok(RuntimeTimelineMessagesSubscription {
             label_app: Some(self.accounts.app.clone()),
+            label_refresh,
             policy_window_size,
             policy_storage: subscription_policy_storage,
             window,

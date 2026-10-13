@@ -2430,6 +2430,25 @@ async fn hot_checkpoints_do_not_postpone_normal_refresh() {
 
 #[tokio::test]
 async fn device_labels_refresh_open_older_departed_device_window() {
+    label_refresh_with_queued_mutation(None).await;
+}
+
+#[tokio::test]
+async fn device_labels_refresh_preserves_queued_edit() {
+    label_refresh_with_queued_mutation(Some(1009)).await;
+}
+
+#[tokio::test]
+async fn device_labels_refresh_preserves_queued_deletion() {
+    label_refresh_with_queued_mutation(Some(0)).await;
+}
+
+#[tokio::test]
+async fn device_labels_refresh_preserves_queued_author_deletion() {
+    label_refresh_with_queued_mutation(Some(5)).await;
+}
+
+async fn label_refresh_with_queued_mutation(mutation: Option<u64>) {
     let f = Fixture::new(80).await;
     f.runtime
         .accounts
@@ -2466,6 +2485,14 @@ async fn device_labels_refresh_open_older_departed_device_window() {
         moderation_grant: false,
     };
     f.store.record_app_event(&old).unwrap();
+    if mutation.is_some() {
+        let mut retained = old.clone();
+        retained.message_id_hex = id(1);
+        retained.source_message_id_hex = Some(id(10001));
+        retained.recorded_at = 101;
+        retained.received_at = 101;
+        f.store.record_app_event(&retained).unwrap();
+    }
     let mut subscription = f
         .runtime
         .subscribe_timeline_messages(
@@ -2490,6 +2517,21 @@ async fn device_labels_refresh_open_older_departed_device_window() {
             .iter()
             .any(|m| m.message_id_hex == id(0))
     );
+    let mut unchanged_subscription = f
+        .runtime
+        .subscribe_timeline_messages(
+            "alice",
+            crate::TimelineMessageQuery {
+                group_id_hex: Some(f.group_hex()),
+                pagination: crate::TimelinePagination {
+                    limit: Some(5),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let tail_query = ConversationWindowQuery {
         opening: ConversationOpenQuery {
             target: ConversationOpenTarget::Latest,
@@ -2529,6 +2571,66 @@ async fn device_labels_refresh_open_older_departed_device_window() {
             .any(|m| m.message_id_hex == id(0))
     );
     assert!(client.device_label_enrichment.begin().contains(&sender));
+    if let Some(kind) = mutation {
+        let update = if kind == 0 {
+            f.store
+                .prune_app_events_before(&f.group_hex(), 101, &f.account, &|_, _| false)
+                .unwrap();
+            assert!(
+                f.store
+                    .timeline_message(&f.group_hex(), &id(0))
+                    .unwrap()
+                    .is_none()
+            );
+            crate::AppProjectionUpdate {
+                group_id_hex: f.group_hex(),
+                timeline_messages: vec![],
+                timeline_changes: vec![crate::TimelineMessageChange::Remove {
+                    message_id_hex: id(0),
+                    reason: storage_sqlite::TimelineRemoveReason::Pruned,
+                }],
+                chat_list_row: None,
+                chat_list_trigger: crate::ChatListUpdateTrigger::SnapshotRefresh,
+            }
+        } else {
+            let mut event = old.clone();
+            event.message_id_hex = id(9000);
+            event.source_message_id_hex = Some(id(19000));
+            event.kind = kind;
+            event.recorded_at = 200;
+            event.received_at = 200;
+            event.plaintext = "edited during enrichment".into();
+            event.tags = vec![vec!["e".into(), old.message_id_hex.clone()]];
+            f.app
+                .app_projection_update("alice", f.store.record_app_event(&event).unwrap())
+                .unwrap()
+        };
+        f.runtime
+            .events
+            .send(MarmotAppEvent::ProjectionUpdated(
+                crate::RuntimeProjectionUpdate {
+                    account_id_hex: f.account.clone(),
+                    account_label: "alice".into(),
+                    update,
+                },
+            ))
+            .unwrap();
+        // Ensure the edit/removal is queued while the host still displays the old row.
+        timeout(Duration::from_secs(5), async {
+            while subscription.updates.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            subscription
+                .take_snapshot()
+                .messages
+                .iter()
+                .any(|m| m.message_id_hex == id(0) && m.plaintext == "old departed device")
+        );
+    }
     client.pending_projection_updates.clear();
     client.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
         account: sender,
@@ -2536,6 +2638,10 @@ async fn device_labels_refresh_open_older_departed_device_window() {
         label: "Departed".into(),
         created_at: 1,
     }]);
+    assert!(
+        client.pending_projection_updates.is_empty(),
+        "label completion must never queue displayed message copies"
+    );
     assert!(
         tail.take().is_none(),
         "an unchanged open viewport must not refresh"
@@ -2556,6 +2662,61 @@ async fn device_labels_refresh_open_older_departed_device_window() {
         .await
         .unwrap()
         .unwrap();
+    if mutation.is_none() {
+        assert!(
+            timeout(Duration::from_millis(50), unchanged_subscription.recv())
+                .await
+                .is_err(),
+            "an unchanged timeline viewport must not refresh"
+        );
+    }
+    if mutation.is_some() {
+        let refreshed = timeout(Duration::from_secs(5), subscription.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(refreshed, crate::RuntimeTimelineMessageUpdate::Page { .. }),
+            "label invalidation must re-read the bounded window"
+        );
+        let snapshot = subscription.take_snapshot();
+        assert!(snapshot.messages.len() <= 5);
+        assert!(snapshot.messages.iter().any(|m| m.message_id_hex == id(1) && matches!(&m.sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Departed")));
+
+        if mutation == Some(0) {
+            assert!(
+                !snapshot.messages.iter().any(|m| m.message_id_hex == id(0)),
+                "label refresh must not resurrect a deleted row"
+            );
+        } else if mutation == Some(5) {
+            let row = snapshot
+                .messages
+                .iter()
+                .find(|m| m.message_id_hex == id(0))
+                .unwrap();
+            let current = f
+                .store
+                .timeline_message(&f.group_hex(), &id(0))
+                .unwrap()
+                .unwrap();
+            assert!(
+                row.deleted && row.plaintext == current.plaintext,
+                "label refresh must preserve the authoritative deletion tombstone"
+            );
+            assert!(
+                matches!(&row.sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Departed")
+            );
+        } else {
+            assert!(snapshot.messages.iter().any(|m| m.message_id_hex == id(0) && m.plaintext == "edited during enrichment" && matches!(&m.sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Departed")), "label refresh must preserve the current edit and add its label");
+        }
+        assert!(
+            timeout(Duration::from_millis(50), subscription.recv())
+                .await
+                .is_err(),
+            "label completion must coalesce to one viewport re-read"
+        );
+        return;
+    }
     assert!(subscription.take_snapshot().messages.iter().any(|m| m.message_id_hex == id(0) && matches!(&m.sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Departed")));
     let updated = observer
         .take()
@@ -2565,4 +2726,140 @@ async fn device_labels_refresh_open_older_departed_device_window() {
         f.app.cached_sender_device_label(&f.group, sender, device)
     });
     assert!(page.page().messages.iter().any(|m| m.message_id_hex == id(0) && matches!(&m.sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Departed")));
+}
+
+#[tokio::test]
+async fn device_labels_eviction_refreshes_other_open_group() {
+    let f = Fixture::new(0).await;
+    f.runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap()
+        .shutdown()
+        .await;
+    let mut client = f.app.client("alice").await.unwrap();
+    let other = client.create_group("other", &[]).await.unwrap();
+    let sender = "bb".repeat(32);
+    let key = vec![77; 32];
+    let cache = f.app.shared_storage().unwrap();
+    cache
+        .put_device_client_label(&sender, &key, "Evicted", 1)
+        .unwrap();
+    for i in 0..15 {
+        cache
+            .put_device_client_label(&sender, &[i; 32], "Sibling", 2 + u64::from(i))
+            .unwrap();
+    }
+    let row = StoredAppEvent {
+        group_id_hex: hex::encode(other.as_slice()),
+        message_id_hex: id(0),
+        source_message_id_hex: Some(id(10000)),
+        source_epoch: Some(1),
+        direction: "received".into(),
+        sender: sender.clone(),
+        sender_device: crate::SenderDevice::Exact {
+            device_id: cgka_traits::message::member_device_id(&other, &key),
+            leaf_index: 9,
+            client_label: None,
+            is_this_installation: false,
+        },
+        plaintext: "other group".into(),
+        kind: 9,
+        tags: vec![],
+        recorded_at: 100,
+        received_at: 100,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    f.store.record_app_event(&row).unwrap();
+    let mut subscription = f
+        .runtime
+        .subscribe_timeline_messages(
+            "alice",
+            crate::TimelineMessageQuery {
+                group_id_hex: Some(row.group_id_hex.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(&subscription.take_snapshot().messages[0].sender_device,
+        crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Evicted")
+    );
+    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Latest,
+            limit: 5,
+        },
+        before_anchor: None,
+    };
+    let observer = Arc::new(SendCapture::new(
+        other.clone(),
+        epoch.clone(),
+        query.clone(),
+    ));
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    capture_conversation(&mut client, &other, query, &epoch).unwrap();
+    // Only the first group supplies demand. Admission there evicts a key displayed in the other group.
+    let new_key = vec![78; 32];
+    client.device_label_enrichment.schedule(
+        &sender,
+        &f.group,
+        &cgka_traits::message::member_device_id(&f.group, &new_key),
+    );
+    assert!(client.device_label_enrichment.begin().contains(&sender));
+    let changed =
+        client.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+            account: sender.clone(),
+            key: new_key,
+            label: "New".into(),
+            created_at: 100,
+        }]);
+    assert!(cache.device_client_label(&sender, &key).unwrap().is_none());
+    assert!(
+        changed.contains(&other),
+        "eviction must notify a group with no demand"
+    );
+    for update in client.take_pending_projection_updates() {
+        f.runtime
+            .events
+            .send(MarmotAppEvent::ProjectionUpdated(
+                crate::RuntimeProjectionUpdate {
+                    account_id_hex: f.account.clone(),
+                    account_label: "alice".into(),
+                    update,
+                },
+            ))
+            .unwrap();
+    }
+    timeout(Duration::from_secs(5), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &subscription.take_snapshot().messages[0].sender_device,
+        crate::SenderDevice::Exact {
+            client_label: None,
+            ..
+        }
+    ));
+    let refreshed = observer
+        .take()
+        .expect("other conversation viewport must refresh on eviction");
+    let mut page = refreshed.account.page;
+    page.enrich_sender_device_labels(|_, sender, device| {
+        f.app.cached_sender_device_label(&other, sender, device)
+    });
+    assert!(matches!(
+        &page.page().messages[0].sender_device,
+        crate::SenderDevice::Exact {
+            client_label: None,
+            ..
+        }
+    ));
 }
