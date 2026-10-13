@@ -1695,6 +1695,10 @@ impl MarmotAppRuntime {
             .map_err(|_| {
                 AppError::InvalidEncryptedMedia("invalid attachment download policy".into())
             })?;
+        self.accounts
+            .app
+            .device_label_events
+            .set_executor(tokio::runtime::Handle::current());
         *self
             .shared
             .diagnostics_executor
@@ -5934,6 +5938,7 @@ impl MarmotAppRuntime {
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
+        self.accounts.app.device_label_events.stop();
         self.shared
             .local_submission_queue
             .lock()
@@ -6049,6 +6054,7 @@ impl MarmotAppRuntime {
 
     async fn run_terminal_shutdown_and_close(self) -> Result<(), AppError> {
         self.shared.lifecycle().begin_shutdown();
+        self.accounts.app.device_label_events.stop();
         self.shared
             .local_submission_queue
             .lock()
@@ -8625,6 +8631,7 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        self.app.device_label_events.stop();
         self.shared
             .local_submission_queue
             .lock()

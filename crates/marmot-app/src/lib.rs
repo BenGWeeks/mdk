@@ -3225,7 +3225,7 @@ impl MarmotApp {
     ) -> Result<Vec<AppMessageRecord>, AppError> {
         self.ensure_account_state(label)?;
         let mut labels = client::device_labels::DeviceLabelResolver::new(self);
-        Ok(self
+        let messages: Vec<_> = self
             .account_storage(label)?
             .visible_app_messages(StoredAppMessageQuery {
                 group_id_hex: query.group_id_hex,
@@ -3242,7 +3242,18 @@ impl MarmotApp {
                 );
                 message
             })
-            .collect())
+            .collect();
+        self.device_label_events.schedule_senders(
+            label,
+            messages.iter().map(|message| {
+                (
+                    message.group_id_hex.as_str(),
+                    message.sender.as_str(),
+                    &message.sender_device,
+                )
+            }),
+        );
+        Ok(messages)
     }
 
     /// Resolve one app-visible event by group/message id, applying block policy.
@@ -3262,6 +3273,14 @@ impl MarmotApp {
         }
         let mut message = app_message_record_from_stored(record);
         self.enrich_message_device_label(&mut message);
+        self.device_label_events.schedule_senders(
+            label,
+            [(
+                message.group_id_hex.as_str(),
+                message.sender.as_str(),
+                &message.sender_device,
+            )],
+        );
         Ok(Some(message))
     }
 
@@ -3362,6 +3381,8 @@ impl MarmotApp {
             .timeline_message(group_id_hex, message_id_hex)?;
         if let Some(message) = &mut message {
             self.enrich_timeline_device_label(message);
+            self.device_label_events
+                .schedule(label, std::slice::from_ref(message));
         }
         Ok(message)
     }
@@ -6835,6 +6856,28 @@ impl MarmotApp {
                 labels.timeline(message);
             }
         }
+        self.device_label_events.schedule_senders(
+            label,
+            storage_update
+                .messages
+                .iter()
+                .chain(
+                    storage_update
+                        .changes
+                        .iter()
+                        .filter_map(|change| match change {
+                            TimelineMessageChange::Upsert { message, .. } => Some(message.as_ref()),
+                            _ => None,
+                        }),
+                )
+                .map(|message| {
+                    (
+                        message.group_id_hex.as_str(),
+                        message.sender.as_str(),
+                        &message.sender_device,
+                    )
+                }),
+        );
         let changed_message_ids = storage_update
             .changes
             .iter()

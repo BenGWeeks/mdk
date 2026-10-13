@@ -3504,3 +3504,182 @@ async fn device_labels_cross_account_roster_regression(two_accounts: bool) {
         "unchanged admission emits nothing"
     );
 }
+
+// Historical senders need not remain in the current MLS roster.
+async fn round6_device_labels_fixture(surface: &str, overflow: bool) {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote_home = AccountHome::open(remote_dir.path());
+    let remote = remote_home.create_account("remote").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let remote_app = app_at(&remote_dir, relay.clone());
+    let mut publisher = remote_app.client("remote").await.unwrap();
+    publisher.publish_key_package().await.unwrap();
+    let event = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
+    let record = crate::RelayEventRecord {
+        event: event.clone(),
+        endpoints: Vec::new(),
+    };
+    let (_, metadata) =
+        crate::key_package_records::key_package_from_record_with_metadata(&record, |package| {
+            cgka_engine::key_package::key_package_metadata(package)
+                .map_err(|_| AppError::InvalidKeyPackageEvent("fixture".into()))
+        })
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
+    *fetcher.events.lock().unwrap() = vec![event];
+    let mut app = app_at(&dir, relay.clone());
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        relay,
+        fetcher.clone(),
+        false,
+    );
+    let mut routes = AccountRelayListStatus::empty();
+    routes.nip65.relays = vec!["wss://relay.example".into()];
+    app.remember_directory_relay_lists(&remote.account_id_hex, &routes)
+        .unwrap();
+    let group = GroupId::new([19, 6]);
+    let group_hex = hex::encode(group.as_slice());
+    let count = if overflow { 140 } else { 1 };
+    for i in 0..count {
+        app.record_account_app_event(
+            "alice",
+            &AppMessageProjection {
+                authority: None,
+                message_id_hex: format!("round6-{i}"),
+                source_message_id_hex: None,
+                direction: "received".into(),
+                group_id_hex: group_hex.clone(),
+                sender: if i == 0 {
+                    remote.account_id_hex.clone()
+                } else {
+                    format!("{i:064x}")
+                },
+                sender_device: crate::SenderDevice::Exact {
+                    device_id: cgka_traits::message::member_device_id(
+                        &group,
+                        &metadata.signature_key,
+                    ),
+                    leaf_index: 0,
+                    client_label: None,
+                    is_this_installation: false,
+                },
+                plaintext: "historical sender".into(),
+                kind: MARMOT_APP_EVENT_KIND_CHAT,
+                tags: Vec::new(),
+                source_epoch: Some(1),
+                retention: None,
+                // Newest (and therefore first) demand is the fetchable remote.
+                recorded_at: Some(unix_now_seconds() - i as u64),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+        )
+        .unwrap();
+    }
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.device_label_events.demand_receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // No await between page admission and worker processing: overwrite the old
+    // 128-row broadcast before its receiver can drain it.
+    match surface {
+        "page" => {
+            let mut page = app
+                .timeline_messages_with_query(
+                    "alice",
+                    crate::TimelineMessageQuery {
+                        group_id_hex: Some(group_hex.clone()),
+                        pagination: crate::TimelinePagination {
+                            limit: Some(200),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(page.messages.len(), count);
+            // Explicitly order the batch with fetchable demand first, independent
+            // of the timeline's display ordering and timestamp tie-breaks.
+            page.messages
+                .sort_by_key(|row| row.sender != remote.account_id_hex);
+            app.device_label_events.schedule("alice", &page.messages);
+        }
+        "query" => {
+            app.messages_with_query("alice", AppMessageQuery::default())
+                .unwrap();
+        }
+        "id" => {
+            app.message_by_id("alice", &group_hex, "round6-0")
+                .unwrap()
+                .unwrap();
+        }
+        "timeline" => {
+            app.timeline_message("alice", &group_hex, "round6-0")
+                .unwrap()
+                .unwrap();
+        }
+        _ => unreachable!(),
+    }
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !app
+                .shared_storage()
+                .unwrap()
+                .device_client_labels(std::slice::from_ref(&remote.account_id_hex))
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    runtime.shutdown().await;
+    result.expect("historical Exact sender must be fetched and admitted from this read alone");
+    assert!(
+        fetcher
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|r| &r.queries)
+            .any(
+                |q| q.kind == KIND_MARMOT_KEY_PACKAGE && q.authors.contains(&remote.account_id_hex)
+            )
+    );
+}
+
+#[tokio::test]
+async fn device_labels_round6_page_overflow_preserves_early_fetchable_demand() {
+    round6_device_labels_fixture("page", true).await;
+}
+#[tokio::test]
+async fn device_labels_round6_messages_query_requests_historical_sender() {
+    round6_device_labels_fixture("query", false).await;
+}
+#[tokio::test]
+async fn device_labels_round6_message_by_id_requests_historical_sender() {
+    round6_device_labels_fixture("id", false).await;
+}
+#[tokio::test]
+async fn device_labels_round6_timeline_message_requests_historical_sender() {
+    round6_device_labels_fixture("timeline", false).await;
+}

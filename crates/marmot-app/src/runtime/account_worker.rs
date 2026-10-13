@@ -1801,7 +1801,10 @@ async fn run_app_runtime_account_worker(
     let device_label_enrichment = client.device_label_enrichment.clone();
     let device_label_wake = device_label_enrichment.wake.clone();
     let mut device_label_events = events.subscribe();
-    let mut device_label_demands = client.app.device_label_events.subscribe_demand();
+    let _device_label_demands = client
+        .app
+        .device_label_events
+        .register_demand(&client.state.label, &device_label_enrichment);
     let mut pending_label_refresh: Option<Option<String>> = None;
     let mut label_retry_at = tokio::time::Instant::now();
     let mut device_label_task: Option<DeviceLabelTask> = None;
@@ -1956,11 +1959,6 @@ async fn run_app_runtime_account_worker(
                 let scope = pending_label_refresh.as_ref().expect("pending refresh");
                 if client.refresh_device_label_windows(scope.as_deref()) { pending_label_refresh = None; }
                 label_retry_at = tokio::time::Instant::now() + crate::client::device_labels::DEVICE_LABEL_CHANGE_COALESCE_INTERVAL;
-            }
-            demand = device_label_demands.recv() => {
-                if let Ok(demand) = demand && demand.owner == client.state.label {
-                    device_label_enrichment.schedule(&demand.account, &demand.group, &demand.device);
-                }
             }
             _ = device_label_wake.notified(), if device_label_task.is_none() => {}
             completed = async { (&mut device_label_task.as_mut().expect("label task exists").0).await }, if device_label_task.is_some() => {

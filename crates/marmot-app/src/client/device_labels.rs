@@ -3,7 +3,7 @@ use super::AppClient;
 use crate::{AppError, MarmotApp};
 use cgka_traits::{GroupId, MaintenanceStorage, TransportEndpoint};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -55,6 +55,10 @@ impl DeviceLabelEnrichment {
         if !demand.groups.contains_key(account)
             && demand.groups.len() + demand.attempted.len() >= DEVICE_LABEL_MAX_TRACKED_ACCOUNTS
         {
+            // Keep the first admitted accounts deterministically. Rejected
+            // accounts acquire no cooldown, so subsequent reads retry them.
+            tracing::debug!(target: "marmot_app::device_labels", method = "schedule",
+                pending_accounts = demand.groups.len(), "label demand saturated; retry on next read");
             return;
         }
         let groups = demand.groups.entry(account.to_owned()).or_default();
@@ -116,61 +120,153 @@ thread_local! { pub(crate) static LABEL_QUERY_COUNT: std::cell::Cell<usize> = co
 /// A fixed burst window; later admissions never postpone publication.
 pub(crate) const DEVICE_LABEL_CHANGE_COALESCE_INTERVAL: Duration = Duration::from_millis(100);
 
-#[derive(Clone)]
-pub(crate) struct LabelDemand {
-    pub(crate) owner: String,
-    pub(crate) account: String,
-    pub(crate) group: GroupId,
-    pub(crate) device: String,
-}
-
 #[derive(Default)]
 struct LabelEventState {
     events: Option<tokio::sync::broadcast::Sender<crate::MarmotAppEvent>>,
+    executor: Option<tokio::runtime::Handle>,
+    task: Option<tokio::task::AbortHandle>,
+    generation: u64,
     // One pending scope regardless of how many accounts change in a burst.
     pending: Option<Option<String>>,
 }
-#[derive(Clone)]
-pub(crate) struct DeviceLabelEvents {
-    state: Arc<Mutex<LabelEventState>>,
-    demand: tokio::sync::broadcast::Sender<LabelDemand>,
-    admission: Arc<Mutex<()>>,
+
+struct WorkerDemand {
+    demand: Weak<Mutex<Demand>>,
+    wake: Weak<tokio::sync::Notify>,
 }
-impl Default for DeviceLabelEvents {
-    fn default() -> Self {
-        Self {
-            state: Default::default(),
-            demand: tokio::sync::broadcast::channel(128).0,
-            admission: Default::default(),
+
+/// The registry retains no worker state after exit, including on cancellation.
+pub(crate) struct DeviceLabelDemandRegistration {
+    workers: Arc<Mutex<HashMap<String, WorkerDemand>>>,
+    owner: String,
+    demand: Weak<Mutex<Demand>>,
+}
+impl Drop for DeviceLabelDemandRegistration {
+    fn drop(&mut self) {
+        let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        if workers
+            .get(&self.owner)
+            .is_some_and(|worker| worker.demand.ptr_eq(&self.demand))
+        {
+            workers.remove(&self.owner);
         }
     }
 }
+
+/// Created before spawn so even an unpolled, cancelled task clears its flag.
+struct LabelPublicationGuard {
+    state: Weak<Mutex<LabelEventState>>,
+    generation: u64,
+}
+impl Drop for LabelPublicationGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.generation == self.generation {
+                state.pending = None;
+                state.task = None;
+                // A destroyed executor cannot serve the next admission.
+                state.executor = None;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct DeviceLabelEvents {
+    state: Arc<Mutex<LabelEventState>>,
+    workers: Arc<Mutex<HashMap<String, WorkerDemand>>>,
+    admission: Arc<Mutex<()>>,
+}
 impl DeviceLabelEvents {
     pub(crate) fn attach(&self, events: tokio::sync::broadcast::Sender<crate::MarmotAppEvent>) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).events = Some(events);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.events = Some(events);
+        state.executor = tokio::runtime::Handle::try_current().ok();
+    }
+    pub(crate) fn set_executor(&self, executor: tokio::runtime::Handle) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .executor = Some(executor);
+    }
+    pub(crate) fn stop(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.generation = state.generation.wrapping_add(1);
+        state.pending = None;
+        state.events = None;
+        state.executor = None;
+        if let Some(task) = state.task.take() {
+            task.abort();
+        }
     }
     #[cfg(test)]
     pub(crate) fn demand_receiver_count(&self) -> usize {
-        self.demand.receiver_count()
+        self.workers.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
-    pub(crate) fn subscribe_demand(&self) -> tokio::sync::broadcast::Receiver<LabelDemand> {
-        self.demand.subscribe()
+    pub(crate) fn register_demand(
+        &self,
+        owner: &str,
+        enrichment: &DeviceLabelEnrichment,
+    ) -> DeviceLabelDemandRegistration {
+        let demand = Arc::downgrade(&enrichment.demand);
+        self.workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                owner.to_owned(),
+                WorkerDemand {
+                    demand: demand.clone(),
+                    wake: Arc::downgrade(&enrichment.wake),
+                },
+            );
+        DeviceLabelDemandRegistration {
+            workers: self.workers.clone(),
+            owner: owner.to_owned(),
+            demand,
+        }
     }
     pub(crate) fn schedule(&self, owner: &str, messages: &[crate::TimelineMessageRecord]) {
-        for message in messages {
+        self.schedule_senders(
+            owner,
+            messages.iter().map(|message| {
+                (
+                    message.group_id_hex.as_str(),
+                    message.sender.as_str(),
+                    &message.sender_device,
+                )
+            }),
+        );
+    }
+    pub(crate) fn schedule_senders<'a>(
+        &self,
+        owner: &str,
+        messages: impl IntoIterator<Item = (&'a str, &'a str, &'a crate::SenderDevice)>,
+    ) {
+        // The bounded set belongs to the worker. Notify is only a wake-up:
+        // coalescing or losing a wake never removes pending work.
+        let enrichment = {
+            let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(worker) = workers.get(owner) else {
+                return;
+            };
+            let (Some(demand), Some(wake)) = (worker.demand.upgrade(), worker.wake.upgrade())
+            else {
+                return;
+            };
+            DeviceLabelEnrichment { demand, wake }
+        };
+        let mut batch = HashSet::new();
+        for (group, account, device) in messages {
             if let crate::SenderDevice::Exact {
                 device_id,
                 client_label: None,
                 ..
-            } = &message.sender_device
-                && let Ok(group) = hex::decode(&message.group_id_hex)
+            } = device
+                && batch.insert((group, account, device_id.as_str()))
+                && let Ok(group) = hex::decode(group)
             {
-                let _ = self.demand.send(LabelDemand {
-                    owner: owner.to_owned(),
-                    account: message.sender.clone(),
-                    group: GroupId::new(group),
-                    device: device_id.clone(),
-                });
+                enrichment.schedule(account, &GroupId::new(group), device_id);
             }
         }
     }
@@ -186,27 +282,43 @@ impl DeviceLabelEvents {
             return;
         }
         state.pending = Some(Some(account.to_owned()));
-        drop(state);
-        let state = self.state.clone();
-        // Synchronous host admissions may run outside Tokio. Both paths
-        // use one fixed burst deadline and retain no worker registrations.
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+        let guard = LabelPublicationGuard {
+            state: Arc::downgrade(&self.state),
+            generation,
+        };
+        let shared = self.state.clone();
         let publish = move || {
-            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if state.generation != generation {
+                return;
+            }
             if let Some(account_id_hex) = state.pending.take()
                 && let Some(events) = &state.events
             {
                 let _ = events.send(crate::MarmotAppEvent::DeviceLabelsChanged { account_id_hex });
             }
+            state.task = None;
+            // Disarm cancellation without discarding the managed executor.
+            state.generation = state.generation.wrapping_add(1);
         };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if let Some(executor) = &state.executor {
             let deadline = Instant::now() + DEVICE_LABEL_CHANGE_COALESCE_INTERVAL;
-            runtime.spawn(async move {
-                tokio::time::sleep_until(deadline).await;
-                publish();
-            });
+            state.task = Some(
+                executor
+                    .spawn(async move {
+                        let _guard = guard;
+                        tokio::time::sleep_until(deadline).await;
+                        publish();
+                    })
+                    .abort_handle(),
+            );
         } else {
-            // A synchronous admission still coalesces over the same fixed interval.
+            // Before runtime start, synchronous hosts have no managed executor.
+            // This fixed-window publisher is still fenced by runtime teardown.
             std::thread::spawn(move || {
+                let _guard = guard;
                 std::thread::sleep(DEVICE_LABEL_CHANGE_COALESCE_INTERVAL);
                 publish();
             });
@@ -668,19 +780,116 @@ mod tests {
         let events = DeviceLabelEvents::default();
         let worker = DeviceLabelEnrichment::default();
         let demand = Arc::downgrade(&worker.demand);
-        let receiver = events.subscribe_demand();
+        let receiver = events.register_demand("owner", &worker);
         drop(worker);
         drop(receiver);
         assert!(
             demand.upgrade().is_none(),
             "logged out worker remains retained"
         );
-        assert_eq!(events.demand.receiver_count(), 0);
+        assert_eq!(events.demand_receiver_count(), 0);
         for _ in 0..1000 {
             events.publish_change("other");
         }
-        assert_eq!(events.demand.receiver_count(), 0);
+        assert_eq!(events.demand_receiver_count(), 0);
     }
+    #[test]
+    fn device_labels_round6_cancelled_executor_allows_later_publication() {
+        let labels = DeviceLabelEvents::default();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(2);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            labels.attach(events);
+            labels.publish_change("a");
+            tokio::task::yield_now().await;
+        });
+        drop(executor);
+        let survivor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        survivor.block_on(async {
+            labels.publish_change("b");
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .expect("cancelled publisher must not strand later admissions")
+                    .unwrap(),
+                crate::MarmotAppEvent::DeviceLabelsChanged {
+                    account_id_hex: Some("b".into())
+                }
+            );
+        });
+    }
+    #[test]
+    fn device_labels_managed_executor_survives_foreign_admission_executor() {
+        let labels = DeviceLabelEvents::default();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(2);
+        let managed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        managed.block_on(async {
+            labels.attach(events);
+        });
+        let foreign = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        foreign.block_on(async {
+            labels.publish_change("a");
+        });
+        drop(foreign);
+        managed.block_on(async {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                crate::MarmotAppEvent::DeviceLabelsChanged {
+                    account_id_hex: Some("a".into())
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn device_labels_unpolled_cancelled_publisher_clears_pending() {
+        let labels = DeviceLabelEvents::default();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(2);
+        let managed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        managed.block_on(async {
+            labels.attach(events);
+            labels.publish_change("a");
+        });
+        drop(managed);
+        assert!(labels.state.lock().unwrap().pending.is_none());
+        labels.publish_change("b");
+        let survivor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        survivor.block_on(async {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                crate::MarmotAppEvent::DeviceLabelsChanged {
+                    account_id_hex: Some("b".into())
+                }
+            );
+        });
+        labels.stop();
+        assert!(labels.state.lock().unwrap().pending.is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn device_labels_events_coalesce_and_bound_unknown_scope() {
         let labels = DeviceLabelEvents::default();
