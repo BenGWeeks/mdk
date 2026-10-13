@@ -1506,6 +1506,7 @@ impl MarmotApp {
         entry.account_id_hex = fetched.account_id_hex.clone();
         entry.relay_lists = merge_relay_list_status(entry.relay_lists, fetched.relay_lists.clone());
         entry.key_package = Some(DirectoryKeyPackage {
+            client_label: fetched.client_label.clone(),
             key_package_id: fetched.key_package_id.clone(),
             key_package_ref_hex: fetched.key_package_ref_hex.clone(),
             key_package_event_id: fetched.key_package_event_id.clone(),

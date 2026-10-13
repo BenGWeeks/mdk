@@ -724,6 +724,8 @@ pub(crate) enum CursorSeal {
 #[cfg(test)]
 pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 
+type MemberDeviceLabels = HashMap<(String, Vec<u8>), String>;
+
 pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
@@ -2398,36 +2400,130 @@ impl AppClient {
     /// map for a single read;
     /// [`AppClient::group_read_snapshot_with_stage_telemetry`] loads it once
     /// and reuses it across every group so capturing the snapshot stays a
-    /// single profile read plus in-memory engine reads (it runs on the worker
-    /// readiness path).
+    /// single profile read with device-label cache reads shared across groups
+    /// (it runs on the worker readiness path).
     fn members_with_profiles(
         &self,
         group_id: &GroupId,
         profiles: &HashMap<String, String>,
     ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
         self.ensure_group(group_id)?;
-        self.members_with_profiles_unchecked(group_id, profiles)
+        self.members_with_profiles_unchecked(group_id, profiles, None)
     }
 
     fn members_with_profiles_unchecked(
         &self,
         group_id: &GroupId,
         profiles: &HashMap<String, String>,
+        cached_labels: Option<&MemberDeviceLabels>,
     ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
-        Ok(self
-            .runtime
-            .members(group_id)?
-            .into_iter()
-            .map(|member| {
-                let member_id_hex = hex::encode(member.id.as_slice());
-                let account = profiles.get(&member_id_hex).cloned();
-                AppGroupMemberRecord {
+        // Disband deletes live MLS state but keeps the historical roster.
+        let devices = if self.runtime.group_record(group_id)?.disbanded.is_some() {
+            Vec::new()
+        } else {
+            self.runtime
+                .session()
+                .canonical_group_membership(group_id)
+                .map(|membership| membership.devices)
+                .unwrap_or_default()
+        };
+        let mut members = std::collections::BTreeMap::new();
+        for member in self.runtime.members(group_id)? {
+            let member_id_hex = hex::encode(member.id.as_slice());
+            let account = profiles.get(&member_id_hex).cloned();
+            members
+                .entry(member_id_hex.clone())
+                .or_insert(AppGroupMemberRecord {
                     member_id_hex,
                     local: account.is_some(),
                     account,
-                }
-            })
-            .collect())
+                    devices: None,
+                });
+        }
+        let owned_labels;
+        let labels = if let Some(labels) = cached_labels {
+            labels
+        } else {
+            owned_labels = self.member_device_labels(members.keys().cloned())?;
+            &owned_labels
+        };
+        for leaf in devices {
+            let account_id = hex::encode(leaf.member.as_slice());
+            if let Some(member) = members.get_mut(&account_id) {
+                let label = labels
+                    .get(&(account_id, leaf.signature_key.clone()))
+                    .cloned();
+                member
+                    .devices
+                    .get_or_insert_with(Vec::new)
+                    .push(crate::groups::member_device(group_id, leaf, label));
+            }
+        }
+        for member in members.values_mut() {
+            if let Some(devices) = &mut member.devices {
+                devices.sort_by_key(|device| (!device.is_this_installation, device.leaf_index));
+            }
+        }
+        Ok(members.into_values().collect())
+    }
+
+    /// Read each requested account cache once; never discover devices here.
+    fn member_device_labels(
+        &self,
+        account_ids: impl IntoIterator<Item = String>,
+    ) -> Result<MemberDeviceLabels, AppError> {
+        // A cache miss is ordinary: enrichment never fetches or changes authority.
+        let mut account_ids = account_ids.into_iter().peekable();
+        if account_ids.peek().is_none() {
+            return Ok(HashMap::new());
+        }
+        let mut labels = HashMap::new();
+        let caches = self.app.directory_caches()?;
+        let shared = self.app.shared_storage()?;
+        let local_accounts = self.app.local_accounts_by_id()?;
+        for account_id in account_ids {
+            if let Some(package) = self
+                .app
+                .directory_entry_for_account_id_with_handles(
+                    &account_id,
+                    &caches,
+                    &shared,
+                    &local_accounts,
+                )?
+                .and_then(|entry| entry.key_package)
+                && let Some(label) = package
+                    .client_label
+                    .as_deref()
+                    .and_then(crate::key_package_records::sanitize_client_label)
+                && let Ok(bytes) = hex::decode(&package.key_package_hex)
+                && let Ok(metadata) = cgka_engine::key_package::key_package_metadata(
+                    &KeyPackage::new(bytes)
+                        .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current),
+                )
+                && metadata.credential_identity_hex == account_id
+            {
+                labels.insert((account_id.clone(), metadata.signature_key), label);
+            }
+        }
+        // Our durable signed publication survives directory slot replacement by
+        // another installation of the same account. Bind its label to its key.
+        if let Some(artifact) = self
+            .runtime
+            .key_package_maintenance_status()?
+            .and_then(|state| state.authored_signed_event)
+            && let Ok(event) = serde_json::from_slice(&artifact.bytes)
+            && let Ok(fetched) =
+                crate::key_package_records::key_package_from_record(crate::RelayEventRecord {
+                    event,
+                    endpoints: Vec::new(),
+                })
+            && let Some(label) = fetched.client_label
+            && let Ok(metadata) =
+                cgka_engine::key_package::key_package_metadata(&fetched.key_package)
+        {
+            labels.insert((fetched.account_id_hex, metadata.signature_key), label);
+        }
+        Ok(labels)
     }
 
     pub fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
@@ -2454,7 +2550,7 @@ impl AppClient {
             .cloned()
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
         let profiles = self.app.profiles_by_id()?;
-        let members = self.members_with_profiles_unchecked(group_id, &profiles)?;
+        let members = self.members_with_profiles_unchecked(group_id, &profiles, None)?;
         if let Some(membership) = self
             .app
             .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?
@@ -2578,9 +2674,8 @@ impl AppClient {
             )
             .into());
         }
-        // Load account profiles once and reuse across every group: the rest of
-        // the capture is in-memory engine reads, so the snapshot adds a single
-        // storage read to the worker readiness path regardless of group count.
+        // Load profiles once and share label enrichment across roster accounts;
+        // canonical device evidence comes from the live engine, never discovery.
         let profile_load_started = Instant::now();
         let profiles = self.app.profiles_by_id();
         if let Some(telemetry) = telemetry {
@@ -2595,6 +2690,17 @@ impl AppClient {
         let mut groups = HashMap::new();
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
+        // Device enrichment is shared across groups in this worker capture.
+        // Only roster accounts are read; no full directory or history scan.
+        let mut account_ids = std::collections::BTreeSet::new();
+        for group in &self.state.groups {
+            if let Ok(bytes) = hex::decode(&group.group_id_hex) {
+                for member in self.runtime.members(&GroupId::new(bytes))? {
+                    account_ids.insert(hex::encode(member.id.as_slice()));
+                }
+            }
+        }
+        let labels = self.member_device_labels(account_ids)?;
         let mut skipped_malformed_group_records = 0usize;
         for group in &self.state.groups {
             let Ok(bytes) = hex::decode(&group.group_id_hex) else {
@@ -2606,7 +2712,8 @@ impl AppClient {
             if let Some(membership) = stored_self_memberships.get(&group.group_id_hex) {
                 group_record.self_membership = *membership;
             }
-            let records = self.members_with_profiles_unchecked(&group_id, &profiles)?;
+            let records =
+                self.members_with_profiles_unchecked(&group_id, &profiles, Some(&labels))?;
             let state = self.group_mls_state_unchecked(&group_id)?;
             groups.insert(group_id.clone(), group_record);
             members.insert(group_id.clone(), records);

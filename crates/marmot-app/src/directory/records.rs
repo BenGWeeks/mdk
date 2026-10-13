@@ -174,6 +174,8 @@ impl UserDirectorySearch {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectoryKeyPackage {
+    #[serde(default)]
+    pub client_label: Option<String>,
     pub key_package_id: String,
     #[serde(default)]
     pub key_package_ref_hex: String,
