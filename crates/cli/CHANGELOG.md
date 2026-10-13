@@ -12,6 +12,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 ### Fixed
 
 - TUI group details show each account once when a person has multiple devices.
+- CLI group management counts distinct admin accounts and emits one action row per account.
 
 ## [0.13.0] - 2026-10-12
 
