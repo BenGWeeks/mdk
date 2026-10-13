@@ -1800,15 +1800,14 @@ async fn run_app_runtime_account_worker(
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     let device_label_enrichment = client.device_label_enrichment.clone();
     let device_label_wake = device_label_enrichment.wake.clone();
-    let device_labels_changed = device_label_enrichment.changed.clone();
+    let mut device_label_events = events.subscribe();
+    let mut device_label_demands = client.app.device_label_events.subscribe_demand();
+    let mut pending_label_refresh: Option<Option<String>> = None;
+    let mut label_retry_at = tokio::time::Instant::now();
     let mut device_label_task: Option<DeviceLabelTask> = None;
     'worker: loop {
         // Reopening transport/session retains this worker's demand and cooldowns.
         client.device_label_enrichment = device_label_enrichment.clone();
-        client
-            .app
-            .device_label_timeline_views
-            .register_worker(&client.state.label, &device_label_enrichment);
         if device_label_task.is_none() {
             let accounts = client.device_label_enrichment.begin();
             if !accounts.is_empty() {
@@ -1936,19 +1935,37 @@ async fn run_app_runtime_account_worker(
                 }
                 break 'worker;
             }
-            _ = device_labels_changed.notified() => {
-                for group in client.refresh_device_label_changes() {
-                    publish_app_runtime_group_state_updated(&events, &account_id_hex, &account_label, &group);
+            event = device_label_events.recv() => {
+                let scope = match event {
+                    Ok(MarmotAppEvent::DeviceLabelsChanged { account_id_hex }) => Some(account_id_hex),
+                    Err(broadcast::error::RecvError::Lagged(_)) => Some(None),
+                    _ => None,
+                };
+                if let Some(scope) = scope {
+                    let scope = match pending_label_refresh.take() {
+                        Some(previous) if previous != scope => None,
+                        _ => scope,
+                    };
+                    if !client.refresh_device_label_windows(scope.as_deref()) {
+                        pending_label_refresh = Some(scope);
+                        label_retry_at = tokio::time::Instant::now() + crate::client::device_labels::DEVICE_LABEL_CHANGE_COALESCE_INTERVAL;
+                    }
                 }
-                publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
+            }
+            _ = tokio::time::sleep_until(label_retry_at), if pending_label_refresh.is_some() => {
+                let scope = pending_label_refresh.as_ref().expect("pending refresh");
+                if client.refresh_device_label_windows(scope.as_deref()) { pending_label_refresh = None; }
+                label_retry_at = tokio::time::Instant::now() + crate::client::device_labels::DEVICE_LABEL_CHANGE_COALESCE_INTERVAL;
+            }
+            demand = device_label_demands.recv() => {
+                if let Ok(demand) = demand && demand.owner == client.state.label {
+                    device_label_enrichment.schedule(&demand.account, &demand.group, &demand.device);
+                }
             }
             _ = device_label_wake.notified(), if device_label_task.is_none() => {}
             completed = async { (&mut device_label_task.as_mut().expect("label task exists").0).await }, if device_label_task.is_some() => {
                 device_label_task = None;
-                for group in client.finish_device_label_pass(completed.unwrap_or_default()) {
-                    publish_app_runtime_group_state_updated(&events, &account_id_hex, &account_label, &group);
-                }
-                publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
+                client.finish_device_label_pass(completed.unwrap_or_default());
             }
             completed = async {
                 comparison_recovery

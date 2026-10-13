@@ -722,6 +722,9 @@ pub(crate) async fn handle_app_runtime_event(
         // signals above this reports a user-facing state, not activity; the
         // notices themselves are read from the runtime.
         marmot_app::MarmotAppEvent::HistoryNoticesChanged { .. } => {}
+        // Advisory labels are resolved by reads and managed timelines; they
+        // do not represent daemon activity.
+        marmot_app::MarmotAppEvent::DeviceLabelsChanged { .. } => {}
     }
 }
 

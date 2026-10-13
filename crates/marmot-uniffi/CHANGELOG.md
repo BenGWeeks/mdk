@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Missing member-device and Exact sender client labels are filled asynchronously from validated KeyPackages. Existing group-state and projection notifications refresh hosts; reads remain local and labels remain optional.
+- Missing member-device and Exact sender client labels are filled asynchronously from validated KeyPackages. `MarmotEventFfi::DeviceLabelsChanged { account_id_hex: Option<String> }` asks hosts to re-read displayed rosters and records; reads remain local and labels remain optional.
 
 - `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
 

@@ -121,6 +121,10 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// Re-read displayed rosters, member devices and message records. None means several/unknown remote accounts.
+    DeviceLabelsChanged {
+        account_id_hex: Option<String>,
+    },
 }
 
 /// FFI projection of [`cgka_traits::engine::GroupEvent`]. The previous FFI
@@ -364,6 +368,9 @@ impl From<GroupEvent> for GroupEventKindFfi {
 impl From<MarmotAppEvent> for MarmotEventFfi {
     fn from(value: MarmotAppEvent) -> Self {
         match value {
+            MarmotAppEvent::DeviceLabelsChanged { account_id_hex } => {
+                Self::DeviceLabelsChanged { account_id_hex }
+            }
             MarmotAppEvent::GroupJoined {
                 account_id_hex,
                 account_label,
@@ -463,6 +470,18 @@ mod tests {
     use cgka_traits::{GroupId, MessageId};
 
     use super::*;
+
+    #[test]
+    fn device_labels_event_preserves_optional_remote_account() {
+        for account in [None, Some("ab".repeat(32))] {
+            let converted = MarmotEventFfi::from(MarmotAppEvent::DeviceLabelsChanged {
+                account_id_hex: account.clone(),
+            });
+            assert!(
+                matches!(converted, MarmotEventFfi::DeviceLabelsChanged { account_id_hex } if account_id_hex == account)
+            );
+        }
+    }
 
     #[test]
     fn transport_resource_refusal_preserves_recovery_fields() {

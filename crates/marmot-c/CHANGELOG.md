@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Append `MarmotEvent::DeviceLabelsChanged` (`MARMOT_EVENT_DEVICE_LABELS_CHANGED`) with owned nullable `account_id_hex`; NULL means several/unknown remote accounts. Re-read displayed rosters/member devices and message records. `marmot_event_free` deep-frees the string. Use matching regenerated headers and libraries.
+
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
 
 ### Added

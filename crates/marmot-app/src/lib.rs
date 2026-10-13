@@ -478,7 +478,7 @@ type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone)]
 pub struct MarmotApp {
-    device_label_timeline_views: client::device_labels::TimelineLabelViews,
+    device_label_events: client::device_labels::DeviceLabelEvents,
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     moderation_reports: Arc<moderation_reports::ModerationReportState>,
     pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
@@ -1639,7 +1639,7 @@ impl MarmotApp {
             relay_plane,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
-            device_label_timeline_views: Default::default(),
+            device_label_events: Default::default(),
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
@@ -1734,7 +1734,7 @@ impl MarmotApp {
             relay_plane,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
-            device_label_timeline_views: Default::default(),
+            device_label_events: Default::default(),
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
@@ -3301,8 +3301,7 @@ impl MarmotApp {
         for message in &mut page.messages {
             labels.timeline(message);
         }
-        self.device_label_timeline_views
-            .schedule(label, &page.messages);
+        self.device_label_events.schedule(label, &page.messages);
         Ok(page)
     }
 
@@ -3319,8 +3318,7 @@ impl MarmotApp {
         for message in &mut page.messages {
             labels.timeline(message);
         }
-        self.device_label_timeline_views
-            .schedule(label, &page.messages);
+        self.device_label_events.schedule(label, &page.messages);
         Ok(page)
     }
 

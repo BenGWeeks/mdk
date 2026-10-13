@@ -5004,6 +5004,10 @@ typedef enum MarmotEvent_Tag {
    * gets `GroupStateUpdated`.
    */
   MARMOT_EVENT_HISTORY_NOTICES_CHANGED,
+  /**
+   * Re-read displayed rosters and message records. Owned nullable remote account; NULL means several/unknown.
+   */
+  MARMOT_EVENT_DEVICE_LABELS_CHANGED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -5075,6 +5079,10 @@ typedef struct MarmotEvent_HistoryNoticesChanged_Body {
   char *account_label;
 } MarmotEvent_HistoryNoticesChanged_Body;
 
+typedef struct MarmotEvent_DeviceLabelsChanged_Body {
+  char *account_id_hex;
+} MarmotEvent_DeviceLabelsChanged_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -5089,6 +5097,7 @@ typedef struct MarmotEvent {
     MarmotEvent_EpochStallEscalated_Body EPOCH_STALL_ESCALATED;
     MarmotEvent_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED;
     MarmotEvent_HistoryNoticesChanged_Body HISTORY_NOTICES_CHANGED;
+    MarmotEvent_DeviceLabelsChanged_Body DEVICE_LABELS_CHANGED;
   };
 } MarmotEvent;
 

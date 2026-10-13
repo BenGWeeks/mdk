@@ -163,6 +163,7 @@ pub(crate) use agent_stream_watch::{
     broker_trust_for_candidate, latest_agent_stream_start, parse_quic_candidate,
     parse_quic_candidates,
 };
+#[cfg(test)]
 pub(crate) use subscriptions::TimelineWindow;
 #[cfg(test)]
 pub(crate) use subscriptions::{
@@ -1532,11 +1533,17 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// Advisory labels changed. Hosts re-read displayed rosters/devices and
+    /// messages; None means several/unknown remote accounts.
+    DeviceLabelsChanged {
+        account_id_hex: Option<String>,
+    },
 }
 
 impl MarmotAppRuntime {
     pub fn new(app: MarmotApp) -> Self {
         let (events, _) = broadcast::channel(1024);
+        app.device_label_events.attach(events.clone());
         let shared = RuntimeSharedServices::for_app(&app);
         let accounts = AccountManager::new(app, events.clone(), shared.clone());
         Self {

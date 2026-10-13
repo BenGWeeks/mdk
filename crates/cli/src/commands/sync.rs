@@ -174,6 +174,7 @@ mod tests {
         let failure = SyncFailure::new(
             SyncSummary {
                 messages: vec![ReceivedMessage {
+                    sender_device: Default::default(),
                     authority: None,
                     message_id_hex: "11".repeat(32),
                     source_message_id_hex: "22".repeat(32),
@@ -275,6 +276,7 @@ mod tests {
         let summary = SyncSummary {
             messages: vec![
                 ReceivedMessage {
+                    sender_device: Default::default(),
                     authority: None,
                     message_id_hex: "11".repeat(32),
                     source_message_id_hex: "22".repeat(32),
@@ -290,6 +292,7 @@ mod tests {
                     received_at: 2,
                 },
                 ReceivedMessage {
+                    sender_device: Default::default(),
                     authority: None,
                     message_id_hex: "33".repeat(32),
                     source_message_id_hex: "44".repeat(32),

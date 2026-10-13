@@ -1602,6 +1602,7 @@ pub(crate) fn notification_update_from_event_cached(
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::DeviceLabelsChanged { .. }
         | MarmotAppEvent::AccountError(_) => Ok(None),
     }
 }

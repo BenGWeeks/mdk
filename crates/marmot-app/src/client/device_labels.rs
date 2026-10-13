@@ -20,10 +20,6 @@ const DEVICE_LABEL_MAX_GROUPS_PER_ACCOUNT: usize = 128;
 /// Bound demanded devices within each group.
 const DEVICE_LABEL_MAX_DEVICES_PER_GROUP: usize = 128;
 
-// Initial resolved labels for changed remote signature keys. Each worker retains
-// the first value until it drains; comparing current labels suppresses round trips.
-type LabelChanges = HashMap<(String, Vec<u8>), Option<String>>;
-
 type GroupDemand = HashMap<GroupId, HashSet<String>>;
 /// Bound the complete discovery + package fetch wait for each optional account.
 const DEVICE_LABEL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -39,8 +35,6 @@ struct Demand {
 pub(crate) struct DeviceLabelEnrichment {
     demand: Arc<Mutex<Demand>>,
     pub(crate) wake: Arc<tokio::sync::Notify>,
-    changes: Arc<Mutex<LabelChanges>>,
-    pub(crate) changed: Arc<tokio::sync::Notify>,
 }
 
 impl DeviceLabelEnrichment {
@@ -119,131 +113,108 @@ pub(crate) struct FetchedLabel {
 #[cfg(test)]
 thread_local! { pub(crate) static LABEL_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
-type TimelineView = std::sync::Weak<Mutex<crate::runtime::TimelineWindow>>;
-type LabelRefresh = std::sync::Weak<tokio::sync::Notify>;
-#[derive(Clone, Default)]
-pub(crate) struct TimelineLabelViews {
-    views: Arc<Mutex<Vec<(String, TimelineView, LabelRefresh)>>>,
-    workers: Arc<Mutex<HashMap<String, DeviceLabelEnrichment>>>,
+/// A fixed burst window; later admissions never postpone publication.
+pub(crate) const DEVICE_LABEL_CHANGE_COALESCE_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Clone)]
+pub(crate) struct LabelDemand {
+    pub(crate) owner: String,
+    pub(crate) account: String,
+    pub(crate) group: GroupId,
+    pub(crate) device: String,
+}
+
+#[derive(Default)]
+struct LabelEventState {
+    events: Option<tokio::sync::broadcast::Sender<crate::MarmotAppEvent>>,
+    // One pending scope regardless of how many accounts change in a burst.
+    pending: Option<Option<String>>,
+}
+#[derive(Clone)]
+pub(crate) struct DeviceLabelEvents {
+    state: Arc<Mutex<LabelEventState>>,
+    demand: tokio::sync::broadcast::Sender<LabelDemand>,
     admission: Arc<Mutex<()>>,
 }
-impl TimelineLabelViews {
-    /// Runtime-wide, lossless coalescing mailbox: no broadcast lag can lose an eviction.
-    fn publish_changes(&self, changes: &LabelChanges) {
-        if changes.is_empty() {
+impl Default for DeviceLabelEvents {
+    fn default() -> Self {
+        Self {
+            state: Default::default(),
+            demand: tokio::sync::broadcast::channel(128).0,
+            admission: Default::default(),
+        }
+    }
+}
+impl DeviceLabelEvents {
+    pub(crate) fn attach(&self, events: tokio::sync::broadcast::Sender<crate::MarmotAppEvent>) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).events = Some(events);
+    }
+    #[cfg(test)]
+    pub(crate) fn demand_receiver_count(&self) -> usize {
+        self.demand.receiver_count()
+    }
+    pub(crate) fn subscribe_demand(&self) -> tokio::sync::broadcast::Receiver<LabelDemand> {
+        self.demand.subscribe()
+    }
+    pub(crate) fn schedule(&self, owner: &str, messages: &[crate::TimelineMessageRecord]) {
+        for message in messages {
+            if let crate::SenderDevice::Exact {
+                device_id,
+                client_label: None,
+                ..
+            } = &message.sender_device
+                && let Ok(group) = hex::decode(&message.group_id_hex)
+            {
+                let _ = self.demand.send(LabelDemand {
+                    owner: owner.to_owned(),
+                    account: message.sender.clone(),
+                    group: GroupId::new(group),
+                    device: device_id.clone(),
+                });
+            }
+        }
+    }
+    fn publish_change(&self, account: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.events.is_none() {
             return;
         }
-        let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
-        for worker in workers.values() {
-            let mut pending = worker.changes.lock().unwrap_or_else(|e| e.into_inner());
-            for (key, before) in changes {
-                pending.entry(key.clone()).or_insert_with(|| before.clone());
+        if let Some(scope) = &mut state.pending {
+            if scope.as_deref() != Some(account) {
+                *scope = None;
             }
-            worker.changed.notify_one();
-        }
-    }
-    pub(crate) fn register_worker(&self, label: &str, worker: &DeviceLabelEnrichment) {
-        let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
-        if workers
-            .get(label)
-            .is_some_and(|old| Arc::ptr_eq(&old.demand, &worker.demand))
-        {
             return;
         }
-        workers.insert(label.to_owned(), worker.clone());
-        drop(workers);
-        self.schedule(label, &self.messages(label));
-    }
-    pub(crate) fn register(
-        &self,
-        label: &str,
-        window: &Arc<Mutex<crate::runtime::TimelineWindow>>,
-        refresh: &Arc<tokio::sync::Notify>,
-    ) {
-        let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
-        views.retain(|(_, view, _)| view.strong_count() > 0);
-        views.push((
-            label.to_owned(),
-            Arc::downgrade(window),
-            Arc::downgrade(refresh),
-        ));
-        drop(views);
-        self.schedule(
-            label,
-            &window
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .page
-                .messages,
-        );
-    }
-    pub(crate) fn schedule(&self, label: &str, messages: &[crate::TimelineMessageRecord]) {
-        let worker = self
-            .workers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(label)
-            .cloned();
-        if let Some(worker) = worker {
-            for message in messages {
-                if let crate::SenderDevice::Exact {
-                    device_id,
-                    client_label: None,
-                    ..
-                } = &message.sender_device
-                    && let Ok(bytes) = hex::decode(&message.group_id_hex)
-                {
-                    worker.schedule(&message.sender, &GroupId::new(bytes), device_id);
-                }
+        state.pending = Some(Some(account.to_owned()));
+        drop(state);
+        let state = self.state.clone();
+        // Synchronous host admissions may run outside Tokio. Both paths
+        // use one fixed burst deadline and retain no worker registrations.
+        let publish = move || {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(account_id_hex) = state.pending.take()
+                && let Some(events) = &state.events
+            {
+                let _ = events.send(crate::MarmotAppEvent::DeviceLabelsChanged { account_id_hex });
             }
-        }
-    }
-    /// Signal only changed loaded windows. Notify retains one permit per window,
-    /// so completions coalesce without buffering copies of displayed records.
-    fn invalidate_changed(&self, label: &str, resolver: &mut DeviceLabelResolver<'_>) {
-        let views = self.views.lock().unwrap_or_else(|e| e.into_inner());
-        for (owner, view, refresh) in views.iter() {
-            if owner != label {
-                continue;
-            }
-            let (Some(view), Some(refresh)) = (view.upgrade(), refresh.upgrade()) else {
-                continue;
-            };
-            let window = view.lock().unwrap_or_else(|e| e.into_inner());
-            if window.page.messages.iter().any(|message| {
-                let mut after = message.sender_device.clone();
-                resolver.enrich(&message.group_id_hex, &message.sender, &mut after);
-                after != message.sender_device
-            }) {
-                refresh.notify_one();
-            }
-        }
-    }
-
-    fn messages(&self, label: &str) -> Vec<crate::TimelineMessageRecord> {
-        let views = {
-            let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
-            views.retain(|(_, view, _)| view.strong_count() > 0);
-            views
-                .iter()
-                .filter(|(owner, _, _)| owner == label)
-                .filter_map(|(_, view, _)| view.upgrade())
-                .collect::<Vec<_>>()
         };
-        views
-            .into_iter()
-            .flat_map(|view| {
-                view.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .page
-                    .messages
-                    .clone()
-            })
-            .collect()
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let deadline = Instant::now() + DEVICE_LABEL_CHANGE_COALESCE_INTERVAL;
+            runtime.spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                publish();
+            });
+        } else {
+            // A synchronous admission still coalesces over the same fixed interval.
+            std::thread::spawn(move || {
+                std::thread::sleep(DEVICE_LABEL_CHANGE_COALESCE_INTERVAL);
+                publish();
+            });
+        }
     }
 }
 
-/// One read/update-local memo, shared by message and change copies.
+/// One batch-local resolver, shared by message records and projection deltas.
 pub(crate) struct DeviceLabelResolver<'a> {
     app: &'a MarmotApp,
     candidates: HashMap<String, Vec<(Vec<u8>, String)>>,
@@ -517,47 +488,27 @@ impl MarmotApp {
         )
     }
 
-    fn resolved_remote_labels(&self, account: &str) -> HashMap<(String, Vec<u8>), String> {
-        self.resolve_device_labels([account.to_owned()], |_, _, package| {
-            cgka_engine::key_package::key_package_metadata(package)
-                .map_err(|_| AppError::InvalidKeyPackageEvent("invalid advisory package".into()))
-        })
-    }
-
-    fn admit_device_client_label(
+    pub(crate) fn admit_device_client_label(
         &self,
         account: &str,
         key: &[u8],
         label: &str,
         created_at: u64,
     ) -> Result<bool, AppError> {
-        // Serialize the before/admission/after boundary across local workers.
-        let _guard = self
-            .device_label_timeline_views
-            .admission
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let storage = self.shared_storage()?;
-        let cached_labels = || -> Result<HashMap<(String, Vec<u8>), String>, AppError> {
-            Ok(storage
-                .device_client_labels(&[account.to_owned()])?
-                .into_iter()
-                .map(|row| ((row.account_id_hex, row.signature_key), row.client_label))
-                .collect())
+        // Storage reports label changes atomically with its bounded eviction.
+        // No resolver, roster or window reads run under this admission guard.
+        let changed = {
+            let _guard = self
+                .device_label_events
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.shared_storage()?
+                .put_device_client_label(account, key, label, created_at)?
         };
-        let before_cache = cached_labels()?;
-        let before = self.resolved_remote_labels(account);
-        let changed = storage.put_device_client_label(account, key, label, created_at)?;
-        let after_cache = cached_labels()?;
-        // Publish every cache key change, even when a higher-precedence source
-        // masks it. Workers compare resolved labels and suppress unchanged views.
-        let changes = before_cache
-            .keys()
-            .chain(after_cache.keys())
-            .filter(|key| before_cache.get(*key) != after_cache.get(*key))
-            .map(|key| (key.clone(), before.get(key).cloned()))
-            .collect();
-        self.device_label_timeline_views.publish_changes(&changes);
+        if changed {
+            self.device_label_events.publish_change(account);
+        }
         Ok(changed)
     }
 
@@ -652,12 +603,8 @@ impl MarmotApp {
 
 impl AppClient {
     /// Admit only demanded leaves and publish bounded, read-time display changes.
-    pub(crate) fn finish_device_label_pass(&mut self, labels: Vec<FetchedLabel>) -> Vec<GroupId> {
+    pub(crate) fn finish_device_label_pass(&mut self, labels: Vec<FetchedLabel>) {
         let demand = self.device_label_enrichment.finish();
-        // Register direct clients too; managed workers register at startup.
-        self.app
-            .device_label_timeline_views
-            .register_worker(&self.state.label, &self.device_label_enrichment);
         let mut failed_admissions = 0usize;
         for label in labels
             .into_iter()
@@ -684,130 +631,85 @@ impl AppClient {
                 failed_admissions += 1;
             }
         }
-        let changed_groups = self.refresh_device_label_changes();
 
         if failed_admissions > 0 {
             tracing::debug!(target: "marmot_app::device_labels", method = "finish_device_label_pass", failed_admissions, "optional label admission unavailable");
         }
-        changed_groups
     }
 
-    /// Each local worker resolves its canonical rosters and its own loaded windows.
-    /// Cache changes carry signature keys and initial labels, never message copies.
-    pub(crate) fn refresh_device_label_changes(&mut self) -> Vec<GroupId> {
-        // Keep the drained baseline and all comparisons in one cache revision;
-        // another account's admission must not race this worker's publication.
-        let views = self.app.device_label_timeline_views.clone();
-        let _guard = views.admission.lock().unwrap_or_else(|e| e.into_inner());
-        let changes = std::mem::take(
-            &mut *self
-                .device_label_enrichment
-                .changes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
-        if changes.is_empty() {
-            return Vec::new();
-        }
-        let mut changed_groups = HashSet::new();
-        for record in &self.state.groups {
-            let Ok(bytes) = hex::decode(&record.group_id_hex) else {
+    /// Re-read bounded open viewports, retaining failed invalidation for retry.
+    pub(crate) fn refresh_device_label_windows(&mut self, account: Option<&str>) -> bool {
+        let views = crate::runtime::conversation_label_viewports(self);
+        let mut complete = true;
+        for (observer, rows) in views {
+            if account.is_some_and(|account| !rows.iter().any(|row| row.sender == account)) {
+                continue;
+            }
+            let Some(view) = observer.upgrade() else {
                 continue;
             };
-            let group = GroupId::new(bytes);
-            let Ok(membership) = self.runtime.session().canonical_group_membership(&group) else {
-                continue;
-            };
-            let relevant = membership.devices.iter().any(|leaf| {
-                changes.contains_key(&(
-                    hex::encode(leaf.member.as_slice()),
-                    leaf.signature_key.clone(),
-                ))
-            });
-            if !relevant {
-                continue;
-            }
-            if let Ok(roster) = self.members(&group) {
-                let changed = membership.devices.iter().any(|leaf| {
-                    let account = hex::encode(leaf.member.as_slice());
-                    let Some(before) = changes.get(&(account.clone(), leaf.signature_key.clone()))
-                    else {
-                        return false;
-                    };
-                    let device =
-                        cgka_traits::message::member_device_id(&group, &leaf.signature_key);
-                    roster
-                        .iter()
-                        .find(|m| m.member_id_hex == account)
-                        .and_then(|m| m.devices.as_ref())
-                        .and_then(|devices| devices.iter().find(|d| d.device_id == device))
-                        .is_some_and(|d| &d.client_label != before)
-                });
-                if changed {
-                    changed_groups.insert(group);
-                }
-            }
-        }
-        let conversation_views = crate::runtime::conversation_label_viewports(self);
-        let displayed = self
-            .app
-            .device_label_timeline_views
-            .messages(&self.state.label);
-        let mut resolver = DeviceLabelResolver::new(&self.app);
-        for message in displayed
-            .iter()
-            .chain(conversation_views.iter().flat_map(|(_, rows)| rows.iter()))
-        {
-            if !changes
-                .keys()
-                .any(|(account, _)| account == &message.sender)
-            {
-                continue;
-            }
-            let mut after = message.sender_device.clone();
-            resolver.enrich(&message.group_id_hex, &message.sender, &mut after);
-            if after != message.sender_device
-                && let Ok(bytes) = hex::decode(&message.group_id_hex)
-            {
-                changed_groups.insert(GroupId::new(bytes));
-            }
-        }
-        for group in &changed_groups {
-            let group_hex = hex::encode(group.as_slice());
-            let observers = conversation_views
-                .iter()
-                .filter(|(_, rows)| {
-                    rows.iter().any(|message| {
-                        if message.group_id_hex != group_hex {
-                            return false;
-                        }
-                        let mut after = message.sender_device.clone();
-                        resolver.enrich(&message.group_id_hex, &message.sender, &mut after);
-                        after != message.sender_device
-                    })
-                })
-                .map(|(observer, _)| observer.clone())
-                .collect::<Vec<_>>();
-            crate::runtime::publish_conversation_captures_from_session(
-                &observers,
+            complete &= crate::runtime::publish_conversation_captures_from_session(
+                &[observer],
                 self.runtime.session(),
                 &self.app,
                 &self.state.label,
-                group,
+                &view.group,
             );
         }
-        self.app
-            .device_label_timeline_views
-            .invalidate_changed(&self.state.label, &mut resolver);
-        let mut changed_groups = changed_groups.into_iter().collect::<Vec<_>>();
-        changed_groups.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-        changed_groups
+        complete
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn device_labels_worker_teardown_releases_demand() {
+        let events = DeviceLabelEvents::default();
+        let worker = DeviceLabelEnrichment::default();
+        let demand = Arc::downgrade(&worker.demand);
+        let receiver = events.subscribe_demand();
+        drop(worker);
+        drop(receiver);
+        assert!(
+            demand.upgrade().is_none(),
+            "logged out worker remains retained"
+        );
+        assert_eq!(events.demand.receiver_count(), 0);
+        for _ in 0..1000 {
+            events.publish_change("other");
+        }
+        assert_eq!(events.demand.receiver_count(), 0);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn device_labels_events_coalesce_and_bound_unknown_scope() {
+        let labels = DeviceLabelEvents::default();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(2);
+        labels.attach(events);
+        for _ in 0..1000 {
+            labels.publish_change("a");
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(DEVICE_LABEL_CHANGE_COALESCE_INTERVAL).await;
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            crate::MarmotAppEvent::DeviceLabelsChanged {
+                account_id_hex: Some("a".into())
+            }
+        );
+        assert!(receiver.try_recv().is_err());
+        labels.publish_change("a");
+        labels.publish_change("b");
+        tokio::task::yield_now().await;
+        tokio::time::advance(DEVICE_LABEL_CHANGE_COALESCE_INTERVAL).await;
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            crate::MarmotAppEvent::DeviceLabelsChanged {
+                account_id_hex: None
+            }
+        );
+        assert!(receiver.try_recv().is_err());
+    }
     #[tokio::test(start_paused = true)]
     async fn device_label_demand_coalesces_bounds_and_rate_limits_misses() {
         let state = DeviceLabelEnrichment::default();

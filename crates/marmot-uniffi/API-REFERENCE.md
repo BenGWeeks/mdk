@@ -34,17 +34,17 @@ this installation; sibling installations of the same account do not. Labels
 are advisory and sanitized, with `None` on a cache miss. Bounded background
 KeyPackage fetches cache demanded leaf labels asynchronously (at most 64 per remote account).
 Exact sender labels resolve at read time without rewriting message rows.
-Cache admissions publish installation-wide, coalesced remote-account signature-key
-changes to every local account worker, including evictions. Each worker compares
-resolved labels for canonical members in its own groups and emits `GroupStateUpdated`
-only for changed roster or loaded sender labels, including roster-only groups with
-no timeline subscription. A bounded open-viewport re-read refreshes affected timeline
-subscriptions and conversation windows from storage, coalesced per worker/group and
-window and bounded by loaded size/query limit. All loaded rows are compared, including
-older departed devices and groups that supplied no demand.
-Displayed rows are never republished as message upserts; hosts receive
-current edits and deletions with read-time labels. Unchanged rosters and windows receive no
-label refresh. Provenance is
+Cache admissions or evictions that change stored labels emit
+`MarmotEventFfi::DeviceLabelsChanged { account_id_hex: Option<String> }` on the existing runtime
+host event stream. `Some` identifies the remote account; `None` means several or
+unknown accounts. Bursts coalesce over `DEVICE_LABEL_CHANGE_COALESCE_INTERVAL`
+(100 ms), without retaining per-worker mailboxes or scanning account rosters.
+Hosts re-read the rosters, member devices and message records they display;
+read-time resolution supplies current labels. MDK-managed open windows subscribe
+to bounded broadcasts and re-read affected loaded windows from storage. Unknown
+scope or broadcast lag refreshes all open windows. Identical rows emit no window
+update. Re-reads preserve current edits/deletions; history is never rewritten.
+Provenance is
 persisted before projection and survives reopening without rewriting legacy
 history. A signature-key change produces a different ID, as in member projection.
 

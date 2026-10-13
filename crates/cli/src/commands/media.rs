@@ -625,6 +625,7 @@ mod tests {
 
     fn sample_message(tags: Vec<Vec<String>>) -> AppMessageRecord {
         AppMessageRecord {
+            sender_device: Default::default(),
             authority: None,
             message_id_hex: "aa".repeat(32),
             direction: "incoming".to_owned(),

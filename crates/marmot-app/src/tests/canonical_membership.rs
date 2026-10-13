@@ -2510,12 +2510,12 @@ async fn welcome_device_labels_read_time_fixture(reject_history: bool) {
     let mut notified_group = false;
     let mut notified_timeline = false;
     tokio::time::timeout(Duration::from_secs(10), async {
-        // Keep recv alive while the independent roster notification arrives:
-        // cancelling it during its store read would consume the refresh signal.
+        // The runtime event asks the host to re-read its roster while the
+        // independent bounded timeline subscription refreshes its own window.
         let roster_updates = async {
             while !notified_group {
-                if let crate::MarmotAppEvent::GroupStateUpdated { group_id, .. } = notifications.recv().await.unwrap() {
-                    notified_group |= group_id == group;
+                if let crate::MarmotAppEvent::DeviceLabelsChanged { account_id_hex } = notifications.recv().await.unwrap() {
+                    notified_group |= account_id_hex.as_deref().is_none_or(|account| account == alice_account.account_id_hex);
                 }
             }
         };
@@ -2692,7 +2692,7 @@ async fn device_label_fetch_failure_leaves_none_and_skips_retired_and_unsafe_rou
     let accounts = client.device_label_enrichment.begin();
     assert_eq!(accounts, vec![account.account_id_hex.clone()]);
     let fetched = app.clone().run_device_label_pass(accounts).await;
-    assert!(client.finish_device_label_pass(fetched).is_empty());
+    client.finish_device_label_pass(fetched);
     assert_eq!(
         client.enrich_sender_device(&group, &account.account_id_hex, device.clone()),
         device
@@ -2862,14 +2862,12 @@ async fn device_labels_unrelated_passes_do_not_admit_or_notify() {
             .device_label_enrichment
             .schedule(&account, &group, &id);
         let _ = client.device_label_enrichment.begin();
-        let changed =
-            client.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
-                account: account.clone(),
-                key: vec![pass; 32],
-                label: "Unrelated".into(),
-                created_at: u64::from(pass),
-            }]);
-        assert!(changed.is_empty(), "unrelated labels must not notify");
+        client.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+            account: account.clone(),
+            key: vec![pass; 32],
+            label: "Unrelated".into(),
+            created_at: u64::from(pass),
+        }]);
         assert!(client.pending_projection_updates.is_empty());
     }
     assert_eq!(
@@ -2885,6 +2883,8 @@ async fn device_labels_unrelated_passes_do_not_admit_or_notify() {
 #[tokio::test]
 async fn device_labels_unchanged_demand_produces_zero_notifications() {
     let (_dir, app, mut client, group, account) = member_device_label_fixture().await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut events = runtime.subscribe_events();
     let row = app
         .shared_storage()
         .unwrap()
@@ -2897,17 +2897,19 @@ async fn device_labels_unchanged_demand_produces_zero_notifications() {
         .schedule(&account, &group, &id);
     client.pending_projection_updates.clear();
     assert!(client.device_label_enrichment.begin().contains(&account));
-    assert!(
-        client
-            .finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
-                account,
-                key: row.signature_key,
-                label: row.client_label,
-                created_at: row.created_at + 1,
-            }])
-            .is_empty()
-    );
+    client.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+        account,
+        key: row.signature_key,
+        label: row.client_label,
+        created_at: row.created_at + 1,
+    }]);
     assert!(client.pending_projection_updates.is_empty());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), events.recv())
+            .await
+            .is_err(),
+        "recency-only admission emits no runtime label event"
+    );
 }
 
 #[tokio::test]
@@ -3229,7 +3231,7 @@ async fn device_labels_admission_and_eviction_refresh_both_local_rosters() {
 async fn device_labels_cross_account_roster_regression(two_accounts: bool) {
     let (dir, app, mut alice, group, bob) = member_device_label_fixture().await;
     let other_group = alice.create_group("roster only", &[&bob]).await.unwrap();
-    let mut carol = if two_accounts {
+    let carol = if two_accounts {
         AccountHome::open(dir.path())
             .create_account("carol")
             .unwrap();
@@ -3259,12 +3261,6 @@ async fn device_labels_cross_account_roster_regression(two_accounts: bool) {
         }
     }
     drop(conn);
-    app.device_label_timeline_views
-        .register_worker("alice", &alice.device_label_enrichment);
-    if let Some((client, _)) = &carol {
-        app.device_label_timeline_views
-            .register_worker("carol", &client.device_label_enrichment);
-    }
     assert!(
         alice
             .members(&other_group)
@@ -3294,6 +3290,7 @@ async fn device_labels_cross_account_roster_regression(two_accounts: bool) {
         );
     }
     let runtime = MarmotAppRuntime::new(app.clone());
+    let mut label_events = runtime.subscribe_events();
     let mut windows = Vec::new();
     if let Some((client, carol_group)) = &carol {
         for (owner, window_group) in [(&alice, &other_group), (client, carol_group)] {
@@ -3353,26 +3350,56 @@ async fn device_labels_cross_account_roster_regression(two_accounts: bool) {
         &cgka_traits::message::member_device_id(&group, &key),
     );
     alice.device_label_enrichment.begin();
-    let changed =
-        alice.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
-            account: bob.clone(),
-            key: key.clone(),
-            label: "Updated".into(),
-            created_at: u64::MAX / 2,
-        }]);
-    if two_accounts {
-        assert!(changed.contains(&group));
-    }
-    if let Some((client, group)) = &mut carol {
-        assert!(
-            client.finish_device_label_pass(vec![]).contains(group),
-            "other local account must refresh on admission"
+    alice.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+        account: bob.clone(),
+        key: key.clone(),
+        label: "Updated".into(),
+        created_at: u64::MAX / 2,
+    }]);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), label_events.recv())
+        .await
+        .expect("label admission must reach the host event stream")
+        .unwrap();
+    assert!(
+        matches!(event, crate::MarmotAppEvent::DeviceLabelsChanged { account_id_hex: Some(account) } if account == bob)
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), label_events.recv())
+            .await
+            .is_err(),
+        "admission emits one coalesced event"
+    );
+    assert_eq!(
+        alice
+            .members(&other_group)
+            .unwrap()
+            .iter()
+            .find(|m| m.member_id_hex == bob)
+            .unwrap()
+            .devices
+            .as_ref()
+            .unwrap()[0]
+            .client_label
+            .as_deref(),
+        Some("Updated")
+    );
+    if let Some((client, group)) = &carol {
+        assert_eq!(
+            client
+                .members(group)
+                .unwrap()
+                .iter()
+                .find(|m| m.member_id_hex == bob)
+                .unwrap()
+                .devices
+                .as_ref()
+                .unwrap()[0]
+                .client_label
+                .as_deref(),
+            Some("Updated")
         );
-        assert!(
-            client.finish_device_label_pass(vec![]).is_empty(),
-            "drained change must not notify twice"
-        );
     }
+
     for window in &mut windows {
         tokio::time::timeout(std::time::Duration::from_secs(5), window.recv())
             .await
@@ -3384,27 +3411,18 @@ async fn device_labels_cross_account_roster_regression(two_accounts: bool) {
     }
     // Reconfirmation changes recency but not either account's displayed labels.
     alice.device_label_enrichment = Default::default();
-    app.device_label_timeline_views
-        .register_worker("alice", &alice.device_label_enrichment);
     alice.device_label_enrichment.schedule(
         &bob,
         &group,
         &cgka_traits::message::member_device_id(&group, &key),
     );
     alice.device_label_enrichment.begin();
-    assert!(
-        alice
-            .finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
-                account: bob.clone(),
-                key: key.clone(),
-                label: "Updated".into(),
-                created_at: u64::MAX / 2
-            }])
-            .is_empty()
-    );
-    if let Some((client, _)) = &mut carol {
-        assert!(client.finish_device_label_pass(vec![]).is_empty());
-    }
+    alice.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+        account: bob.clone(),
+        key: key.clone(),
+        label: "Updated".into(),
+        created_at: u64::MAX / 2,
+    }]);
     for window in &mut windows {
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), window.recv())
@@ -3421,8 +3439,6 @@ async fn device_labels_cross_account_roster_regression(two_accounts: bool) {
     }
     // Reset only the discovery cooldown by using a fresh demand owner.
     alice.device_label_enrichment = Default::default();
-    app.device_label_timeline_views
-        .register_worker("alice", &alice.device_label_enrichment);
     let new_key = vec![254; 32];
     alice.device_label_enrichment.schedule(
         &bob,
@@ -3430,25 +3446,39 @@ async fn device_labels_cross_account_roster_regression(two_accounts: bool) {
         &cgka_traits::message::member_device_id(&group, &new_key),
     );
     alice.device_label_enrichment.begin();
-    let changed =
-        alice.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
-            account: bob.clone(),
-            key: new_key,
-            label: "New".into(),
-            created_at: 3,
-        }]);
+    alice.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+        account: bob.clone(),
+        key: new_key,
+        label: "New".into(),
+        created_at: 3,
+    }]);
     assert!(cache.device_client_label(&bob, &key).unwrap().is_none());
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), label_events.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        changed.contains(&other_group),
-        "roster-only group must refresh on eviction"
+        matches!(event, crate::MarmotAppEvent::DeviceLabelsChanged { account_id_hex: Some(account) } if account == bob)
     );
-    if let Some((client, group)) = &mut carol {
-        assert!(
-            client.finish_device_label_pass(vec![]).contains(group),
-            "other local account must refresh on eviction"
-        );
-        assert!(client.finish_device_label_pass(vec![]).is_empty());
-    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), label_events.recv())
+            .await
+            .is_err(),
+        "eviction emits one coalesced event"
+    );
+    assert!(
+        alice
+            .members(&other_group)
+            .unwrap()
+            .iter()
+            .find(|m| m.member_id_hex == bob)
+            .unwrap()
+            .devices
+            .as_ref()
+            .unwrap()[0]
+            .client_label
+            .is_none()
+    );
     for window in &mut windows {
         tokio::time::timeout(std::time::Duration::from_secs(5), window.recv())
             .await
@@ -3467,5 +3497,10 @@ async fn device_labels_cross_account_roster_regression(two_accounts: bool) {
                 .is_err()
         );
     }
-    assert!(alice.finish_device_label_pass(vec![]).is_empty());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), label_events.recv())
+            .await
+            .is_err(),
+        "unchanged admission emits nothing"
+    );
 }

@@ -316,12 +316,17 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
+    /// Re-read displayed rosters and message records. Owned nullable remote account; NULL means several/unknown.
+    DeviceLabelsChanged { account_id_hex: *mut c_char },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
     fn from(value: MarmotEventFfi) -> Self {
         use MarmotEventFfi as F;
         match value {
+            F::DeviceLabelsChanged { account_id_hex } => Self::DeviceLabelsChanged {
+                account_id_hex: owned_opt_c_string(account_id_hex),
+            },
             F::GroupJoined {
                 account_id_hex,
                 account_label,
@@ -431,6 +436,7 @@ impl CFree for MarmotEvent {
     unsafe fn free_in_place(&mut self) {
         unsafe {
             match self {
+                Self::DeviceLabelsChanged { account_id_hex } => free_c_string(*account_id_hex),
                 Self::GroupJoined {
                     account_id_hex,
                     account_label,
@@ -623,6 +629,38 @@ mod tests {
                 marmot_event_free(event);
             }
             assert_eq!(audit::live_allocations(), before);
+        }
+    }
+}
+
+#[cfg(test)]
+mod device_label_tests {
+    use super::*;
+    #[test]
+    fn device_labels_event_optional_account_and_deep_free() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let baseline = crate::memory::audit::live_allocations();
+        for account in [None, Some("ab".repeat(32))] {
+            let mut event = MarmotEvent::from(MarmotEventFfi::DeviceLabelsChanged {
+                account_id_hex: account.clone(),
+            });
+            let MarmotEvent::DeviceLabelsChanged { account_id_hex } = &event else {
+                panic!("wrong event")
+            };
+            if let Some(account) = account {
+                assert_eq!(
+                    unsafe { std::ffi::CStr::from_ptr(*account_id_hex) }
+                        .to_str()
+                        .unwrap(),
+                    account
+                );
+            } else {
+                assert!(account_id_hex.is_null());
+            }
+            unsafe { event.free_in_place() };
+            #[cfg(feature = "alloc-audit")]
+            assert_eq!(crate::memory::audit::live_allocations(), baseline);
         }
     }
 }

@@ -174,7 +174,15 @@ pub(crate) enum TimelineSubscriptionSignal {
     // carries none of the public-type cost noted on `RuntimeTimelineMessageUpdate`.
     Projection(Box<RuntimeProjectionUpdate>),
     Refresh,
+    LabelRefresh,
     PolicyRefresh,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TimelineRefresh {
+    Normal,
+    Labels,
+    Policy,
 }
 
 /// The mutable, materialized window plus everything needed to extend it. Lives
@@ -415,13 +423,18 @@ impl TimelineWindowHandle {
     /// the (now stale) refresh would roll that expansion back, so if the
     /// generation moved we keep the newer window and drop the refresh.
     pub(crate) fn install_refresh(&self, page: TimelinePage, generation: u64) -> TimelinePage {
+        self.try_install_refresh(page, generation)
+            .unwrap_or_else(|| self.snapshot())
+    }
+
+    fn try_install_refresh(&self, page: TimelinePage, generation: u64) -> Option<TimelinePage> {
         let mut window = self.lock();
         if window.generation != generation {
-            return window.page.clone();
+            return None;
         }
         window.page = page;
         window.bump_generation();
-        window.page.clone()
+        Some(window.page.clone())
     }
 }
 
@@ -435,7 +448,7 @@ pub struct RuntimeTimelineMessagesSubscription {
     // Hosted subscriptions resolve advisory labels after policy rehydration.
     // In-memory window tests have no shared app cache.
     pub(crate) label_app: Option<MarmotApp>,
-    pub(crate) label_refresh: Arc<tokio::sync::Notify>,
+    pub(crate) pending_refresh: Option<TimelineRefresh>,
     pub(crate) policy_window_size: usize,
     pub(crate) policy_storage: storage_sqlite::SqliteAccountStorage,
     pub(crate) window: TimelineWindowHandle,
@@ -479,7 +492,11 @@ impl RuntimeTimelineMessagesSubscription {
                 biased;
                 _ = wait_for_runtime_shutdown(&mut self.stopping) => return None,
                 signal = self.updates.recv() => signal?,
-                _ = self.label_refresh.notified() => TimelineSubscriptionSignal::Refresh,
+                _ = tokio::time::sleep(crate::client::device_labels::DEVICE_LABEL_CHANGE_COALESCE_INTERVAL), if self.pending_refresh.is_some() => match self.pending_refresh.expect("pending refresh") {
+                    TimelineRefresh::Normal => TimelineSubscriptionSignal::Refresh,
+                    TimelineRefresh::Labels => TimelineSubscriptionSignal::LabelRefresh,
+                    TimelineRefresh::Policy => TimelineSubscriptionSignal::PolicyRefresh,
+                },
             };
             self.policy_window_size = self.policy_window_size.max(self.window.message_count());
             // Refresh only the affected records under current policy, including
@@ -516,12 +533,22 @@ impl RuntimeTimelineMessagesSubscription {
                 signal
             };
             let policy_refresh = matches!(signal, TimelineSubscriptionSignal::PolicyRefresh);
+            let label_refresh = matches!(signal, TimelineSubscriptionSignal::LabelRefresh);
             match signal {
                 TimelineSubscriptionSignal::Projection(update) => {
                     self.window.apply_projection(&update.update);
                     return Some(RuntimeTimelineMessageUpdate::Projection(*update));
                 }
-                TimelineSubscriptionSignal::Refresh | TimelineSubscriptionSignal::PolicyRefresh => {
+                TimelineSubscriptionSignal::Refresh
+                | TimelineSubscriptionSignal::LabelRefresh
+                | TimelineSubscriptionSignal::PolicyRefresh => {
+                    self.pending_refresh = Some(if policy_refresh {
+                        TimelineRefresh::Policy
+                    } else if label_refresh {
+                        TimelineRefresh::Labels
+                    } else {
+                        TimelineRefresh::Normal
+                    });
                     let (query_fn, mut query, mut head_query, generation) =
                         self.window.refresh_request();
                     if policy_refresh {
@@ -532,12 +559,26 @@ impl RuntimeTimelineMessagesSubscription {
                     match query_timeline_page_with_cursor_refresh(query_fn, query, head_query).await
                     {
                         Ok((page, _)) => {
-                            let page = self.window.install_refresh(page, generation);
+                            let before = self.window.snapshot();
+                            let page = if label_refresh {
+                                // Pagination won the install: retain the invalidation
+                                // and re-read the expanded viewport, rather than losing it.
+                                let Some(page) = self.window.try_install_refresh(page, generation)
+                                else {
+                                    continue;
+                                };
+                                page
+                            } else {
+                                self.window.install_refresh(page, generation)
+                            };
+                            self.pending_refresh = None;
+                            if label_refresh && before == page {
+                                continue;
+                            }
                             return Some(RuntimeTimelineMessageUpdate::Page { page });
                         }
-                        // Transient store error on refresh: keep the existing
-                        // window and wait for the next signal rather than
-                        // surfacing a spurious empty page.
+                        // Keep the invalidation through transient failures and
+                        // cancelled recv calls; retry without needing another event.
                         Err(_) => continue,
                     }
                 }
@@ -1228,17 +1269,13 @@ impl MarmotAppRuntime {
                 generation: 0,
             })),
         };
-        let label_refresh = Arc::new(tokio::sync::Notify::new());
-        self.accounts.app.device_label_timeline_views.register(
-            &account.label,
-            &window.inner,
-            &label_refresh,
-        );
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
+        let label_window = window.clone();
         tokio::spawn(async move {
             loop {
                 let event = tokio::select! {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    _ = updates_tx.closed() => return,
                     event = events.recv() => event,
                     changed = block_changes.changed() => {
                         if changed.is_err() {
@@ -1260,10 +1297,10 @@ impl MarmotAppRuntime {
                 let event = match event {
                     Ok(event) => event,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // We may have missed projections; ask the subscription to
-                        // re-materialize its current window (head or scrolled-back).
+                        // Lost projections or labels require a full bounded re-read.
+                        // Suppress a replacement if all loaded rows still match.
                         if updates_tx
-                            .send(TimelineSubscriptionSignal::Refresh)
+                            .send(TimelineSubscriptionSignal::LabelRefresh)
                             .await
                             .is_err()
                         {
@@ -1273,6 +1310,22 @@ impl MarmotAppRuntime {
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 };
+                if let MarmotAppEvent::DeviceLabelsChanged { account_id_hex } = &event {
+                    if account_id_hex.as_ref().is_none_or(|account| {
+                        label_window
+                            .snapshot()
+                            .messages
+                            .iter()
+                            .any(|row| &row.sender == account)
+                    }) && updates_tx
+                        .send(TimelineSubscriptionSignal::LabelRefresh)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 let Some(update) = projection_update_from_event(&event) else {
                     continue;
                 };
@@ -1294,8 +1347,8 @@ impl MarmotAppRuntime {
             }
         });
         Ok(RuntimeTimelineMessagesSubscription {
+            pending_refresh: None,
             label_app: Some(self.accounts.app.clone()),
-            label_refresh,
             policy_window_size,
             policy_storage: subscription_policy_storage,
             window,

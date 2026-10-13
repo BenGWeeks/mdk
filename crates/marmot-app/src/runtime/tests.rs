@@ -1218,7 +1218,7 @@ fn timeline_subscription_with(
 ) -> RuntimeTimelineMessagesSubscription {
     RuntimeTimelineMessagesSubscription {
         label_app: None,
-        label_refresh: Arc::new(tokio::sync::Notify::new()),
+        pending_refresh: None,
         policy_window_size: window.messages.len().max(1),
         policy_storage: storage_sqlite::SqliteAccountStorage::in_memory().unwrap(),
         window: timeline_window_handle(store, window, window_limit),
@@ -3872,7 +3872,17 @@ async fn message_journey_overflow() {
         .send(&group, b"recover missed projection")
         .await
         .unwrap();
-    for _ in 0..2 {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let mut window = timeline.window.inner.lock().unwrap();
+        let query = window.query.clone();
+        let counted = reads.clone();
+        window.query = Arc::new(move |request| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            query(request)
+        });
+    }
+    for gap in 0..2 {
         let mut observer = runtime.subscribe();
         // No await: the single-thread executor cannot drain the 1024-event ring.
         for _ in 0..2048 {
@@ -3889,11 +3899,23 @@ async fn message_journey_overflow() {
             observer.try_recv(),
             Err(broadcast::error::TryRecvError::Lagged(_))
         ));
-        let update = tokio::time::timeout(Duration::from_secs(5), timeline.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(update, RuntimeTimelineMessageUpdate::Page { .. }));
+        let update = tokio::time::timeout(Duration::from_millis(500), timeline.recv()).await;
+        if gap == 0 {
+            assert!(matches!(
+                update.unwrap().unwrap(),
+                RuntimeTimelineMessageUpdate::Page { .. }
+            ));
+        } else {
+            assert!(
+                update.is_err(),
+                "an unchanged gap re-read must not emit another page"
+            );
+        }
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            gap + 1,
+            "every gap re-reads authoritative storage"
+        );
         let page = timeline.take_snapshot();
         assert_eq!(
             page.messages.len(),
@@ -4467,4 +4489,150 @@ fn generated_setup_profile_adopts_a_selected_profile_only_before_local_readiness
         );
         assert!(store, "{phase:?}");
     }
+}
+
+#[tokio::test]
+async fn device_labels_refresh_retries_transient_window_read_without_new_signal() {
+    let store = ScriptedTimelineStore::new_results(vec![
+        Err(AppError::InvalidAppMessagePayload("transient".into())),
+        Ok(timeline_test_page(&[("fresh", 2)], false, false)),
+    ]);
+    let lifecycle = RuntimeLifecycle::new();
+    let (tx, rx) = mpsc::channel(2);
+    let mut subscription = timeline_subscription_with(
+        &store,
+        timeline_test_page(&[("old", 1)], false, false),
+        10,
+        rx,
+        lifecycle.subscribe_shutdown(),
+    );
+    tx.send(TimelineSubscriptionSignal::LabelRefresh)
+        .await
+        .unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+        .await
+        .expect("failed re-read must retain invalidation")
+        .unwrap();
+    assert!(
+        matches!(update, RuntimeTimelineMessageUpdate::Page { page } if timeline_ids(&page) == vec!["fresh"])
+    );
+    assert_eq!(store.recorded_queries().len(), 2);
+}
+
+#[tokio::test]
+async fn device_labels_identical_window_reread_emits_nothing() {
+    let page = timeline_test_page(&[("same", 1)], false, false);
+    let store = ScriptedTimelineStore::new(vec![page.clone()]);
+    let lifecycle = RuntimeLifecycle::new();
+    let (tx, rx) = mpsc::channel(1);
+    let mut subscription =
+        timeline_subscription_with(&store, page, 10, rx, lifecycle.subscribe_shutdown());
+    tx.send(TimelineSubscriptionSignal::LabelRefresh)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), subscription.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(store.recorded_queries().len(), 1);
+    assert!(subscription.pending_refresh.is_none());
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn device_labels_logout_drops_bounded_receivers_during_other_account_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home().create_account("alice").unwrap();
+    app.account_home().create_account("bob").unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts.reconcile().await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        while app.device_label_events.demand_receiver_count() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    runtime.accounts.deactivate_account("alice").await.unwrap();
+    assert_eq!(app.device_label_events.demand_receiver_count(), 1);
+    let mut events = runtime.subscribe_events();
+    let remote = "bb".repeat(32);
+    for revision in 0..1000 {
+        app.admit_device_client_label(&remote, &[42; 32], &format!("label {revision}"), revision)
+            .unwrap();
+    }
+    assert_eq!(app.device_label_events.demand_receiver_count(), 1);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), MarmotAppEvent::DeviceLabelsChanged { account_id_hex: Some(account) } if account == remote) { break; }
+        }
+    }).await.unwrap();
+    runtime.shutdown().await;
+    assert_eq!(app.device_label_events.demand_receiver_count(), 0);
+}
+
+#[tokio::test]
+async fn device_labels_refresh_retries_when_pagination_wins_install() {
+    let mut initial = timeline_test_page(&[("b", 20)], true, false);
+    initial.messages[0].sender_device = crate::SenderDevice::Exact {
+        device_id: "device".into(),
+        leaf_index: 0,
+        client_label: None,
+        is_this_installation: false,
+    };
+    let mut fresh = timeline_test_page(&[("a", 10), ("b", 20)], false, false);
+    fresh.messages[1].sender_device = crate::SenderDevice::Exact {
+        device_id: "device".into(),
+        leaf_index: 0,
+        client_label: Some("fresh".into()),
+        is_this_installation: false,
+    };
+    let lifecycle = RuntimeLifecycle::new();
+    let (tx, rx) = mpsc::channel(1);
+    let mut subscription = timeline_subscription_with(
+        &ScriptedTimelineStore::default(),
+        initial.clone(),
+        10,
+        rx,
+        lifecycle.subscribe_shutdown(),
+    );
+    let handle = subscription.window_handle();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let (entered, reached) = oneshot::channel();
+    let entered = StdMutex::new(Some(entered));
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let wait = StdMutex::new(wait);
+    handle.inner.lock().unwrap().query =
+        Arc::new(
+            move |_| match counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => {
+                    entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                    wait.lock().unwrap().recv().unwrap();
+                    Ok(initial.clone())
+                }
+                1 => Ok(timeline_test_page(&[("a", 10)], false, true)),
+                2 => Ok(fresh.clone()),
+                _ => panic!("unexpected extra re-read"),
+            },
+        );
+    tx.send(TimelineSubscriptionSignal::LabelRefresh)
+        .await
+        .unwrap();
+    let receiving = tokio::spawn(async move { subscription.recv().await });
+    reached.await.unwrap();
+    let expanded = handle.paginate_backwards(1).await.unwrap();
+    assert_eq!(timeline_ids(&expanded), vec!["a", "b"]);
+    release.send(()).unwrap();
+    let result = timeout(Duration::from_secs(2), receiving)
+        .await
+        .expect("stale label install must retain invalidation")
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result, RuntimeTimelineMessageUpdate::Page { page } if matches!(&page.messages[1].sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "fresh"))
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
 }

@@ -29,15 +29,24 @@ class BindingDocsTests(unittest.TestCase):
         ):
             with self.subTest(path=relative):
                 text = " ".join((REPO / relative).read_text().split())
-                self.assertIn("installation-wide, coalesced remote-account signature-key changes", text)
-                self.assertIn("every local account worker", text)
-                self.assertIn("roster-only groups", text)
+                self.assertIn("DeviceLabelsChanged { account_id_hex: Option<String> }", text)
+                self.assertIn("several or unknown accounts", text)
+                self.assertIn("DEVICE_LABEL_CHANGE_COALESCE_INTERVAL", text)
+                self.assertIn("(100 ms)", text)
+                self.assertIn("Hosts re-read the rosters, member devices and message records", text)
                 self.assertIn("at most 64 per remote account" if relative.endswith("API-REFERENCE.md") else "64 entries per remote account", text)
-                self.assertNotIn("64-row tail comparison", text)
-                self.assertIn("bounded open-viewport re-read", text)
-                self.assertIn("including evictions", text)
-                self.assertIn("current edits and deletions", text)
-                self.assertNotIn("at most 64 recent timeline rows per group", text)
+                self.assertIn("bounded broadcasts", text)
+                self.assertIn("admissions or evictions", text)
+                self.assertIn("Identical rows emit no window update", text)
+                self.assertIn("Re-reads preserve current edits/deletions", text)
+                self.assertNotIn("signature-key changes to every local account worker", text)
+                self.assertNotIn("emits `GroupStateUpdated`", text)
+        for relative in ("crates/marmot-c/README.md", "crates/marmot-c/API-REFERENCE.md"):
+            with self.subTest(path=relative):
+                text = " ".join((REPO / relative).read_text().split())
+                self.assertIn("MARMOT_EVENT_DEVICE_LABELS_CHANGED", text)
+                self.assertIn("NULL means several/unknown remote accounts", text)
+                self.assertIn("marmot_event_free", text)
 
     def test_rejects_omitted_method(self) -> None:
         self.assertIn("missing method", "\n".join(check("", "rust", self.expected)))

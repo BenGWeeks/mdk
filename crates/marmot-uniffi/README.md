@@ -805,17 +805,17 @@ including misses and failures, have a one-hour cooldown per account worker.
 Only demanded keys and invitation selections enter the validated cache, capped at
 64 entries per remote account with least-recently-confirmed eviction. Labels survive
 directory slot replacement and resolve at read time; stored message rows never
-change. Cache admissions publish installation-wide, coalesced remote-account signature-key
-changes to every local account worker, including evictions. Each worker compares
-resolved labels for canonical members in its own groups and emits `GroupStateUpdated`
-only for changed roster or loaded sender labels, including roster-only groups with
-no timeline subscription. A bounded open-viewport re-read refreshes affected timeline
-subscriptions and conversation windows from storage, coalesced per worker/group and
-window and bounded by loaded size/query limit. All loaded rows are compared, including
-older departed devices and groups that supplied no demand.
-Displayed rows are never republished as message
-upserts; hosts receive current edits and deletions with read-time labels. Unchanged
-windows receive no label refresh. Shutdown stops waiting
+change. Cache admissions or evictions that change stored labels emit
+`MarmotEventFfi::DeviceLabelsChanged { account_id_hex: Option<String> }` on the existing runtime
+host event stream. `Some` identifies the remote account; `None` means several or
+unknown accounts. Bursts coalesce over `DEVICE_LABEL_CHANGE_COALESCE_INTERVAL`
+(100 ms), without retaining per-worker mailboxes or scanning account rosters.
+Hosts re-read the rosters, member devices and message records they display;
+read-time resolution supplies current labels. MDK-managed open windows subscribe
+to bounded broadcasts and re-read affected loaded windows from storage. Unknown
+scope or broadcast lag refreshes all open windows. Identical rows emit no window
+update. Re-reads preserve current edits/deletions; history is never rewritten.
+Shutdown stops waiting
 and admitting results; coalesced directory fetches finish independently within
 relay connect/fetch timeouts.
 `joined_at` is always `None`; no join timestamp is inferred or backfilled. Treat

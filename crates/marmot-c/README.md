@@ -319,6 +319,12 @@ for version ordering, localization, readiness, and account-switch behavior.
 means canonical authoritative devices, always nonempty for an admitted member.
 Parent deep-frees release the array and its strings. See the
 [shared optional-device contract](../marmot-uniffi/README.md#device-local-membership-events).
+Runtime label invalidations use `MarmotEvent::DeviceLabelsChanged`, with tag
+`MARMOT_EVENT_DEVICE_LABELS_CHANGED`. Its owned nullable `account_id_hex` is
+released by `marmot_event_free`; NULL means several/unknown remote accounts.
+Follow the [shared re-read contract](../marmot-uniffi/README.md#device-local-membership-events)
+for displayed rosters, member devices and message records.
+
 `client_label` is nullable; `has_joined_at` represents the optional `joined_at`
 (currently always absent).
 

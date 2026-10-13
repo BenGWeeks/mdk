@@ -2219,6 +2219,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, id)| AppMessageRecord {
+                sender_device: Default::default(),
                 authority: None,
                 message_id_hex: id.to_owned(),
                 direction: "received".to_owned(),

@@ -2633,18 +2633,23 @@ async fn label_refresh_with_queued_mutation(mutation: Option<u64>) {
     }
     client.pending_projection_updates.clear();
     client.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
-        account: sender,
+        account: sender.clone(),
         key,
         label: "Departed".into(),
         created_at: 1,
     }]);
+    assert_eq!(
+        client.refresh_device_label_windows(Some(&sender)),
+        mutation != Some(0),
+        "a pruned historical anchor retains invalidation for the normal window recovery path"
+    );
     assert!(
         client.pending_projection_updates.is_empty(),
         "label completion must never queue displayed message copies"
     );
     assert!(
-        tail.take().is_none(),
-        "an unchanged open viewport must not refresh"
+        tail.take().is_some(),
+        "coarse account invalidation re-reads every matching open viewport"
     );
     for update in client.take_pending_projection_updates() {
         f.runtime
@@ -2813,18 +2818,14 @@ async fn device_labels_eviction_refreshes_other_open_group() {
         &cgka_traits::message::member_device_id(&f.group, &new_key),
     );
     assert!(client.device_label_enrichment.begin().contains(&sender));
-    let changed =
-        client.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
-            account: sender.clone(),
-            key: new_key,
-            label: "New".into(),
-            created_at: 100,
-        }]);
+    client.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+        account: sender.clone(),
+        key: new_key,
+        label: "New".into(),
+        created_at: 100,
+    }]);
     assert!(cache.device_client_label(&sender, &key).unwrap().is_none());
-    assert!(
-        changed.contains(&other),
-        "eviction must notify a group with no demand"
-    );
+    assert!(client.refresh_device_label_windows(Some(&sender)));
     for update in client.take_pending_projection_updates() {
         f.runtime
             .events
@@ -2862,4 +2863,68 @@ async fn device_labels_eviction_refreshes_other_open_group() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn device_labels_lagged_receiver_rereads_every_open_window() {
+    let f = Fixture::new(0).await;
+    let senders = ["bb".repeat(32), "cc".repeat(32)];
+    let key = vec![77; 32];
+    for (index, sender) in senders.iter().enumerate() {
+        f.store
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: f.group_hex(),
+                message_id_hex: id(index),
+                source_message_id_hex: Some(id(index + 10000)),
+                source_epoch: Some(1),
+                direction: "received".into(),
+                sender: sender.clone(),
+                sender_device: crate::SenderDevice::Exact {
+                    device_id: cgka_traits::message::member_device_id(&f.group, &key),
+                    leaf_index: index as u32,
+                    client_label: None,
+                    is_this_installation: false,
+                },
+                plaintext: "lag recovery".into(),
+                kind: 9,
+                tags: vec![],
+                recorded_at: 100 + index as u64,
+                received_at: 100 + index as u64,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+    }
+    let mut windows = Vec::new();
+    for _ in 0..2 {
+        windows.push(f.open(ConversationOpenTarget::Latest, 5).await);
+    }
+    let cache = f.app.shared_storage().unwrap();
+    for sender in &senders {
+        // Change storage without generating a scoped event. Only broadcast lag
+        // can discover these labels, since all retained events name a stranger.
+        cache
+            .put_device_client_label(sender, &key, "After lag", 1)
+            .unwrap();
+    }
+    let before = f.captures.load(Ordering::SeqCst);
+    // No await: both bounded receivers must lag before either can run.
+    for _ in 0..2048 {
+        f.runtime
+            .events
+            .send(MarmotAppEvent::DeviceLabelsChanged {
+                account_id_hex: Some("dd".repeat(32)),
+            })
+            .unwrap();
+    }
+    for window in &mut windows {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = window.recv().await.unwrap().unwrap();
+                if snapshot.page.page().messages.iter().all(|row| matches!(&row.sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "After lag")) { break; }
+            }
+        }).await.unwrap();
+    }
+    assert!(f.captures.load(Ordering::SeqCst) >= before + 2);
+    f.runtime.shutdown().await;
 }

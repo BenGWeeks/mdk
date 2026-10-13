@@ -1053,6 +1053,7 @@ mod tests {
         .to_content()
         .unwrap();
         let message = TimelineMessageRecord {
+            sender_device: Default::default(),
             client_token: None,
             has_reports: false,
             group_system: None,
@@ -1132,6 +1133,7 @@ mod tests {
     #[test]
     fn message_and_timeline_plain_rows_sanitize_untrusted_fields() {
         let hostile = AppMessageRecord {
+            sender_device: Default::default(),
             authority: None,
             message_id_hex: "11".repeat(32),
             direction: "received".to_owned(),

@@ -170,7 +170,7 @@ pub(crate) struct CapturedConversation {
 // navigation or a normal worker read invalidates that speculative tail capture.
 // The worker holds weak references so closing a window releases its rows.
 pub(crate) struct SendCapture {
-    group: GroupId,
+    pub(crate) group: GroupId,
     epoch: Vec<u8>,
     state: Mutex<SendCaptureState>,
     changed: watch::Sender<()>,
@@ -275,12 +275,13 @@ pub(crate) fn publish_conversation_captures_from_session(
     app: &MarmotApp,
     label: &str,
     group: &GroupId,
-) {
+) -> bool {
     let observers: Vec<_> = observers
         .iter()
         .filter_map(Weak::upgrade)
         .filter(|observer| observer.group == *group)
         .collect();
+    let mut complete = true;
     for observer in observers {
         let (query, generation) = {
             let state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -329,8 +330,11 @@ pub(crate) fn publish_conversation_captures_from_session(
                 state.latest = latest;
                 observer.changed.send_replace(());
             }
+        } else {
+            complete = false;
         }
     }
+    complete
 }
 pub(crate) fn conversation_label_viewports(
     client: &AppClient,
@@ -1156,6 +1160,7 @@ impl Sources {
             tokio::select! {
                 event = self.avatars.recv() => match event { Ok(label) if label == reader.label => return, Err(_) => return, _ => {} },
                 event = self.events.recv() => match event {
+                    Ok(MarmotAppEvent::DeviceLabelsChanged { account_id_hex }) if account_id_hex.as_ref().is_none_or(|account| current.page.page().messages.iter().any(|row| &row.sender == account)) => return,
                     Ok(event) if projection_update_from_event(&event).is_some_and(|u|u.account_id_hex == reader.account_id && u.update.group_id_hex == group_hex)
                         || chat_list_event_route(&event).is_some_and(|(account,group)| account == reader.account_id && group == &reader.group) => return,
                     Err(_) => return, _ => {},
