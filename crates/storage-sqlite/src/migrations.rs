@@ -4410,7 +4410,8 @@ mod slot_observation_migration_tests {
     #[test]
     fn slot_observation_migration_is_transactional_and_preserves_lifecycle() {
         let mut conn = Connection::open_in_memory().unwrap();
-        run(&mut conn, &MIGRATIONS[..MIGRATIONS.len() - 1]).unwrap();
+        // Versions 1-107 are the schema immediately before 0108.
+        run(&mut conn, &MIGRATIONS[..107]).unwrap();
         conn.execute(
             "INSERT INTO cgka_key_package_lifecycle(singleton, record) VALUES(1, ?1)",
             [b"unchanged".as_slice()],
@@ -4429,7 +4430,9 @@ mod slot_observation_migration_tests {
             )
             .unwrap();
         assert_eq!(count, 0);
-        assert_eq!(run_all(&mut conn).unwrap(), 1);
+        assert_eq!(applied_name(&conn, 108).unwrap(), None);
+        run_all(&mut conn).unwrap();
+        assert!(applied_name(&conn, 108).unwrap().is_some());
         assert_eq!(run_all(&mut conn).unwrap(), 0);
         let bytes: Vec<u8> = conn
             .query_row("SELECT record FROM cgka_key_package_lifecycle", [], |r| {

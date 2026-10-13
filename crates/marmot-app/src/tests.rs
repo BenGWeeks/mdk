@@ -23862,6 +23862,59 @@ async fn directory_own_slot_observation_is_verified_coalesced_and_durable() {
 }
 
 #[tokio::test]
+async fn directory_own_slot_observation_failure_still_caches_key_package() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let package = fresh_key_package_for_account(&app, &account, false).await;
+    let package_hex = hex::encode(package.bytes());
+    let unsigned = member_resolution_key_package_event(&account, package);
+    let keys = home.load_signing_keys(&account.label).unwrap();
+    let signed = EventBuilder::new(Kind::from(KIND_MARMOT_KEY_PACKAGE as u16), unsigned.content)
+        .tags(
+            unsigned
+                .tags
+                .into_iter()
+                .map(|tag| Tag::parse(tag).unwrap()),
+        )
+        .finalize(&keys)
+        .unwrap();
+    let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+    let event_id = event.id.clone();
+
+    // Close only the session database: the best-effort observation must fail,
+    // while the independent directory stores remain available for caching.
+    app.account_storage(&account.label)
+        .unwrap()
+        .close()
+        .unwrap();
+    assert!(matches!(
+        app.remember_own_key_package_slot_observation(&event),
+        Err(AppError::Storage(cgka_traits::StorageError::Closed(_)))
+    ));
+    assert!(
+        app.directory_entry_for_account_id(&account.account_id_hex)
+            .unwrap()
+            .is_none_or(|entry| entry.key_package.is_none())
+    );
+
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        event,
+    })
+    .unwrap();
+    let cached = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap()
+        .key_package
+        .unwrap();
+    assert_eq!(cached.key_package_event_id, event_id);
+    assert_eq!(cached.key_package_hex, package_hex);
+}
+
+#[tokio::test]
 async fn directory_tracked_public_key_package_does_not_open_account_storage() {
     let remote_directory = tempfile::tempdir().unwrap();
     let remote_app = MarmotApp::with_relay(remote_directory.path(), "wss://relay.example");
