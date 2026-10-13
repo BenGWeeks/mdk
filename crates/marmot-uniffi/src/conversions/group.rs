@@ -325,9 +325,12 @@ pub struct GroupManagementStateFfi {
     /// Whether the last leaf of an admin account must self-demote before leaving. Disbanding and a
     /// terminal lifecycle take precedence and keep this false.
     pub requires_self_demote_before_leave: bool,
-    /// A leave is already in flight for this group; `Marmot::leave_group` would
-    /// return `MarmotKitError::LeaveAlreadyRequested`. Render progress rather
-    /// than a Leave affordance.
+    /// A leave is already in flight for this group. Render progress rather
+    /// than a Leave affordance. Retrying `Marmot::leave_group` normally returns
+    /// `MarmotKitError::LeaveAlreadyRequested`; if the leave has since become
+    /// forbidden (this leaf is now its admin account's last leaf, for example
+    /// after a sibling device left first), the retry cancels the pending leave
+    /// and returns `AdminCannotSelfRemove`, after which the group is usable again.
     pub leave_request_pending: bool,
     /// When the local account asked to leave, in milliseconds since the Unix
     /// epoch; `null` when no leave is pending.
