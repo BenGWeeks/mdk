@@ -602,6 +602,12 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         request: crate::relay_plane::DirectoryFetchRequest,
     ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
         self.requests.lock().unwrap().push(request.clone());
+        // Model batch/refetch differences for author-scoped filter batches too.
+        let package_batch = request.queries.len() > 1
+            && request
+                .queries
+                .iter()
+                .all(|query| query.kind == KIND_MARMOT_KEY_PACKAGE);
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
             if request
@@ -629,6 +635,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             return Err("multi-author queries unsupported".to_owned());
         }
         if let Some(failing_author) = self.failing_single_author.lock().unwrap().as_ref()
+            && !package_batch
             && request.queries.iter().any(|query| {
                 query.authors.len() == 1 && query.authors.first() == Some(failing_author)
             })
@@ -665,13 +672,14 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             }
             if event.kind == KIND_MARMOT_KEY_PACKAGE
                 && multi_author_only.contains(&event.id)
+                && !package_batch
                 && request.queries.iter().all(|query| query.authors.len() == 1)
             {
                 return false;
             }
             if event.kind == KIND_MARMOT_KEY_PACKAGE
                 && single_author_only.contains(&event.id)
-                && request.queries.iter().any(|query| query.authors.len() > 1)
+                && (package_batch || request.queries.iter().any(|query| query.authors.len() > 1))
             {
                 return false;
             }
@@ -9067,10 +9075,16 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
     let requests = fetcher.requests.lock().unwrap();
     assert_eq!(
         requests.len(),
-        1,
+        4,
+        "prewarmed routes still require package refetches and deletion proofs"
+    );
+    assert!(
+        requests
+            .iter()
+            .flat_map(|request| &request.queries)
+            .all(|query| matches!(query.kind, KIND_MARMOT_KEY_PACKAGE | 5)),
         "prewarmed routes should avoid repeating discovery"
     );
-    assert_eq!(requests[0].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
 }
 
 #[tokio::test]
@@ -9229,10 +9243,12 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
             .iter()
             .all(|query| query.authors.len() == 8)
     );
-    assert_eq!(requests[2].queries.len(), 1);
-    assert_eq!(requests[2].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
-    assert_eq!(requests[2].queries[0].authors.len(), 8);
-    assert_eq!(requests[2].queries[0].limit, 8 * 32);
+    assert_eq!(requests[2].queries.len(), 8);
+    for query in &requests[2].queries {
+        assert_eq!(query.kind, KIND_MARMOT_KEY_PACKAGE);
+        assert_eq!(query.authors.len(), 1);
+        assert_eq!(query.limit, 32);
+    }
     drop(requests);
 
     for account in &accounts {
@@ -9356,7 +9372,7 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
-        10,
+        11,
         "relay-list fallbacks, per-author packages, supplementary packages and deletion proofs stay bounded"
     );
 }
@@ -9389,7 +9405,7 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
-        10,
+        11,
         "incomplete relay-list batches retry per author, followed by bounded package/deletion discovery"
     );
 }

@@ -236,8 +236,8 @@ membership, provider response, profile hydration, and network completion, withou
 ## Groups and invitations
 
 **Creating and inviting.** Group creation and invites take pubkeys at the action boundary. The app canonicalizes and
-deduplicates the requested roster and fetches current KeyPackages in bounded multi-author relay batches before building
-the MLS add.
+deduplicates the requested roster and fetches current KeyPackages in bounded batches of author-scoped relay filters
+before building the MLS add. Normal invites exclude existing leaf signing keys before selection and the device cap.
 
 - Cached packages are useful for discovery, but cannot authorize an invitation or substitute for a failed relay lookup.
   This also applies to another account on the same installation: its local package record is not an invitation
@@ -257,7 +257,7 @@ KeyPackageRef and capped at ten packages per account. Newer slot publications su
 invalid or revoked. MLS lifetime checks still apply. If no eligible package is fresh, a compatibility fallback
 selects only the single newest valid compatible package; internal account-level resolution statistics count this
 fallback. The cap applies only to outbound selection, never to received group leaves. Prewarm counts accounts,
-not packages, and a direct chat contains two distinct accounts regardless of their device counts.
+not packages.
 
 Member discovery requests at most 32 events per author, keeps the existing author/concurrency bounds and
 50-second deadline, and supplements advertised outboxes with up to eight safe configured discovery endpoints

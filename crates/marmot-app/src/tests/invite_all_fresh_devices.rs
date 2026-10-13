@@ -165,7 +165,7 @@ async fn invite_all_fresh_devices_publication_age_and_single_stale_fallback() {
 }
 
 #[tokio::test]
-async fn invite_all_fresh_devices_create_and_invite_preserve_direct_chat_accounts() {
+async fn invite_all_fresh_devices_create_and_invite_include_both_siblings() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let peer = &accounts[0];
     let now = unix_now_seconds();
@@ -197,26 +197,12 @@ async fn invite_all_fresh_devices_create_and_invite_preserve_direct_chat_account
         .await
         .unwrap();
     assert_eq!(alice.group_mls_state(&direct).unwrap().member_count, 3);
-    let record = alice
-        .state
-        .groups
-        .iter()
-        .find(|g| g.group_id_hex == hex::encode(direct.as_slice()))
-        .unwrap();
-    assert_eq!(record.direct_member_ids_hex.as_ref().unwrap().len(), 2);
     let empty = alice.create_group("", &[]).await.unwrap();
     alice
         .invite_members(&empty, &[&peer.account_id_hex])
         .await
         .unwrap();
     assert_eq!(alice.group_mls_state(&empty).unwrap().member_count, 3);
-    let record = alice
-        .state
-        .groups
-        .iter()
-        .find(|g| g.group_id_hex == hex::encode(empty.as_slice()))
-        .unwrap();
-    assert_eq!(record.direct_member_ids_hex.as_ref().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -535,4 +521,117 @@ async fn invite_all_fresh_devices_recovery_matches_original_leaf_before_cap() {
     assert_eq!(key_packages.len(), 1);
     assert_eq!(key_packages[0].bytes, replacement.bytes);
     assert!(storage.own_commit_intent(&commit_id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn invite_all_fresh_devices_normal_invite_excludes_active_sibling() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let peer = &accounts[0];
+    let mut active = client_on_app_relay_plane(&app, &peer.label).await;
+    let original = active
+        .runtime
+        .session_mut()
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let replenished = active
+        .runtime
+        .session_mut()
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let now = unix_now_seconds();
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .push(device_event(peer, original, 0, now - 2));
+    app.account_home().create_account("alice").unwrap();
+    let mut alice = client_on_app_relay_plane(&app, "alice").await;
+    let group = alice
+        .create_group("siblings", &[&peer.account_id_hex])
+        .await
+        .unwrap();
+    assert_eq!(alice.group_mls_state(&group).unwrap().member_count, 2);
+    let sibling = fresh_key_package_for_account(&app, peer, false).await;
+    let sibling_key = cgka_engine::key_package::key_package_metadata(&sibling)
+        .unwrap()
+        .signature_key_hex;
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    fetcher.events.lock().unwrap().extend([
+        device_event(peer, replenished, 0, now - 1),
+        device_event(peer, sibling, 1, now),
+    ]);
+    alice
+        .invite_members(&group, &[&peer.account_id_hex])
+        .await
+        .unwrap();
+    assert_eq!(alice.group_mls_state(&group).unwrap().member_count, 3);
+    let roster = alice.runtime.group_record(&group).unwrap();
+    assert!(
+        roster
+            .members
+            .iter()
+            .any(|member| hex::encode(&member.credential) == sibling_key)
+    );
+}
+
+#[tokio::test]
+async fn invite_all_fresh_devices_multi_author_fetch_bounds_prolific_account() {
+    use crate::key_package_records::MEMBER_CANDIDATE_VALIDATIONS;
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    let peer = &accounts[0];
+    let package = fresh_key_package_for_account(&app, peer, false).await;
+    fetcher.events.lock().unwrap().retain(|event| {
+        event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != peer.account_id_hex
+    });
+    // One author dominates the batch. Distinct replaceable slots ensure the
+    // excess cannot disappear merely through slot winner deduplication.
+    let now = unix_now_seconds();
+    for slot in 0..64 {
+        fetcher.events.lock().unwrap().push(device_event(
+            peer,
+            package.clone(),
+            slot,
+            now - slot as u64,
+        ));
+    }
+    MEMBER_CANDIDATE_VALIDATIONS.with(|count| count.set(0));
+    let members = accounts
+        .iter()
+        .map(|account| account.account_id_hex.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        app.resolve_member_key_packages(&members)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let work = MEMBER_CANDIDATE_VALIDATIONS.with(|count| count.get());
+    // Recovery validates the retained prefix, then final selection revalidates
+    // it: at most 32 prolific-author slots plus the other author, twice.
+    assert!(
+        work <= 2 * (32 + 1),
+        "prolific author exceeded bounded candidate validation: {work}"
+    );
+    for request in fetcher.requests.lock().unwrap().iter() {
+        for query in request
+            .queries
+            .iter()
+            .filter(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+        {
+            assert_eq!(query.authors.len(), 1);
+            assert_eq!(query.limit, 32);
+        }
+    }
 }

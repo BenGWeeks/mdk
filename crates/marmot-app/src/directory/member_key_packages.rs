@@ -882,28 +882,33 @@ impl MarmotApp {
                     .collect::<Vec<_>>()
             })
             .map(|(endpoints, indices)| {
-                let authors = indices
+                // A multi-author filter's limit is shared by all authors.
+                // Bound each author independently before merging recovery records.
+                let queries = indices
                     .iter()
-                    .map(|index| targets[*index].account_id_hex.clone())
+                    .map(|index| {
+                        DirectoryEventQuery::new(
+                            KIND_MARMOT_KEY_PACKAGE,
+                            vec![targets[*index].account_id_hex.clone()],
+                            KEY_PACKAGE_EVENTS_PER_AUTHOR,
+                        )
+                        .bounded_key_package_prefix()
+                    })
                     .collect::<Vec<_>>();
-                let query = DirectoryEventQuery::new(
-                    KIND_MARMOT_KEY_PACKAGE,
-                    authors.clone(),
-                    authors.len() * KEY_PACKAGE_EVENTS_PER_AUTHOR,
-                );
-                (indices, endpoints, query)
+                (indices, endpoints, queries)
             })
             .collect::<Vec<_>>();
         let app = self.clone();
         let requests = request_specs
             .into_iter()
-            .map(move |(indices, endpoints, query)| {
+            .map(move |(indices, endpoints, queries)| {
                 let app = app.clone();
                 async move {
                     let result = app
                         .relay_plane
-                        .fetch_directory_events(endpoints, vec![query])
+                        .fetch_directory_events_with_completion(endpoints, queries)
                         .await
+                        .map(|outcome| outcome.records)
                         .map_err(|error| {
                             AppError::RelayDirectory(format!("fetch key packages: {error}"))
                         });

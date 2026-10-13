@@ -809,18 +809,19 @@ impl AppGroupRecord {
         &mut self,
         members: &[cgka_traits::group::Member],
     ) {
-        // Direct chats contain two accounts, each of which may have several devices.
-        let mut ids: Vec<_> = members
-            .iter()
-            .map(|member| hex::encode(member.id.as_slice()))
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        self.presentation_member_ids_hex = (ids.len() == 2
+        self.presentation_member_ids_hex = (members.len() == 2
             && members
                 .iter()
-                .all(|member| member.id.as_slice().len() == 32))
-        .then_some(ids);
+                .all(|member| member.id.as_slice().len() == 32)
+            && members[0].id != members[1].id)
+            .then(|| {
+                let mut ids: Vec<_> = members
+                    .iter()
+                    .map(|member| hex::encode(member.id.as_slice()))
+                    .collect();
+                ids.sort_unstable();
+                ids
+            });
         self.direct_member_ids_hex = if self.profile.name.trim().is_empty() {
             self.presentation_member_ids_hex.clone()
         } else {

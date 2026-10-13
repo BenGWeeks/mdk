@@ -242,7 +242,7 @@ async fn member_selection_deduplicates_packages_in_batch_and_single_author_fallb
             .flat_map(|request| &request.queries)
             .filter(|query| query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.len() == 1)
             .count();
-        assert_eq!(single_author_lookups, 4);
+        assert_eq!(single_author_lookups, 6);
         assert_eq!(
             actual
                 .iter()
