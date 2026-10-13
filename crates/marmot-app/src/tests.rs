@@ -558,6 +558,7 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     failing_endpoint: std::sync::Mutex<Option<String>>,
     failing_endpoint_kind: std::sync::Mutex<Option<u64>>,
     fetch_gate_kind: std::sync::Mutex<Option<u64>>,
+    fetch_gate_author: std::sync::Mutex<Option<String>>,
     fetch_gate: std::sync::Mutex<
         Option<(
             std::sync::Arc<tokio::sync::Notify>,
@@ -603,11 +604,15 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         self.requests.lock().unwrap().push(request.clone());
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
-            if request
-                .queries
-                .iter()
-                .any(|query| Some(query.kind) == *self.fetch_gate_kind.lock().unwrap())
-            {
+            if request.queries.iter().any(|query| {
+                Some(query.kind) == *self.fetch_gate_kind.lock().unwrap()
+                    && self
+                        .fetch_gate_author
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_none_or(|author| query.authors.contains(author))
+            }) {
                 fetch_gate.take()
             } else {
                 None

@@ -796,12 +796,16 @@ MDK retains its installation signer. A client rotating its leaf signature key
 appears as a new device. Leaf indices can be reused after removal and are for
 display/debug only. There is no persisted device continuity state.
 
-`client_label` is advisory, cache-only KeyPackage `client` metadata matched by
-account and signature key: at most 64 Unicode characters, stripped of control
-and bidirectional override/isolate characters and trimmed. A missing label or
-cache mismatch returns `None`. The latest directory package per account and our
-durable signed publication supply enrichment; replacing a cached package can
-lose an older device's label. Projection performs no network reads or discovery.
+`client_label` is advisory KeyPackage `client` metadata matched by account and
+leaf signature key: at most 64 Unicode characters, stripped of control and
+bidirectional override/isolate characters and trimmed. A cache miss returns `None`.
+Member/roster reads and Exact sender enrichment schedule bounded background
+fetches from safe KeyPackage relays; reads perform no network I/O. Attempts,
+including misses and failures, have a one-hour cooldown per account worker.
+Validated labels survive directory slot replacement. Inviters also retain labels
+from every selected package. Completion emits `GroupStateUpdated` for demanded
+groups and `ProjectionUpdated` for existing Exact sender rows whose labels change,
+so hosts re-read their roster or refresh their timeline subscription.
 `joined_at` is always `None`; no join timestamp is inferred or backfilled. Treat
 labels and device identifiers as private presentation data, never log them.
 

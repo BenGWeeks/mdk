@@ -1547,6 +1547,8 @@ impl MarmotApp {
         &self,
         fetched: &FetchedKeyPackage,
     ) -> Result<(), AppError> {
+        // Label cache failures are optional and must not fail invitation resolution.
+        let _ = self.remember_device_client_label(fetched);
         let mut entry = self
             .directory_entry_for_account_id(&fetched.account_id_hex)?
             .unwrap_or_else(|| self.empty_directory_record(&fetched.account_id_hex));

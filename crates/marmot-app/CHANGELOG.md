@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Missing member-device and Exact sender labels now trigger bounded, coalesced background KeyPackage enrichment with a one-hour cooldown (including misses/failures). Validated client labels persist by account and signature key across directory slot replacement; inviters cache every selected package. Existing group-state and projection notifications refresh hosts without network I/O in authoritative reads.
+
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
 ### Added

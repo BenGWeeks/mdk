@@ -241,8 +241,18 @@ canonical admission, or projection unavailable); `Some(list)` is authoritative
 and always nonempty for an admitted member. Disbanded historical rosters have
 `None` after live MLS state is deleted. See the
 [binding contract](../marmot-uniffi/README.md#device-local-membership-events) for
-group-scoped IDs, active-installation flags, cache-only labels, and unknown join
+group-scoped IDs, active-installation flags, advisory labels, and unknown join
 times. KeyPackage inventory `is_this_installation` equals `local_state.is_local()`.
+
+Missing device labels schedule optional background kind-30443 discovery from safe
+KeyPackage relays. Authoritative roster and message reads perform no network I/O.
+Each account worker admits at most eight accounts per pass and twelve events per
+account, with one pass in flight and a one-hour re-fetch interval even for misses
+or failures. Validated, sanitized labels are retained by account and leaf signature
+key independently of replaceable directory slots; invitation selection also fills
+this cache. Completion uses `GroupStateUpdated` for demanded groups and
+`ProjectionUpdated` when existing Exact sender rows change. Hosts refresh their
+roster/timeline through the existing subscriptions; unavailable labels remain `None`.
 
 
 **Creating and inviting.** Group creation and invites take pubkeys at the action boundary. The app canonicalizes and

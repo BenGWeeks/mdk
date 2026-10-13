@@ -1,6 +1,8 @@
+mod device_labels;
 mod error;
 mod migrations;
 mod presentation;
+pub use device_labels::DeviceClientLabel;
 pub use presentation::{DirectoryPresentation, DirectoryPresentationChanges};
 
 use error::SharedSqliteResultExt;
@@ -1073,7 +1075,7 @@ mod migration_contract_tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row, (3, "0003_directory_presentation".into()));
+        assert_eq!(row, (4, "0004_device_client_labels".into()));
     }
 
     #[test]

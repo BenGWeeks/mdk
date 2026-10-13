@@ -71,6 +71,7 @@ mod audit_recovery;
 mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 mod delivery_spill;
+pub(crate) mod device_labels;
 pub(crate) mod epoch_stall;
 pub(crate) mod history_notices;
 mod invite_recovery;
@@ -735,6 +736,7 @@ pub(crate) struct MemberDevicePackageValidation {
 }
 
 pub struct AppClient {
+    pub(crate) device_label_enrichment: device_labels::DeviceLabelEnrichment,
     pub(crate) member_device_package_validations:
         std::sync::Mutex<HashMap<(String, bool), MemberDevicePackageValidation>>,
     #[cfg(test)]
@@ -2462,8 +2464,11 @@ impl AppClient {
             let account_id = hex::encode(leaf.member.as_slice());
             if let Some(member) = members.get_mut(&account_id) {
                 let label = labels
-                    .get(&(account_id, leaf.signature_key.clone()))
+                    .get(&(account_id.clone(), leaf.signature_key.clone()))
                     .cloned();
+                if label.is_none() {
+                    self.device_label_enrichment.schedule(&account_id, group_id);
+                }
                 member
                     .devices
                     .get_or_insert_with(Vec::new)
@@ -2495,6 +2500,9 @@ impl AppClient {
                 (cgka_traits::message::member_device_id(group_id, &key) == *device_id)
                     .then_some(label)
             });
+            if client_label.is_none() {
+                self.device_label_enrichment.schedule(sender, group_id);
+            }
         }
         device
     }
@@ -2544,6 +2552,8 @@ impl AppClient {
         }
         let mut labels = HashMap::new();
         let mut failed_advisory_reads = 0usize;
+        let mut unavailable_accounts = HashSet::new();
+        let mut label_created_at = HashMap::new();
         match self.app.member_device_key_packages(&account_ids) {
             Ok(packages) => {
                 for (account_id, package) in packages {
@@ -2567,7 +2577,9 @@ impl AppClient {
                             ),
                         )?;
                         if metadata.credential_identity_hex == account_id {
-                            labels.insert((account_id, metadata.signature_key), label);
+                            let key = (account_id.clone(), metadata.signature_key);
+                            label_created_at.insert(key.clone(), package.created_at);
+                            labels.insert(key, label);
                         } else {
                             return Err(AppError::InvalidKeyPackageEvent(
                                 "advisory identity mismatch".into(),
@@ -2575,7 +2587,39 @@ impl AppClient {
                         }
                         Ok(())
                     })();
-                    failed_advisory_reads += usize::from(result.is_err());
+                    if result.is_err() {
+                        unavailable_accounts.insert(account_id);
+                        failed_advisory_reads += 1;
+                    }
+                }
+            }
+            Err(_) => {
+                unavailable_accounts.extend(account_ids.iter().cloned());
+                failed_advisory_reads += 1;
+            }
+        }
+        match self.app.shared_storage().and_then(|storage| {
+            storage
+                .device_client_labels(&account_ids)
+                .map_err(AppError::from)
+        }) {
+            Ok(cached) => {
+                for row in cached {
+                    // Preserve 4a's failure -> None contract for corrupt advisory rows.
+                    if unavailable_accounts.contains(&row.account_id_hex) {
+                        continue;
+                    }
+                    if let Some(label) =
+                        crate::key_package_records::sanitize_client_label(&row.client_label)
+                    {
+                        let key = (row.account_id_hex, row.signature_key);
+                        if label_created_at
+                            .get(&key)
+                            .is_none_or(|at| row.created_at >= *at)
+                        {
+                            labels.insert(key, label);
+                        }
+                    }
                 }
             }
             Err(_) => failed_advisory_reads += 1,

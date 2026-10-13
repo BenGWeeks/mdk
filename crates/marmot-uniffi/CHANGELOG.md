@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Missing member-device and Exact sender client labels are filled asynchronously from validated KeyPackages. Existing group-state and projection notifications refresh hosts; reads remain local and labels remain optional.
+
 - `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
 
 ### Added
@@ -15,7 +17,7 @@
   are authoritative and nonempty for admitted members.
 
 - Member list/detail and `group_roster` records expose optional canonical device arrays with
-  group-scoped IDs, leaf indices, cache-only client labels, unknown join times,
+  group-scoped IDs, leaf indices, advisory client labels, unknown join times,
   and active-installation flags. Inventory rows expose `is_this_installation`
   from durable local ownership. No runtime methods or device continuity storage
   are added. Regenerate bindings/headers and use the matching native library;

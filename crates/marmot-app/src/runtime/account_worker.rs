@@ -907,6 +907,14 @@ fn handle_startup_sync_command(
 /// Relay-only startup Welcome work. Dropping the worker aborts the task so no
 /// detached publication can outlive relay-plane/account shutdown; the exact
 /// durable artifact remains retryable on the next open.
+/// Cancelling or shutting down the account worker cancels optional directory I/O.
+struct DeviceLabelTask(JoinHandle<Vec<crate::client::device_labels::FetchedLabel>>);
+impl Drop for DeviceLabelTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 struct WelcomeRecoveryTask {
     handle: JoinHandle<CompletedWelcomeDeliveryRecovery>,
     message_ids: Vec<MessageId>,
@@ -1787,7 +1795,20 @@ async fn run_app_runtime_account_worker(
     let mut yield_to_convergence = false;
     let mut local_submission_service_owed = false;
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
+    let device_label_enrichment = client.device_label_enrichment.clone();
+    let device_label_wake = device_label_enrichment.wake.clone();
+    let mut device_label_task: Option<DeviceLabelTask> = None;
     'worker: loop {
+        // Reopening transport/session retains this worker's demand and cooldowns.
+        client.device_label_enrichment = device_label_enrichment.clone();
+        if device_label_task.is_none() {
+            let accounts = client.device_label_enrichment.begin();
+            if !accounts.is_empty() {
+                device_label_task = Some(DeviceLabelTask(tokio::spawn(
+                    client.app.clone().run_device_label_pass(accounts),
+                )));
+            }
+        }
         // A pass whose network wait ended admits its owned batch a few events
         // per turn. The select below then serves commands and live input
         // before the next turn.
@@ -1906,6 +1927,14 @@ async fn run_app_runtime_account_worker(
                     client.finish_audit_recording();
                 }
                 break 'worker;
+            }
+            _ = device_label_wake.notified(), if device_label_task.is_none() => {}
+            completed = async { (&mut device_label_task.as_mut().expect("label task exists").0).await }, if device_label_task.is_some() => {
+                device_label_task = None;
+                for group in client.finish_device_label_pass(completed.unwrap_or_default()) {
+                    publish_app_runtime_group_state_updated(&events, &account_id_hex, &account_label, &group);
+                }
+                publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
             }
             completed = async {
                 comparison_recovery

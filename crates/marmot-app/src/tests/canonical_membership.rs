@@ -2309,3 +2309,397 @@ async fn member_device_labels_reuse_validation_until_package_changes() {
         "unchanged rejected packages must not be revalidated"
     );
 }
+
+/// A receiver learns Alice's leaf through Welcome, without observing her publication.
+#[tokio::test]
+async fn welcome_device_labels_enrich_member_and_existing_exact_sender() {
+    let inviter_dir = tempfile::tempdir().unwrap();
+    let receiver_dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(inviter_dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let secret = home
+        .load_signing_keys("bob")
+        .unwrap()
+        .secret_key()
+        .to_secret_hex();
+    AccountHome::open(receiver_dir.path())
+        .import_account("bob", &secret)
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let mut inviter = MarmotApp::with_relay_and_config(
+        inviter_dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig {
+            key_package_client_name: Some("Lightning Piggy".into()),
+            ..MarmotAppConfig::default()
+        }
+        .with_dev_settlement_quiescence_ms(0),
+    )
+    .with_test_relay_client(relay.clone());
+    let inviter_fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
+    inviter.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        relay.clone(),
+        inviter_fetcher.clone(),
+        false,
+    );
+    let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
+    let mut receiver = app_at(&receiver_dir, relay.clone());
+    receiver.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        relay.clone(),
+        fetcher.clone(),
+        false,
+    );
+    remember_test_member_inbox(&inviter, &bob_account.account_id_hex, "wss://relay.example");
+    let mut bob = receiver.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    bob.sync().await.unwrap();
+    let mut alice = inviter.client("alice").await.unwrap();
+    alice.publish_key_package().await.unwrap();
+    let alice_event = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == alice_account.account_id_hex
+        })
+        .unwrap()
+        .clone();
+    *inviter_fetcher.events.lock().unwrap() = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .cloned()
+        .collect();
+    let mut bob_routes = AccountRelayListStatus::empty();
+    bob_routes.nip65.relays = vec!["wss://relay.example".into()];
+    bob_routes.inbox.relays = vec!["wss://relay.example".into()];
+    inviter
+        .remember_directory_relay_lists(&bob_account.account_id_hex, &bob_routes)
+        .unwrap();
+    let group = alice
+        .create_group("Welcome label", &[&bob_account.account_id_hex])
+        .await
+        .unwrap();
+    // The inviter already selected Bob's validated package and retains its label.
+    let inviter_bob = alice
+        .members(&group)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.member_id_hex == bob_account.account_id_hex)
+        .unwrap();
+    assert_eq!(
+        inviter_bob.devices.unwrap()[0].client_label.as_deref(),
+        Some("Test Client")
+    );
+    let mut cursor = 0;
+    deliver_new(&mut bob, &relay, &mut cursor).await;
+    bob.sync().await.unwrap();
+    bob.accept_group_invite(&group).unwrap();
+    alice.send(&group, b"label arrives later").await.unwrap();
+    deliver_new(&mut bob, &relay, &mut cursor).await;
+    bob.sync().await.unwrap();
+    let before = bob
+        .members(&group)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.member_id_hex == alice_account.account_id_hex)
+        .unwrap();
+    assert!(before.devices.as_ref().unwrap()[0].client_label.is_none());
+    let raw_before = receiver
+        .messages("bob")
+        .unwrap()
+        .into_iter()
+        .find(|m| m.plaintext == "label arrives later")
+        .unwrap();
+    assert!(matches!(
+        raw_before.sender_device,
+        crate::SenderDevice::Exact {
+            client_label: None,
+            ..
+        }
+    ));
+    fetcher.requests.lock().unwrap().clear();
+    let mut routes = AccountRelayListStatus::empty();
+    routes.nip65.relays = vec![
+        "wss://relay.nostr.band".into(),
+        "wss://192.168.1.1".into(),
+        "wss://relay.example".into(),
+    ];
+    receiver
+        .remember_directory_relay_lists(&alice_account.account_id_hex, &routes)
+        .unwrap();
+    *fetcher.events.lock().unwrap() = vec![alice_event];
+    // Exercise the actual worker: blocked optional I/O cannot block roster reads.
+    drop(bob);
+    fetcher.requests.lock().unwrap().clear();
+    let (entered, release) = fetcher.hold_fetches();
+    *fetcher.fetch_gate_author.lock().unwrap() = Some(alice_account.account_id_hex.clone());
+    let runtime = crate::MarmotAppRuntime::new(receiver.clone());
+    let mut notifications = runtime.subscribe();
+    runtime.start().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("missing labels schedule a background fetch");
+    for _ in 0..20 {
+        let rows =
+            tokio::time::timeout(Duration::from_secs(2), runtime.group_members("bob", &group))
+                .await
+                .expect("optional I/O must not block roster reads")
+                .unwrap();
+        let member = rows
+            .iter()
+            .find(|m| m.member_id_hex == alice_account.account_id_hex)
+            .unwrap();
+        assert!(member.devices.as_ref().unwrap()[0].client_label.is_none());
+    }
+    release.notify_one();
+    let mut notified_group = false;
+    let mut notified_timeline = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !notified_group || !notified_timeline {
+            match notifications.recv().await.unwrap() {
+                crate::MarmotAppEvent::GroupStateUpdated { group_id, .. } => notified_group |= group_id == group,
+                crate::MarmotAppEvent::ProjectionUpdated(update) => notified_timeline |= update.update.timeline_messages.iter().any(|m| matches!(&m.sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Lightning Piggy")),
+                _ => {}
+            }
+        }
+    }).await.expect("roster and timeline hosts are notified");
+    let after = runtime
+        .group_members("bob", &group)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.member_id_hex == alice_account.account_id_hex)
+        .unwrap();
+    assert_eq!(
+        after.devices.as_ref().unwrap()[0].client_label.as_deref(),
+        Some("Lightning Piggy")
+    );
+    let raw_after = receiver
+        .messages("bob")
+        .unwrap()
+        .into_iter()
+        .find(|m| m.message_id_hex == raw_before.message_id_hex)
+        .unwrap();
+    let expected = crate::SenderDevice::Exact {
+        device_id: after.devices.as_ref().unwrap()[0].device_id.clone(),
+        leaf_index: after.devices.as_ref().unwrap()[0].leaf_index,
+        client_label: Some("Lightning Piggy".into()),
+        is_this_installation: false,
+    };
+    assert_eq!(raw_after.sender_device, expected);
+    let timeline = receiver
+        .timeline_message(
+            "bob",
+            &hex::encode(group.as_slice()),
+            &raw_after.message_id_hex,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(timeline.sender_device, expected);
+    runtime.shutdown().await;
+    assert_eq!(
+        fetcher
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|request| &request.queries)
+            .filter(|query| query.kind == KIND_MARMOT_KEY_PACKAGE
+                && query.authors.contains(&alice_account.account_id_hex))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn device_label_fetch_failure_leaves_none_and_skips_retired_and_unsafe_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
+    fetcher.fail_all_fetches();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let mut app = app_at(&dir, relay.clone());
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        relay,
+        fetcher.clone(),
+        false,
+    );
+    let mut routes = AccountRelayListStatus::empty();
+    routes.nip65.relays = vec![
+        "wss://relay.nostr.band".into(),
+        "wss://192.168.1.1".into(),
+        "wss://healthy.example".into(),
+    ];
+    app.remember_directory_relay_lists(&account.account_id_hex, &routes)
+        .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group = GroupId::new([1, 2, 3]);
+    let device = crate::SenderDevice::Exact {
+        device_id: "leaf".into(),
+        leaf_index: 0,
+        client_label: None,
+        is_this_installation: false,
+    };
+    for _ in 0..20 {
+        assert_eq!(
+            client.enrich_sender_device(&group, &account.account_id_hex, device.clone()),
+            device
+        );
+    }
+    assert!(fetcher.requests.lock().unwrap().is_empty());
+    let accounts = client.device_label_enrichment.begin();
+    assert_eq!(accounts, vec![account.account_id_hex.clone()]);
+    let fetched = app.clone().run_device_label_pass(accounts).await;
+    assert!(client.finish_device_label_pass(fetched).is_empty());
+    assert_eq!(
+        client.enrich_sender_device(&group, &account.account_id_hex, device.clone()),
+        device
+    );
+    assert!(
+        client.device_label_enrichment.begin().is_empty(),
+        "failures receive cooldown"
+    );
+    let requests = fetcher.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "coalesced demand makes one failed fetch");
+    assert!(requests.iter().all(
+        |request| request.endpoints == vec![TransportEndpoint("wss://healthy.example".into())]
+    ));
+    assert!(
+        requests
+            .iter()
+            .flat_map(|request| &request.queries)
+            .all(|query| query.limit == crate::client::device_labels::DEVICE_LABEL_EVENT_LIMIT)
+    );
+}
+
+#[tokio::test]
+async fn inviter_device_label_cache_retains_every_selected_leaf_after_slot_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
+    let mut keys = Vec::new();
+    for (created_at, label) in [(10, "Lightning Piggy\n"), (11, "White Noise")] {
+        let package = fresh_key_package_for_account(&app, &account, false).await;
+        let metadata = cgka_engine::key_package::key_package_metadata(&package).unwrap();
+        keys.push(metadata.signature_key);
+        let selected = FetchedKeyPackage {
+            account_id_hex: account.account_id_hex.clone(),
+            key_package: package,
+            client_label: Some(label.into()),
+            key_package_id: "same-slot".into(),
+            key_package_ref_hex: metadata.key_package_ref_hex,
+            key_package_event_id: "42".repeat(32),
+            created_at,
+            source_relays: vec!["wss://relay.example".into()],
+            relay_lists: AccountRelayListStatus::empty(),
+        };
+        // The common validated-package acceptance seam used by create and invite.
+        app.remember_directory_key_package(&selected).unwrap();
+    }
+    assert_ne!(keys[0], keys[1]);
+    let client = app.client("alice").await.unwrap();
+    let group = GroupId::new([1]);
+    for (key, label) in keys.iter().zip(["Lightning Piggy", "White Noise"]) {
+        let result = client.enrich_sender_device(
+            &group,
+            &account.account_id_hex,
+            crate::SenderDevice::Exact {
+                device_id: cgka_traits::message::member_device_id(&group, key),
+                leaf_index: 0,
+                client_label: None,
+                is_this_installation: false,
+            },
+        );
+        assert!(
+            matches!(result, crate::SenderDevice::Exact { client_label: Some(ref actual), .. } if actual == label)
+        );
+    }
+}
+
+#[tokio::test]
+async fn device_label_fetch_validates_signatures_freshness_and_local_event_bound() {
+    use nostr_sdk::prelude::UnsignedEvent;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
+    let mut app = app_at(&dir, relay.clone());
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        relay.clone(),
+        fetcher.clone(),
+        false,
+    );
+    let mut client = app.client("alice").await.unwrap();
+    client.publish_key_package().await.unwrap();
+    let event = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
+    let mut routes = AccountRelayListStatus::empty();
+    routes.nip65.relays = vec!["wss://relay.example".into()];
+    app.remember_directory_relay_lists(&account.account_id_hex, &routes)
+        .unwrap();
+    let mut tampered = event.clone();
+    tampered
+        .tags
+        .push(vec!["client".into(), "Forged label".into()]);
+    let mut future = event.clone();
+    future.created_at += 24 * 3600;
+    future.id = future.computed_id();
+    let keys = home.load_signing_keys("alice").unwrap();
+    let signed = transport_nostr_peeler::MarmotNostrSigner::sign_event(
+        &keys,
+        UnsignedEvent::from_json(serde_json::to_string(&future).unwrap()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let future = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+    assert!(future.to_verified_nostr_event().is_ok());
+    *fetcher.events.lock().unwrap() = vec![tampered, future];
+    assert!(
+        app.clone()
+            .run_device_label_pass(vec![account.account_id_hex.clone()])
+            .await
+            .is_empty()
+    );
+    let mut events = Vec::new();
+    for index in 0..20 {
+        let mut slot = event.clone();
+        slot.tags
+            .iter_mut()
+            .find(|tag| tag.first().is_some_and(|t| t == "d"))
+            .unwrap()[1] = format!("label-slot-{index}");
+        slot.id = slot.computed_id();
+        let signed = transport_nostr_peeler::MarmotNostrSigner::sign_event(
+            &keys,
+            UnsignedEvent::from_json(serde_json::to_string(&slot).unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+        events.push(NostrTransportEvent::from_nostr_event(&signed).unwrap());
+    }
+    *fetcher.events.lock().unwrap() = events;
+    // The scripted fetcher intentionally ignores the wire limit.
+    assert_eq!(
+        app.run_device_label_pass(vec![account.account_id_hex])
+            .await
+            .len(),
+        crate::client::device_labels::DEVICE_LABEL_EVENT_LIMIT
+    );
+}

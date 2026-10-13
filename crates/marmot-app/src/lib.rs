@@ -1992,6 +1992,7 @@ impl MarmotApp {
         let recovery_loss_imports = open.recovery_loss_imports;
         let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
         let mut client = AppClient {
+            device_label_enrichment: client::device_labels::DeviceLabelEnrichment::default(),
             member_device_package_validations: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             member_device_validation_count: std::sync::atomic::AtomicUsize::new(0),

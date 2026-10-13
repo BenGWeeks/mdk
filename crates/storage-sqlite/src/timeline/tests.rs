@@ -4554,3 +4554,93 @@ fn sender_device_legacy_upgrade_requires_compatible_source_epoch() {
         }
     }
 }
+
+#[test]
+fn sender_device_label_refresh_preserves_attribution_and_updates_raw_and_timeline() {
+    use cgka_traits::message::SenderDevice;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut exact = chat("exact-label", "alice", 10, "hello");
+    exact.sender_device = SenderDevice::Exact {
+        device_id: "leaf".into(),
+        leaf_index: 7,
+        client_label: None,
+        is_this_installation: false,
+    };
+    store.record_app_event(&exact).unwrap();
+    let mut uncertain = chat("uncertain-label", "alice", 11, "uncertain");
+    uncertain.sender_device = SenderDevice::OneOf { device_count: 2 };
+    store.record_app_event(&uncertain).unwrap();
+    let mut other = chat("other-label", "bob", 12, "other");
+    other.sender_device = exact.sender_device.clone();
+    store.record_app_event(&other).unwrap();
+    assert!(
+        store
+            .enrich_sender_device_label(&exact.group_id_hex, "alice", "wrong-leaf", "Piggy")
+            .unwrap()
+            .is_none()
+    );
+    store.lock().unwrap().execute_batch("CREATE TRIGGER reject_label BEFORE UPDATE ON message_timeline BEGIN SELECT RAISE(ABORT, 'test rollback'); END").unwrap();
+    assert!(
+        store
+            .enrich_sender_device_label(&exact.group_id_hex, "alice", "leaf", "Piggy")
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .app_message(&exact.group_id_hex, "exact-label")
+            .unwrap()
+            .unwrap()
+            .sender_device,
+        exact.sender_device
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_label")
+        .unwrap();
+    let update = store
+        .enrich_sender_device_label(&exact.group_id_hex, "alice", "leaf", "Piggy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(update.messages.len(), 1);
+    let expected = SenderDevice::Exact {
+        device_id: "leaf".into(),
+        leaf_index: 7,
+        client_label: Some("Piggy".into()),
+        is_this_installation: false,
+    };
+    assert_eq!(update.messages[0].sender_device, expected);
+    let raw = store
+        .app_message(&exact.group_id_hex, "exact-label")
+        .unwrap()
+        .unwrap();
+    assert_eq!(raw.sender_device, expected);
+    let source: Option<String> = store.lock().unwrap().query_row(
+        "SELECT source_message_id_hex FROM app_events WHERE group_id_hex=?1 AND message_id_hex=?2",
+        params![exact.group_id_hex, exact.message_id_hex], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(source, exact.source_message_id_hex);
+    assert_eq!(raw.source_epoch, exact.source_epoch);
+    assert_eq!(
+        store
+            .app_message(&exact.group_id_hex, "uncertain-label")
+            .unwrap()
+            .unwrap()
+            .sender_device,
+        uncertain.sender_device
+    );
+    assert_eq!(
+        store
+            .app_message(&exact.group_id_hex, "other-label")
+            .unwrap()
+            .unwrap()
+            .sender_device,
+        other.sender_device
+    );
+    assert!(
+        store
+            .enrich_sender_device_label(&exact.group_id_hex, "alice", "leaf", "Piggy")
+            .unwrap()
+            .is_none()
+    );
+}
