@@ -563,6 +563,152 @@ async fn admin_sibling_selfremove_preserves_surviving_app_device_after_reopen() 
     sibling_selfremove_through_author_command(false, true).await;
 }
 
+/// Pending retries must reach engine cancellation before push-token cleanup.
+#[tokio::test]
+async fn forbidden_admin_sibling_leave_retry_with_push_registration() {
+    for reopen_before_retry in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let alice_account = home.create_account("alice").unwrap();
+        let bob_account = home.create_account("bob").unwrap();
+        let secret = home
+            .load_signing_keys("alice")
+            .unwrap()
+            .secret_key()
+            .to_secret_hex();
+        AccountHome::open(sibling_dir.path())
+            .import_account("alice", &secret)
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = app_at(&dir, relay.clone());
+        let sibling_app = app_at(&sibling_dir, relay.clone());
+        remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+        remember_test_member_inbox(&app, &alice_account.account_id_hex, "wss://relay.example");
+        let mut bob = app.client("bob").await.unwrap();
+        bob.publish_key_package().await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        let group = alice
+            .create_group("concurrent admin leaves", &[&bob_account.account_id_hex])
+            .await
+            .unwrap();
+        let mut bob_cursor = 0;
+        deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+        bob.sync().await.unwrap();
+        bob.accept_group_invite(&group).unwrap();
+        let mut sibling = sibling_app.client("alice").await.unwrap();
+        let mut sibling_cursor = relay.published_events.lock().unwrap().len();
+        let kp = published_key_package(&mut sibling, &relay).await;
+        let effects = alice
+            .runtime
+            .send(SendIntent::Invite {
+                group_id: group.clone(),
+                key_packages: vec![kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        alice
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+        deliver_new(&mut sibling, &relay, &mut sibling_cursor).await;
+        sibling.sync().await.unwrap();
+        sibling.accept_group_invite(&group).unwrap();
+        deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+        bob.sync().await.unwrap();
+        bob.retry_group_convergence(&group).await.unwrap();
+        sibling_app.set_native_push_enabled("alice", true).unwrap();
+        sibling
+            .upsert_and_share_push_registration(
+                PushPlatform::Fcm,
+                "surviving-token",
+                &nostr::prelude::Keys::generate().public_key().to_hex(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Both requests are authored against the same roster, before delivery.
+        alice.leave_group(&group).await.unwrap();
+        sibling.leave_group(&group).await.unwrap();
+        deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+        bob.sync().await.unwrap();
+        let delay = bob
+            .runtime
+            .scheduled_self_remove_auto_commit_delay_ms(&group)
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(delay + 1)).await;
+        bob.retry_group_convergence(&group).await.unwrap();
+        deliver_new(&mut sibling, &relay, &mut sibling_cursor).await;
+        sibling.sync().await.unwrap();
+        sibling.retry_group_convergence(&group).await.unwrap();
+        assert!(!sibling.runtime.group_record(&group).unwrap().removed);
+        assert_eq!(sibling.runtime.members(&group).unwrap().len(), 2);
+        assert!(sibling.runtime.session().leave_in_progress(&group).unwrap());
+        assert!(sibling_app.push_registration("alice").unwrap().is_some());
+        if reopen_before_retry {
+            drop(sibling);
+            sibling = sibling_app.client("alice").await.unwrap();
+        }
+        let refused = sibling.leave_group(&group).await.unwrap_err();
+        assert!(
+            matches!(
+                refused.as_engine_error(),
+                Some(cgka_traits::EngineError::AdminCannotSelfRemove { .. })
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            sibling_app
+                .pending_leave_requests("alice")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            sibling_app
+                .pending_push_registration_removals("alice")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(can_send(&sibling, &group));
+        sibling
+            .send(&group, b"usable before restart")
+            .await
+            .unwrap();
+        sibling
+            .promote_admin(&group, &bob_account.account_id_hex)
+            .await
+            .unwrap();
+        sibling
+            .demote_admin(&group, &bob_account.account_id_hex)
+            .await
+            .unwrap();
+        if !reopen_before_retry {
+            sibling.disband_group(&group).await.unwrap();
+        }
+        drop(sibling);
+        let reopened_app = app_at(&sibling_dir, relay.clone());
+        let mut sibling = reopened_app.client("alice").await.unwrap();
+        assert!(
+            reopened_app
+                .pending_leave_requests("alice")
+                .unwrap()
+                .is_empty()
+        );
+        if reopen_before_retry {
+            assert!(can_send(&sibling, &group));
+            sibling.send(&group, b"usable after restart").await.unwrap();
+            sibling
+                .promote_admin(&group, &bob_account.account_id_hex)
+                .await
+                .unwrap();
+            sibling.disband_group(&group).await.unwrap();
+        }
+    }
+}
+
 async fn sibling_selfremove_through_author_command(profile_command: bool, admin: bool) {
     let dir = tempfile::tempdir().unwrap();
     let sibling_dir = tempfile::tempdir().unwrap();
