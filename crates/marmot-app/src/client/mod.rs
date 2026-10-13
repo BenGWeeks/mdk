@@ -2549,129 +2549,16 @@ impl AppClient {
             .ok_or_else(|| AppError::InvalidKeyPackageEvent("invalid advisory KeyPackage".into()))
     }
 
-    /// Read each requested account cache once; never discover devices here.
-    /// Optional enrichment cannot change the outcome of authoritative roster reads.
+    /// Roster and sender enrichment share the same ordered local sources.
     fn member_device_labels(
         &self,
         account_ids: impl IntoIterator<Item = String>,
-        keys: Option<&[(String, Vec<u8>)]>,
+        _keys: Option<&[(String, Vec<u8>)]>,
     ) -> MemberDeviceLabels {
-        let account_ids = account_ids.into_iter().collect::<Vec<_>>();
-        if account_ids.is_empty() {
-            return HashMap::new();
-        }
-        let mut labels = HashMap::new();
-        let mut failed_advisory_reads = 0usize;
-        let mut unavailable_accounts = HashSet::new();
-        let mut label_created_at = HashMap::new();
-        match self.app.member_device_key_packages(&account_ids) {
-            Ok(packages) => {
-                for (account_id, package) in packages {
-                    let result = (|| -> Result<(), AppError> {
-                        let Some(package) = package? else {
-                            return Ok(());
-                        };
-                        let Some(label) = package
-                            .client_label
-                            .as_deref()
-                            .and_then(crate::key_package_records::sanitize_client_label)
-                        else {
-                            return Ok(());
-                        };
-                        let bytes = hex::decode(&package.key_package_hex)?;
-                        let metadata = self.member_device_package_metadata(
-                            &account_id,
-                            false,
-                            &KeyPackage::new(bytes).with_protocol_profile(
-                                cgka_traits::group::ProtocolProfile::Current,
-                            ),
-                        )?;
-                        if metadata.credential_identity_hex == account_id {
-                            let key = (account_id.clone(), metadata.signature_key);
-                            label_created_at.insert(key.clone(), package.created_at);
-                            labels.insert(key, label);
-                        } else {
-                            return Err(AppError::InvalidKeyPackageEvent(
-                                "advisory identity mismatch".into(),
-                            ));
-                        }
-                        Ok(())
-                    })();
-                    if result.is_err() {
-                        unavailable_accounts.insert(account_id);
-                        failed_advisory_reads += 1;
-                    }
-                }
-            }
-            Err(_) => {
-                unavailable_accounts.extend(account_ids.iter().cloned());
-                failed_advisory_reads += 1;
-            }
-        }
-        match self.app.shared_storage().and_then(|storage| {
-            match keys {
-                Some(keys) => keys
-                    .iter()
-                    .map(|(account, key)| storage.device_client_label(account, key))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(|rows| rows.into_iter().flatten().collect()),
-                None => storage.device_client_labels(&account_ids),
-            }
-            .map_err(AppError::from)
-        }) {
-            Ok(cached) => {
-                for row in cached {
-                    // Preserve 4a's failure -> None contract for corrupt advisory rows.
-                    if unavailable_accounts.contains(&row.account_id_hex) {
-                        continue;
-                    }
-                    if let Some(label) =
-                        crate::key_package_records::sanitize_client_label(&row.client_label)
-                    {
-                        let key = (row.account_id_hex, row.signature_key);
-                        if label_created_at
-                            .get(&key)
-                            .is_none_or(|at| row.created_at >= *at)
-                        {
-                            labels.insert(key, label);
-                        }
-                    }
-                }
-            }
-            Err(_) => failed_advisory_reads += 1,
-        }
-        // The durable signed publication survives replacement by a sibling.
-        // Reuse its validated metadata, including when also present in the directory.
-        let publication = (|| -> Result<(), AppError> {
-            let Some(artifact) = self
-                .runtime
-                .key_package_maintenance_status()?
-                .and_then(|state| state.authored_signed_event)
-            else {
-                return Ok(());
-            };
-            let event: transport_nostr_peeler::NostrTransportEvent =
-                serde_json::from_slice(&artifact.bytes)?;
-            let account_id = event.pubkey.clone();
-            let (fetched, metadata) =
-                crate::key_package_records::key_package_from_record_with_metadata(
-                    &crate::RelayEventRecord {
-                        event,
-                        endpoints: Vec::new(),
-                    },
-                    |package| self.member_device_package_metadata(&account_id, true, package),
-                )?;
-            if let Some(label) = fetched.client_label {
-                labels.insert((fetched.account_id_hex, metadata.signature_key), label);
-            }
-            Ok(())
-        })();
-        failed_advisory_reads += usize::from(publication.is_err());
-        if failed_advisory_reads > 0 {
-            tracing::warn!(target: "marmot_app::client", method = "member_device_labels",
-                failed_advisory_reads, "advisory device label enrichment unavailable");
-        }
-        labels
+        self.app
+            .resolve_device_labels(account_ids, |account, publication, package| {
+                self.member_device_package_metadata(account, publication, package)
+            })
     }
 
     pub fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {

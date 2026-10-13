@@ -1804,6 +1804,10 @@ async fn run_app_runtime_account_worker(
     'worker: loop {
         // Reopening transport/session retains this worker's demand and cooldowns.
         client.device_label_enrichment = device_label_enrichment.clone();
+        client
+            .app
+            .device_label_timeline_views
+            .register_worker(&client.state.label, &device_label_enrichment);
         if device_label_task.is_none() {
             let accounts = client.device_label_enrichment.begin();
             if !accounts.is_empty() {

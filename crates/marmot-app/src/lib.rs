@@ -478,6 +478,7 @@ type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone)]
 pub struct MarmotApp {
+    device_label_timeline_views: client::device_labels::TimelineLabelViews,
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     moderation_reports: Arc<moderation_reports::ModerationReportState>,
     pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
@@ -1638,6 +1639,7 @@ impl MarmotApp {
             relay_plane,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
+            device_label_timeline_views: Default::default(),
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
@@ -1732,6 +1734,7 @@ impl MarmotApp {
             relay_plane,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
+            device_label_timeline_views: Default::default(),
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
@@ -3221,6 +3224,7 @@ impl MarmotApp {
         query: AppMessageQuery,
     ) -> Result<Vec<AppMessageRecord>, AppError> {
         self.ensure_account_state(label)?;
+        let mut labels = client::device_labels::DeviceLabelResolver::new(self);
         Ok(self
             .account_storage(label)?
             .visible_app_messages(StoredAppMessageQuery {
@@ -3231,7 +3235,11 @@ impl MarmotApp {
             .into_iter()
             .map(|record| {
                 let mut message = app_message_record_from_stored(record);
-                self.enrich_message_device_label(&mut message);
+                labels.enrich(
+                    &message.group_id_hex,
+                    &message.sender,
+                    &mut message.sender_device,
+                );
                 message
             })
             .collect())
@@ -3289,9 +3297,12 @@ impl MarmotApp {
         .entered();
         self.ensure_account_state(label)?;
         let mut page = self.account_storage(label)?.message_timeline(query)?;
+        let mut labels = client::device_labels::DeviceLabelResolver::new(self);
         for message in &mut page.messages {
-            self.enrich_timeline_device_label(message);
+            labels.timeline(message);
         }
+        self.device_label_timeline_views
+            .schedule(label, &page.messages);
         Ok(page)
     }
 
@@ -3304,9 +3315,12 @@ impl MarmotApp {
         let mut page = self
             .account_storage(label)?
             .message_timeline_by_wall_clock(query)?;
+        let mut labels = client::device_labels::DeviceLabelResolver::new(self);
         for message in &mut page.messages {
-            self.enrich_timeline_device_label(message);
+            labels.timeline(message);
         }
+        self.device_label_timeline_views
+            .schedule(label, &page.messages);
         Ok(page)
     }
 
@@ -6814,12 +6828,13 @@ impl MarmotApp {
         label: &str,
         mut storage_update: TimelineProjectionUpdate,
     ) -> Result<AppProjectionUpdate, AppError> {
+        let mut labels = client::device_labels::DeviceLabelResolver::new(self);
         for message in &mut storage_update.messages {
-            self.enrich_timeline_device_label(message);
+            labels.timeline(message);
         }
         for change in &mut storage_update.changes {
             if let TimelineMessageChange::Upsert { message, .. } = change {
-                self.enrich_timeline_device_label(message);
+                labels.timeline(message);
             }
         }
         let changed_message_ids = storage_update

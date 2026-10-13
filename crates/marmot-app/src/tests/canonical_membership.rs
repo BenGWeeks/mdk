@@ -2926,6 +2926,7 @@ async fn device_labels_read_time_overrides_legacy_values_and_ignores_cache_error
         expected
     );
     // Cache resolution also applies to both copies carried in live updates.
+    crate::client::device_labels::LABEL_QUERY_COUNT.with(|c| c.set(0));
     let update = app
         .record_account_app_event(
             "alice",
@@ -2935,6 +2936,11 @@ async fn device_labels_read_time_overrides_legacy_values_and_ignores_cache_error
             },
         )
         .unwrap();
+    assert_eq!(
+        crate::client::device_labels::LABEL_QUERY_COUNT.with(|c| c.get()),
+        1,
+        "message and change copies share candidate queries"
+    );
     assert_eq!(update.timeline_messages[0].sender_device, expected);
     assert!(
         matches!(&update.timeline_changes[0], crate::TimelineMessageChange::Upsert { message, .. } if message.sender_device == expected)
@@ -2968,5 +2974,201 @@ async fn device_labels_read_time_overrides_legacy_values_and_ignores_cache_error
             .unwrap()
             .sender_device,
         expected
+    );
+}
+
+#[tokio::test]
+async fn device_labels_offline_upgrade_uses_publication_and_directory() {
+    let (dir, app, mut client, group, bob) = member_device_label_fixture().await;
+    client.publish_key_package().await.unwrap();
+    let own = app.account_home().account("alice").unwrap().account_id_hex;
+    let roster = client.members(&group).unwrap();
+    for member in &roster {
+        let device = &member.devices.as_ref().unwrap()[0];
+        app.record_account_app_event(
+            "alice",
+            &AppMessageProjection {
+                authority: None,
+                message_id_hex: member.member_id_hex.clone(),
+                source_message_id_hex: None,
+                direction: "received".into(),
+                group_id_hex: hex::encode(group.as_slice()),
+                sender: member.member_id_hex.clone(),
+                sender_device: crate::SenderDevice::Exact {
+                    device_id: device.device_id.clone(),
+                    leaf_index: device.leaf_index,
+                    client_label: None,
+                    is_this_installation: device.is_this_installation,
+                },
+                plaintext: "upgrade".into(),
+                kind: MARMOT_APP_EVENT_KIND_CHAT,
+                tags: Vec::new(),
+                source_epoch: Some(1),
+                retention: None,
+                recorded_at: Some(unix_now_seconds()),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+        )
+        .unwrap();
+    }
+    let cached = app
+        .shared_storage()
+        .unwrap()
+        .device_client_labels(&[own.clone(), bob.clone()])
+        .unwrap();
+    let conn = rusqlite::Connection::open(app.shared_storage_path()).unwrap();
+    conn.execute("DELETE FROM device_client_labels", [])
+        .unwrap();
+    // The own publication must work even when the directory slot is absent.
+    conn.execute(
+        "UPDATE directory_users SET key_package_json=NULL WHERE account_id_hex=?1",
+        [&own],
+    )
+    .unwrap();
+    for cache in app.directory_caches().unwrap() {
+        if let Some(mut entry) = cache.entry(&own).unwrap() {
+            entry.key_package = None;
+            cache.put_with_reason(&entry, "test").unwrap();
+        }
+    }
+    drop(conn);
+    drop(client);
+    app.close_storage().unwrap();
+    let reopened = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
+    let client = reopened.client("alice").await.unwrap();
+    assert!(
+        reopened
+            .shared_storage()
+            .unwrap()
+            .device_client_labels(&[own.clone(), bob.clone()])
+            .unwrap()
+            .is_empty()
+    );
+    for account in [own.clone(), bob] {
+        let members = client.members(&group).unwrap();
+        let member = members.iter().find(|m| m.member_id_hex == account).unwrap();
+        let expected = member.devices.as_ref().unwrap()[0].client_label.clone();
+        assert!(expected.is_some());
+        // Even a newer fallback row cannot override a higher-precedence source.
+        let row = cached
+            .iter()
+            .find(|row| row.account_id_hex == account)
+            .unwrap();
+        reopened
+            .shared_storage()
+            .unwrap()
+            .put_device_client_label(
+                &account,
+                &row.signature_key,
+                "Lower precedence",
+                row.created_at + 1,
+            )
+            .unwrap();
+        let message = reopened
+            .message_by_id("alice", &hex::encode(group.as_slice()), &account)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(message.sender_device, crate::SenderDevice::Exact { client_label, .. } if client_label == expected),
+            "offline sender and roster must agree"
+        );
+    }
+    // Cache churn cannot remove this installation's durable label.
+    for i in 0..=storage_sqlite::DEVICE_CLIENT_LABELS_PER_ACCOUNT {
+        reopened
+            .shared_storage()
+            .unwrap()
+            .put_device_client_label(&own, &[i as u8; 32], "Sibling", 100 + i as u64)
+            .unwrap();
+    }
+    let own_key = &cached
+        .iter()
+        .find(|row| row.account_id_hex == own)
+        .unwrap()
+        .signature_key;
+    assert!(
+        reopened
+            .shared_storage()
+            .unwrap()
+            .device_client_label(&own, own_key)
+            .unwrap()
+            .is_none()
+    );
+    let member = client
+        .members(&group)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.member_id_hex == own)
+        .unwrap();
+    let expected = member.devices.unwrap()[0].client_label.clone();
+    let message = reopened
+        .message_by_id("alice", &hex::encode(group.as_slice()), &own)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(message.sender_device, crate::SenderDevice::Exact { client_label, .. } if client_label == expected && client_label.is_some())
+    );
+}
+
+#[tokio::test]
+async fn device_labels_page_queries_are_bounded_by_distinct_senders() {
+    let (_dir, app, client, group, account) = member_device_label_fixture().await;
+    let device = client
+        .members(&group)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.member_id_hex == account)
+        .unwrap()
+        .devices
+        .unwrap()
+        .remove(0);
+    for i in 0..100 {
+        app.record_account_app_event(
+            "alice",
+            &AppMessageProjection {
+                authority: None,
+                message_id_hex: format!("batch-{i}"),
+                source_message_id_hex: None,
+                direction: "received".into(),
+                group_id_hex: hex::encode(group.as_slice()),
+                sender: account.clone(),
+                sender_device: crate::SenderDevice::Exact {
+                    device_id: device.device_id.clone(),
+                    leaf_index: device.leaf_index,
+                    client_label: None,
+                    is_this_installation: false,
+                },
+                plaintext: "batch".into(),
+                kind: MARMOT_APP_EVENT_KIND_CHAT,
+                tags: Vec::new(),
+                source_epoch: Some(1),
+                retention: None,
+                recorded_at: Some(unix_now_seconds()),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+        )
+        .unwrap();
+    }
+    crate::client::device_labels::LABEL_QUERY_COUNT.with(|c| c.set(0));
+    let page = app
+        .timeline_messages_with_query(
+            "alice",
+            crate::TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group.as_slice())),
+                pagination: crate::TimelinePagination {
+                    limit: Some(200),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(page.messages.len() >= 100);
+    let queries = crate::client::device_labels::LABEL_QUERY_COUNT.with(|c| c.get());
+    assert!(
+        queries <= 2,
+        "one candidate query per distinct sender, got {queries}"
     );
 }

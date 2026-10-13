@@ -180,6 +180,7 @@ struct SendCaptureState {
     generation: u64,
     pending: Option<CapturedConversation>,
     latest: Option<(ConversationWindowQuery, CapturedConversation)>,
+    displayed: Vec<crate::TimelineMessageRecord>,
 }
 impl SendCapture {
     fn new(group: GroupId, epoch: Vec<u8>, query: ConversationWindowQuery) -> Self {
@@ -191,6 +192,7 @@ impl SendCapture {
                 generation: 0,
                 pending: None,
                 latest: None,
+                displayed: Vec::new(),
             }),
             changed: watch::channel(()).0,
         }
@@ -330,6 +332,29 @@ pub(crate) fn publish_conversation_captures_from_session(
         }
     }
 }
+pub(crate) fn conversation_label_viewports(
+    client: &AppClient,
+    groups: &std::collections::HashSet<GroupId>,
+) -> Vec<(Weak<SendCapture>, Vec<crate::TimelineMessageRecord>)> {
+    client
+        .conversation_captures
+        .iter()
+        .filter_map(|weak| {
+            let observer = weak.upgrade()?;
+            if !groups.contains(&observer.group) {
+                return None;
+            }
+            let rows = observer
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .displayed
+                .clone();
+            Some((weak.clone(), rows))
+        })
+        .collect()
+}
+
 /// Only called with the live client. Frozen startup/recovery snapshots return
 /// NotReady at their dispatch sites instead of entering this path.
 pub(super) fn capture_conversation(
@@ -343,19 +368,24 @@ pub(super) fn capture_conversation(
         &client.app,
         &client.state.label,
         group,
-        query,
+        query.clone(),
         epoch,
     )?;
+    let mut labels = crate::client::device_labels::DeviceLabelResolver::new(&client.app);
     captured
         .account
         .page
-        .enrich_sender_device_labels(|group_hex, sender, device_id| {
-            hex::decode(group_hex).ok().and_then(|bytes| {
-                client
-                    .app
-                    .cached_sender_device_label(&GroupId::new(bytes), sender, device_id)
-            })
-        });
+        .enrich_sender_device_labels(|group, sender, device| labels.label(group, sender, device));
+    for observer in client
+        .conversation_captures
+        .iter()
+        .filter_map(Weak::upgrade)
+    {
+        let mut state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
+        if observer.group == *group && state.query == query {
+            state.displayed = captured.account.page.page().messages.clone();
+        }
+    }
     for message in &captured.account.page.page().messages {
         if let crate::SenderDevice::Exact {
             device_id,
@@ -791,17 +821,17 @@ impl Reader {
             let app = self.app.clone();
             let label = self.label.clone();
             let account_id = self.account_id.clone();
+            let send_capture = self.send_capture.clone();
             let presentation = blocking_app_task(move || {
                 if app.account_home().account(&label)?.account_id_hex != account_id {
                     return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
                 }
                 let mut account = captured.account;
+                let mut labels = crate::client::device_labels::DeviceLabelResolver::new(&app);
                 account
                     .page
-                    .enrich_sender_device_labels(|group_hex, sender, device_id| {
-                        hex::decode(group_hex).ok().and_then(|bytes| {
-                            app.cached_sender_device_label(&GroupId::new(bytes), sender, device_id)
-                        })
+                    .enrich_sender_device_labels(|group, sender, device| {
+                        labels.label(group, sender, device)
                     });
                 let state = if let Some(authority) = captured.authority {
                     let facts = authority.facts;
@@ -855,15 +885,22 @@ impl Reader {
                     state,
                     &account.page,
                 );
-                Ok(presentation.map(|presentation| ConversationWindowSnapshot {
-                    revision,
-                    page: account.page,
-                    presentation,
-                    read_state: account.read_state,
-                    draft: account.draft,
-                    pending_confirmation: account.pending_confirmation,
-                    anchor: account.anchor,
-                    anchors: account.anchors,
+                Ok(presentation.map(|presentation| {
+                    send_capture
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .displayed = account.page.page().messages.clone();
+                    ConversationWindowSnapshot {
+                        revision,
+                        page: account.page,
+                        presentation,
+                        read_state: account.read_state,
+                        draft: account.draft,
+                        pending_confirmation: account.pending_confirmation,
+                        anchor: account.anchor,
+                        anchors: account.anchors,
+                    }
                 }))
             })
             .await?;

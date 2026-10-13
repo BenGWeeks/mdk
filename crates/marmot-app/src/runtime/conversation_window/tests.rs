@@ -2427,3 +2427,142 @@ async fn hot_checkpoints_do_not_postpone_not_ready_retry() {
 async fn hot_checkpoints_do_not_postpone_normal_refresh() {
     assert_hot_checkpoints_do_not_postpone_refresh(false).await;
 }
+
+#[tokio::test]
+async fn device_labels_refresh_open_older_departed_device_window() {
+    let f = Fixture::new(80).await;
+    f.runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap()
+        .shutdown()
+        .await;
+    let mut client = f.app.client("alice").await.unwrap();
+    let sender = "bb".repeat(32);
+    let key = vec![77; 32];
+    let device_id = cgka_traits::message::member_device_id(&f.group, &key);
+    let old = StoredAppEvent {
+        group_id_hex: f.group_hex(),
+        message_id_hex: id(0),
+        source_message_id_hex: Some(id(10000)),
+        source_epoch: Some(1),
+        direction: "received".into(),
+        sender: sender.clone(),
+        sender_device: crate::SenderDevice::Exact {
+            device_id: device_id.clone(),
+            leaf_index: 9,
+            client_label: None,
+            is_this_installation: false,
+        },
+        plaintext: "old departed device".into(),
+        kind: 9,
+        tags: vec![],
+        recorded_at: 100,
+        received_at: 100,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    f.store.record_app_event(&old).unwrap();
+    let mut subscription = f
+        .runtime
+        .subscribe_timeline_messages(
+            "alice",
+            crate::TimelineMessageQuery {
+                group_id_hex: Some(f.group_hex()),
+                pagination: crate::TimelinePagination {
+                    before: Some(105),
+                    before_message_id: Some(id(5)),
+                    limit: Some(5),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        subscription
+            .take_snapshot()
+            .messages
+            .iter()
+            .any(|m| m.message_id_hex == id(0))
+    );
+    let tail_query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Latest,
+            limit: 5,
+        },
+        before_anchor: None,
+    };
+    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let tail = Arc::new(SendCapture::new(
+        f.group.clone(),
+        epoch.clone(),
+        tail_query.clone(),
+    ));
+    client.register_conversation_capture(Some(Arc::downgrade(&tail)));
+    capture_conversation(&mut client, &f.group, tail_query, &epoch).unwrap();
+    let query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Message(id(0)),
+            limit: 5,
+        },
+        before_anchor: None,
+    };
+    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let observer = Arc::new(SendCapture::new(
+        f.group.clone(),
+        epoch.clone(),
+        query.clone(),
+    ));
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    let page = capture_conversation(&mut client, &f.group, query, &epoch).unwrap();
+    assert!(
+        page.account
+            .page
+            .page()
+            .messages
+            .iter()
+            .any(|m| m.message_id_hex == id(0))
+    );
+    assert!(client.device_label_enrichment.begin().contains(&sender));
+    client.pending_projection_updates.clear();
+    client.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+        account: sender,
+        key,
+        label: "Departed".into(),
+        created_at: 1,
+    }]);
+    assert!(
+        tail.take().is_none(),
+        "an unchanged open viewport must not refresh"
+    );
+    for update in client.take_pending_projection_updates() {
+        f.runtime
+            .events
+            .send(MarmotAppEvent::ProjectionUpdated(
+                crate::RuntimeProjectionUpdate {
+                    account_id_hex: f.account.clone(),
+                    account_label: "alice".into(),
+                    update,
+                },
+            ))
+            .unwrap();
+    }
+    timeout(Duration::from_secs(5), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(subscription.take_snapshot().messages.iter().any(|m| m.message_id_hex == id(0) && matches!(&m.sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Departed")));
+    let updated = observer
+        .take()
+        .expect("the open historical viewport must receive a checkpoint");
+    let mut page = updated.account.page;
+    page.enrich_sender_device_labels(|_, sender, device| {
+        f.app.cached_sender_device_label(&f.group, sender, device)
+    });
+    assert!(page.page().messages.iter().any(|m| m.message_id_hex == id(0) && matches!(&m.sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Departed")));
+}

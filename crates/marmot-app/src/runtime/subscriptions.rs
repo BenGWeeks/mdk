@@ -486,12 +486,14 @@ impl RuntimeTimelineMessagesSubscription {
                 match blocking_app_task(move || {
                     let mut update = filter_projection_for_block_policy(&storage, *update)?;
                     if let Some(app) = app {
+                        let mut labels =
+                            crate::client::device_labels::DeviceLabelResolver::new(&app);
                         for message in &mut update.update.timeline_messages {
-                            app.enrich_timeline_device_label(message);
+                            labels.timeline(message);
                         }
                         for change in &mut update.update.timeline_changes {
                             if let TimelineMessageChange::Upsert { message, .. } = change {
-                                app.enrich_timeline_device_label(message);
+                                labels.timeline(message);
                             }
                         }
                     }
@@ -1221,6 +1223,10 @@ impl MarmotAppRuntime {
                 generation: 0,
             })),
         };
+        self.accounts
+            .app
+            .device_label_timeline_views
+            .register(&account.label, &window.inner);
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {

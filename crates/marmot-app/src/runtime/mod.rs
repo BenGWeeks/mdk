@@ -88,7 +88,9 @@ pub use conversation_window::{
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
-pub(crate) use conversation_window::{SendCapture, publish_conversation_captures_from_session};
+pub(crate) use conversation_window::{
+    SendCapture, conversation_label_viewports, publish_conversation_captures_from_session,
+};
 pub(crate) mod attachment_controls;
 pub(crate) mod attachment_permission;
 pub use attachment_controls::{
@@ -161,13 +163,13 @@ pub(crate) use agent_stream_watch::{
     broker_trust_for_candidate, latest_agent_stream_start, parse_quic_candidate,
     parse_quic_candidates,
 };
+pub(crate) use subscriptions::TimelineWindow;
 #[cfg(test)]
 pub(crate) use subscriptions::{
-    TIMELINE_WINDOW_LIMIT, TimelineQueryFn, TimelineSubscriptionSignal, TimelineWindow,
-    TimelineWindowEdge, apply_projection_to_window, chat_list_row_fingerprint,
-    merge_timeline_window_with_order, messages_recovery_query, received_message_update_from_record,
-    reconcile_chat_list_snapshot, recovery_row_is_pre_subscription, send_atomic_chat_list_snapshot,
-    send_chat_list_remove_update,
+    TIMELINE_WINDOW_LIMIT, TimelineQueryFn, TimelineSubscriptionSignal, TimelineWindowEdge,
+    apply_projection_to_window, chat_list_row_fingerprint, merge_timeline_window_with_order,
+    messages_recovery_query, received_message_update_from_record, reconcile_chat_list_snapshot,
+    recovery_row_is_pre_subscription, send_atomic_chat_list_snapshot, send_chat_list_remove_update,
 };
 // External items `runtime/tests.rs` reaches through `super::*` that the
 // orchestration core itself no longer references after the split.
