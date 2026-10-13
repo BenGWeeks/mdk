@@ -164,6 +164,7 @@ pub enum MarmotKitError {
     AccountCatchUp { details: String },
     #[error("local account is not an admin of group {group_id_hex}")]
     NotGroupAdmin { group_id_hex: String },
+    /// The last leaf of an admin account must self-demote before leaving.
     #[error("admin must self-demote before leaving group {group_id_hex}")]
     AdminCannotSelfRemove { group_id_hex: String },
     /// A leave is already in flight for this group. The durable request survives

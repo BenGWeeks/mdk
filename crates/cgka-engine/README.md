@@ -36,6 +36,10 @@ MIP-03 admin rules, and returns typed outcomes for every ingest path.
 It does **not** do transport (plug in a `TransportPeeler`), persistence beyond `StorageProvider` (pair with
 [`storage-sqlite`](../storage-sqlite/README.md); tests use its in-memory mode), CLI, FFI, or application logic.
 
+`SendIntent::Leave` removes only this installation's MLS leaf. Admin rights belong to the account:
+an admin device may leave while another canonical leaf of that account remains, preserving the admin set.
+The account's last leaf must first leave the admin set or the engine returns `AdminCannotSelfRemove`.
+
 ## KeyPackage validation before membership changes
 
 Create and Invite validate transported KeyPackages through OpenMLS and the Marmot identity/profile checks before

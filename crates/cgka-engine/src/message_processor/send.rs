@@ -747,15 +747,19 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
 
-        // member-departure.md:23-26 — an admin must leave the admin set before
-        // using SelfRemove. This is stricter than merely preserving a non-empty
-        // admin set: it prevents an admin identity from departing while still
-        // present in the prior epoch's admin policy.
+        // Admin rights belong to the account. Only its last canonical leaf
+        // must leave the admin set before using SelfRemove.
         let self_pubkey =
             crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
         let admins = crate::app_components::admins_of_group(&mls_group)?;
         let i_am_admin = admins.iter().any(|k| k == &self_pubkey);
-        if i_am_admin {
+        if i_am_admin
+            && !crate::app_components::account_has_other_leaf(
+                &mls_group,
+                mls_group.own_leaf_index(),
+                &self_pubkey,
+            )
+        {
             return Err(EngineError::AdminCannotSelfRemove {
                 group_id: group_id.clone(),
             });

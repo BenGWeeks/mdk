@@ -532,6 +532,7 @@ fn can_send(client: &AppClient, group: &GroupId) -> bool {
             .unwrap(),
         is_admin: facts.is_admin,
         admin_count: facts.admin_count,
+        self_has_sibling_leaf: facts.self_has_sibling_leaf,
         pending_confirmation: false,
         leave_request_pending: client.runtime.session().leave_in_progress(group).unwrap(),
         lifecycle: authority.lifecycle.into(),
@@ -547,17 +548,22 @@ fn can_send(client: &AppClient, group: &GroupId) -> bool {
 /// A real sibling SelfRemove must not terminate the surviving device's projection.
 #[tokio::test]
 async fn sibling_selfremove_preserves_surviving_app_device_after_reopen() {
-    sibling_selfremove_through_author_command(false).await;
+    sibling_selfremove_through_author_command(false, false).await;
 }
 
 /// A group command can confirm a retained sibling departure before its own
 /// profile update; the command must observe those native effects as well.
 #[tokio::test]
 async fn own_group_command_observes_retained_sibling_departure() {
-    sibling_selfremove_through_author_command(true).await;
+    sibling_selfremove_through_author_command(true, false).await;
 }
 
-async fn sibling_selfremove_through_author_command(profile_command: bool) {
+#[tokio::test]
+async fn admin_sibling_selfremove_preserves_surviving_app_device_after_reopen() {
+    sibling_selfremove_through_author_command(false, true).await;
+}
+
+async fn sibling_selfremove_through_author_command(profile_command: bool, admin: bool) {
     let dir = tempfile::tempdir().unwrap();
     let sibling_dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -611,6 +617,27 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
     deliver_new(&mut bob_client, &relay, &mut bob_cursor).await;
     bob_client.sync().await.unwrap();
     bob_client.retry_group_convergence(&group).await.unwrap();
+    if admin {
+        alice
+            .promote_admin(&group, &bob.account_id_hex)
+            .await
+            .unwrap();
+        deliver_new(&mut sibling, &relay, &mut sibling_cursor).await;
+        sibling.sync().await.unwrap();
+        sibling.retry_group_convergence(&group).await.unwrap();
+        deliver_new(&mut bob_client, &relay, &mut bob_cursor).await;
+        bob_client.sync().await.unwrap();
+        bob_client.retry_group_convergence(&group).await.unwrap();
+        assert!(
+            sibling
+                .runtime
+                .session()
+                .group_authority(&group)
+                .unwrap()
+                .facts
+                .is_admin
+        );
+    }
     let group_hex = hex::encode(group.as_slice());
     let surviving_leaf = bob_client.runtime.own_leaf_index(&group).unwrap();
     let departing_leaf = sibling.runtime.own_leaf_index(&group).unwrap();
@@ -861,6 +888,18 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
         .unwrap();
     assert!(client.pending_push_leaf_reconciliations.is_empty());
     assert!(can_send(&client, &group));
+    if admin {
+        assert!(
+            client
+                .runtime
+                .session()
+                .group_authority(&group)
+                .unwrap()
+                .facts
+                .is_admin,
+            "the surviving device retains the account's admin rights after reopen"
+        );
+    }
     assert!(
         !client
             .runtime

@@ -76,8 +76,8 @@ pub(crate) fn select_lowest_digest_per_leaf(
 ///    would reject it. Enforcing here gives a clean typed early exit
 ///    instead of an opaque MLS error.
 /// 3. Admin checks are partly enforced by send-time guards and partly here:
-///    if the leaver is the only admin, this policy observes instead of
-///    committing.
+///    if the leaver is the last leaf of an admin account, this policy
+///    observes instead of committing.
 ///
 /// Not enforced here:
 /// - **§151 remove-beats-self-remove**: a precedence rule when both a
@@ -119,9 +119,8 @@ pub(crate) fn decide_with_reason(
         };
     }
 
-    // (3) member-departure.md:23-26 — an admin must leave the admin set before
-    //     SelfRemove. Refuse to auto-commit any SelfRemove whose sender is
-    //     still an active admin in the prior epoch.
+    // (3) An admin account's last leaf must demote before SelfRemove.
+    // A sibling departure preserves the account and its admin rights.
     //
     // Fail-closed: if we cannot read the admin set or the leaver's
     // pubkey (e.g. malformed admin extension, non-32-byte credential),
@@ -145,6 +144,7 @@ pub(crate) fn decide_with_reason(
     };
     if let Some(leaver_pubkey) = leaver_pubkey
         && admins.iter().any(|admin| admin == &leaver_pubkey)
+        && !crate::app_components::account_has_other_leaf(mls_group, leaver_idx, &leaver_pubkey)
     {
         return AutoCommitDecisionReport {
             decision: AutoCommitDecision::Observe,

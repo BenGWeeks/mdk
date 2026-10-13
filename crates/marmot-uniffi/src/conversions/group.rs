@@ -314,7 +314,7 @@ pub struct GroupManagementStateFfi {
     pub is_last_admin: bool,
     pub can_invite: bool,
     /// Whether a Leave action would do anything: the local account is a member,
-    /// is not an admin, and has no leave already in flight.
+    /// is either non-admin or has another leaf of its account, and has no leave already in flight.
     ///
     /// When this is `false`, the reason is one of
     /// `requires_self_demote_before_leave` (demote first) or
@@ -322,7 +322,7 @@ pub struct GroupManagementStateFfi {
     /// `lifecycle_state` (ordinary group actions are unavailable) — or the
     /// account is not a member at all. Check those before reporting an error.
     pub can_leave: bool,
-    /// Whether an admin must self-demote before leaving. Disbanding and a
+    /// Whether the last leaf of an admin account must self-demote before leaving. Disbanding and a
     /// terminal lifecycle take precedence and keep this false.
     pub requires_self_demote_before_leave: bool,
     /// A leave is already in flight for this group; `Marmot::leave_group` would
@@ -512,6 +512,12 @@ pub(crate) fn group_management_state_ffi(
         },
         is_admin: self_member.is_some_and(|member| member.is_admin),
         admin_count,
+        self_has_sibling_leaf: details
+            .members
+            .iter()
+            .filter(|member| member.member_id_hex == my_account_id_hex)
+            .count()
+            > 1,
         pending_confirmation: details.group.pending_confirmation,
         leave_request_pending: details.group.leave_request_pending,
         lifecycle: match details.mls_state.lifecycle_state {

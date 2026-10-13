@@ -756,6 +756,119 @@ async fn sibling_device_membership_preserves_activity_targets() {
     }
 }
 
+/// Leaving removes one installation, while account-level administration survives.
+#[tokio::test]
+async fn admin_sibling_leaf_leave_preserves_admin_account() {
+    for (admin, sibling_committer) in [(true, true), (true, false), (false, false)] {
+        let device = |label: &[u8]| {
+            EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+                .identity(pad32(label))
+                .account_identity_proof_signer(proof_signer(label))
+                .feature_registry(selfremove_registry())
+                .peeler(Box::new(MockPeeler))
+                .build()
+                .unwrap()
+        };
+        let mut a1 = device(b"alice");
+        let mut a2 = device(b"alice");
+        let mut a3 = device(b"alice");
+        let mut bob = device(b"bob");
+        // The creator is admin: swap founding roles for the non-admin case.
+        let (creator, invitee) = if admin {
+            (&mut a1, &mut bob)
+        } else {
+            (&mut bob, &mut a1)
+        };
+        let kp = invitee.fresh_key_package().await.unwrap();
+        let (group_id, created) = creator
+            .create_group(CreateGroupRequest {
+                name: "admin siblings".into(),
+                description: String::new(),
+                members: vec![kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+            panic!("founding group")
+        };
+        invitee.join_welcome(welcomes.remove(0)).await.unwrap();
+        for index in 0..2 {
+            let sibling = if index == 0 { &mut a2 } else { &mut a3 };
+            let kp = sibling.fresh_key_package().await.unwrap();
+            let creator = if admin { &mut a1 } else { &mut bob };
+            let SendResult::GroupEvolution {
+                msg,
+                pending,
+                mut welcomes,
+            } = creator
+                .send(SendIntent::Invite {
+                    group_id: group_id.clone(),
+                    key_packages: vec![kp],
+                    initial_admins: vec![],
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("sibling invite")
+            };
+            creator.confirm_published(pending).await.unwrap();
+            sibling.join_welcome(welcomes.remove(0)).await.unwrap();
+            for peer in [&mut a1, &mut a2, &mut bob] {
+                peer.ingest(route_group_commit(msg.clone(), &group_id))
+                    .await
+                    .unwrap();
+                converge_buffered_commit(peer, &group_id);
+            }
+        }
+        let prior_admins = a1.admin_pubkeys(&group_id).unwrap();
+        assert_eq!(a1.members(&group_id).unwrap().len(), 4);
+        let SendResult::Proposal { msg } = a1
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("SelfRemove proposal")
+        };
+        let proposal = route_group_commit(msg, &group_id);
+        for peer in [&mut a2, &mut a3, &mut bob] {
+            peer.ingest(proposal.clone()).await.unwrap();
+        }
+        let committer = if sibling_committer { &mut a2 } else { &mut bob };
+        advance_selfremove_auto_commit(committer, &group_id).await;
+        let mut publications = committer.drain_auto_publish();
+        assert_eq!(
+            publications.len(),
+            1,
+            "remaining members accept admin sibling SelfRemove"
+        );
+        let publication = publications.remove(0);
+        committer
+            .confirm_published(publication.pending)
+            .await
+            .unwrap();
+        for peer in [&mut a1, &mut a2, &mut a3, &mut bob] {
+            peer.ingest(route_group_commit(publication.msg.clone(), &group_id))
+                .await
+                .unwrap();
+            converge_buffered_commit(peer, &group_id);
+        }
+        assert!(a1.group_record(&group_id).unwrap().removed);
+        for peer in [&a2, &a3, &bob] {
+            let members = peer.members(&group_id).unwrap();
+            assert_eq!(members.len(), 3);
+            assert_eq!(members.iter().filter(|m| m.id == a2.self_id()).count(), 2);
+            assert_eq!(members.iter().filter(|m| m.id == bob.self_id()).count(), 1);
+            assert_eq!(peer.admin_pubkeys(&group_id).unwrap(), prior_admins);
+            assert!(!peer.group_record(&group_id).unwrap().removed);
+        }
+    }
+}
+
 #[tokio::test]
 async fn invite_adds_third_member_and_advances_epoch() {
     let mut alice = build_client(b"alice");
