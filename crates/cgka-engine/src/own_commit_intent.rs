@@ -449,7 +449,29 @@ impl<S: StorageProvider> Engine<S> {
         };
         let group = self.stored_group_record(&record.group_id)?;
         let mut expected = Vec::new();
-        let mut consumed = std::collections::BTreeSet::new();
+        let retry = record.reinvite.as_ref().expect("active recovery");
+        let mut consumed = retry
+            .consumed_key_package_refs
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut assigned = retry
+            .assigned_signing_keys
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for queued in self
+            .storage
+            .list_queued_outbound_intents(&record.group_id)?
+        {
+            if let SendIntent::Invite { key_packages, .. } = queued.intent {
+                for package in key_packages {
+                    let metadata = crate::key_package::key_package_metadata(&package)?;
+                    consumed.insert(metadata.key_package_ref_hex);
+                    assigned.insert(metadata.signature_key_hex);
+                }
+            }
+        }
         for package in old {
             let metadata = crate::key_package::key_package_metadata(package)?;
             consumed.insert(metadata.key_package_ref_hex.clone());
@@ -460,6 +482,9 @@ impl<S: StorageProvider> Engine<S> {
                     .any(|member| hex::encode(&member.credential) == metadata.signature_key_hex)
             }) {
                 expected.push((package.clone(), metadata));
+            } else {
+                // A canonical leaf already discharged this obligation too.
+                assigned.insert(metadata.signature_key_hex);
             }
         }
         let report = |outcome, reason| SupersededIntentReport {
@@ -521,6 +546,7 @@ impl<S: StorageProvider> Engine<S> {
         for package in &key_packages {
             let metadata = crate::key_package::key_package_metadata(package)?;
             if consumed.contains(&metadata.key_package_ref_hex)
+                || assigned.contains(&metadata.signature_key_hex)
                 || !refs.insert(metadata.key_package_ref_hex.clone())
                 || !leaf_keys.insert(metadata.signature_key_hex.clone())
             {
@@ -557,7 +583,10 @@ impl<S: StorageProvider> Engine<S> {
             let Some(index) = matched else {
                 return Err(EngineError::InvalidWelcome);
             };
-            remaining.remove(index);
+            let (_, obligation) = remaining.remove(index);
+            assigned.insert(obligation.signature_key_hex);
+            assigned.insert(metadata.signature_key_hex.clone());
+            consumed.insert(metadata.key_package_ref_hex.clone());
         }
         if actual.is_empty() {
             return Err(EngineError::InvalidWelcome);
@@ -580,6 +609,10 @@ impl<S: StorageProvider> Engine<S> {
             intent,
             record.reissue_attempts.saturating_add(1),
         )?;
+        if let Some(retry) = &mut record.reinvite {
+            retry.consumed_key_package_refs = consumed.into_iter().collect();
+            retry.assigned_signing_keys = assigned.into_iter().collect();
+        }
         if !remaining.is_empty() {
             record.intent = SendIntent::Invite {
                 group_id: record.group_id.clone(),

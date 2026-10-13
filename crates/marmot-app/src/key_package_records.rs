@@ -324,10 +324,19 @@ pub(crate) struct ValidatedMemberKeyPackages {
     rejected_future: bool,
 }
 
+/// Recovery narrows discovery to outstanding leaves before the outbound cap.
+#[derive(Default)]
+pub(crate) struct MemberKeyPackageExclusions {
+    pub(crate) refs: BTreeSet<String>,
+    pub(crate) signing_keys: BTreeSet<String>,
+    pub(crate) obligations: Option<std::collections::BTreeMap<String, Vec<String>>>,
+}
+
 impl ValidatedMemberKeyPackages {
     pub(crate) fn select(
         &mut self,
         allows: impl Fn(&FetchedKeyPackage) -> bool,
+        exclusions: &MemberKeyPackageExclusions,
     ) -> Result<DirectorySelection<Vec<FetchedKeyPackage>>, AppError> {
         let now = crate::unix_now_seconds();
         let mut refs = BTreeSet::new();
@@ -335,7 +344,11 @@ impl ValidatedMemberKeyPackages {
         let mut eligible = self
             .candidates
             .iter()
-            .filter(|(fetched, _)| allows(fetched))
+            .filter(|(fetched, key)| {
+                allows(fetched)
+                    && !exclusions.refs.contains(&fetched.key_package_ref_hex)
+                    && !exclusions.signing_keys.contains(key)
+            })
             .filter(|(fetched, key)| {
                 if refs.contains(&fetched.key_package_ref_hex) || keys.contains(key) {
                     return false;
@@ -344,6 +357,35 @@ impl ValidatedMemberKeyPackages {
                 keys.insert(key.clone());
                 true
             })
+            .collect::<Vec<_>>();
+        if let Some(obligations) = &exclusions.obligations {
+            let mut remaining = obligations.clone();
+            let mut selected = BTreeSet::new();
+            // Stable signing keys win regardless of publication order. Only
+            // then may rotated keys consume unmatched account obligations.
+            for exact in [true, false] {
+                for (fetched, key) in &eligible {
+                    if selected.contains(&fetched.key_package_ref_hex) {
+                        continue;
+                    }
+                    let Some(keys) = remaining.get_mut(&fetched.account_id_hex) else {
+                        continue;
+                    };
+                    let index = if exact {
+                        keys.iter().position(|old| old == key)
+                    } else {
+                        (!keys.is_empty()).then_some(0)
+                    };
+                    if let Some(index) = index {
+                        keys.remove(index);
+                        selected.insert(fetched.key_package_ref_hex.clone());
+                    }
+                }
+            }
+            eligible.retain(|(fetched, _)| selected.contains(&fetched.key_package_ref_hex));
+        }
+        let mut eligible = eligible
+            .into_iter()
             .map(|(fetched, _)| fetched.clone())
             .collect::<Vec<_>>();
         let newest = eligible.first().cloned();
@@ -375,10 +417,10 @@ pub(crate) fn eligible_member_key_packages_from_records(
     records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-    excluded_refs: &BTreeSet<String>,
+    exclusions: &MemberKeyPackageExclusions,
 ) -> Result<DirectorySelection<Vec<FetchedKeyPackage>>, AppError> {
     validate_member_key_package_candidates(account, records, freshness, requirements)
-        .select(|candidate| !excluded_refs.contains(&candidate.key_package_ref_hex))
+        .select(|_| true, exclusions)
 }
 
 pub(crate) fn validate_member_key_package_candidates(

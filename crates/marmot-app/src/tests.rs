@@ -757,7 +757,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                     .filter(|r| seen.insert(r.event.id.clone()))
                     .take(query.limit)
                     .collect::<Vec<_>>();
-                complete &= matching.len() < query.limit;
+                complete &= query.accepts_limit() || matching.len() < query.limit;
                 for record in matching {
                     if let Some(existing) =
                         retained.iter_mut().find(|r| r.event.id == record.event.id)

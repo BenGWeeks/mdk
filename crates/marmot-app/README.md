@@ -262,11 +262,14 @@ not packages, and a direct chat contains two distinct accounts regardless of the
 Member discovery requests at most 32 events per author, keeps the existing author/concurrency bounds and
 50-second deadline, and supplements advertised outboxes with up to eight safe configured discovery endpoints
 that were not already searched. Successful White Noise results still allow discovery of other device slots.
-Every selected candidate requires completed deletion queries across searched routes: separate exact-event
+Normal create, invite and prewarm use deletion evidence from responding relays: separate exact-event
 and timestamp-scoped coordinate filters ask for verified same-author kind-5 deletions. Unrelated post deletions
 cannot fill their limits. A matching deletion rejects its candidate even when another route is incomplete;
-unknown coverage and the bounded 32-candidate proof budget remain retryable. Signed deletions never revive
-an older slot version.
+unavailable routes do not veto observed packages. Retired and unsafe routes are skipped before fetching.
+Superseded-invite recovery requires complete transport and deletion coverage, but may select from a deliberately
+bounded 32-publication prefix. It matches missing leaves before the ten-package cap, prioritizing exact signing
+keys, and retains unmatched obligations plus consumed refs and assigned signing keys across partial retries.
+Signed deletions never revive an older slot version; the 32-candidate proof budget remains bounded.
 
 Direct directory diagnostics retain their single-package client preference and existing cache fallback for
 future-record results; supplementary recovery checks its cached public event metadata. Incomplete recovery

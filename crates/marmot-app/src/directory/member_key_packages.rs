@@ -7,7 +7,7 @@
 //! evidence that a recipient still owns the private bundle. Unsupported batch
 //! queries fall back to bounded single-author relay requests.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cgka_engine::key_package::key_package_metadata;
@@ -21,8 +21,9 @@ use transport_nostr_adapter::{
 };
 
 use crate::key_package_records::{
-    MEMBER_KEY_PACKAGE_FRESHNESS_WINDOW, eligible_member_key_packages_from_records,
-    fresh_relay_list_status_from_records, merge_relay_list_status,
+    MEMBER_KEY_PACKAGE_FRESHNESS_WINDOW, MemberKeyPackageExclusions,
+    eligible_member_key_packages_from_records, fresh_relay_list_status_from_records,
+    merge_relay_list_status,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryFetchOutcome};
 use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp};
@@ -318,7 +319,7 @@ impl MarmotApp {
             member_refs,
             purpose,
             requirements,
-            &BTreeSet::new(),
+            &MemberKeyPackageExclusions::default(),
         )
         .await
     }
@@ -328,7 +329,7 @@ impl MarmotApp {
         member_refs: Vec<String>,
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-        excluded_refs: &BTreeSet<String>,
+        exclusions: &MemberKeyPackageExclusions,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::KeyPackage,
@@ -337,12 +338,7 @@ impl MarmotApp {
         );
         let result = match tokio::time::timeout(
             MEMBER_RESOLUTION_DEADLINE,
-            self.resolve_member_key_packages_inner(
-                &member_refs,
-                purpose,
-                requirements,
-                excluded_refs,
-            ),
+            self.resolve_member_key_packages_inner(&member_refs, purpose, requirements, exclusions),
         )
         .await
         {
@@ -367,7 +363,7 @@ impl MarmotApp {
         member_refs: &[String],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-        excluded_refs: &BTreeSet<String>,
+        exclusions: &MemberKeyPackageExclusions,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let directory_observation = self
             .product_analytics
@@ -463,7 +459,7 @@ impl MarmotApp {
             &key_package_unresolved,
             &mut outcomes,
             requirements,
-            excluded_refs,
+            exclusions,
         )
         .await;
 
@@ -847,7 +843,7 @@ impl MarmotApp {
         unresolved: &[usize],
         outcomes: &mut [Option<Result<Vec<FetchedKeyPackage>, AppError>>],
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-        excluded_refs: &BTreeSet<String>,
+        exclusions: &MemberKeyPackageExclusions,
     ) {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
@@ -934,7 +930,7 @@ impl MarmotApp {
                     .push(record);
             }
             // A batch prefix cannot establish every device slot. Always run
-            // bounded per-author discovery and deletion proof, even for White Noise.
+            // bounded per-author discovery and deletion evidence, even for White Noise.
             for index in indices {
                 fallback.push(index);
                 fallback_records.insert(
@@ -985,7 +981,8 @@ impl MarmotApp {
                             KIND_MARMOT_KEY_PACKAGE,
                             vec![target.account_id_hex.clone()],
                             KEY_PACKAGE_EVENTS_PER_AUTHOR,
-                        );
+                        )
+                        .bounded_key_package_prefix();
                         let result = async {
                             let (mut records, complete) = match app
                                 .relay_plane
@@ -1013,7 +1010,7 @@ impl MarmotApp {
                                         requirements,
                                         cached_target: None,
                                         all_devices: true,
-                                        excluded_refs,
+                                        exclusions,
                                     },
                                 )
                                 .await?;
@@ -1022,7 +1019,7 @@ impl MarmotApp {
                                 &records.records,
                                 records.freshness,
                                 requirements,
-                                excluded_refs,
+                                exclusions,
                             )?
                             .value;
                             if fetched.is_empty() {

@@ -26,7 +26,7 @@ async fn invite_all_fresh_devices_caps_newest_slots_and_deduplicates_refs() {
     let account = &accounts[0];
     let now = unix_now_seconds();
     let mut events = Vec::new();
-    for slot in 0..12 {
+    for slot in 0..31 {
         events.push(device_event(
             account,
             fresh_key_package_for_account(&app, account, false).await,
@@ -44,6 +44,7 @@ async fn invite_all_fresh_devices_caps_newest_slots_and_deduplicates_refs() {
         now,
     );
     events.push(duplicate);
+    assert_eq!(events.len(), 32, "exactly one saturated per-author prefix");
     let mut expected = events.clone();
     expected.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
     let mut refs = HashSet::new();
@@ -72,6 +73,25 @@ async fn invite_all_fresh_devices_caps_newest_slots_and_deduplicates_refs() {
             expected.iter().map(|e| e.id.clone()).collect::<Vec<_>>()
         );
     }
+    // Recovery accepts this deliberate 32-event prefix too, but still requires
+    // completed transport reads and deletion absence coverage.
+    let exclusions = crate::key_package_records::MemberKeyPackageExclusions {
+        obligations: Some(std::collections::BTreeMap::from([(
+            account.account_id_hex.clone(),
+            vec!["missing-leaf".into(); 10],
+        )])),
+        ..Default::default()
+    };
+    let recovered = app
+        .resolve_member_key_packages_with_exclusions(
+            vec![account.account_id_hex.clone()],
+            crate::directory::MemberResolutionPurpose::CommitFresh,
+            None,
+            &exclusions,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.key_packages.len(), 10);
 }
 
 #[tokio::test]
@@ -348,6 +368,23 @@ async fn staggered_device_recovery(partial: bool) {
             panic!("remaining invite");
         };
         assert_eq!(key_packages, &vec![old[1].clone()]);
+        // A's consumed original remains visible in an independent replaceable
+        // slot while its replacement is queued. It must never discharge B.
+        let mut retry = remaining.clone();
+        retry.reinvite.as_mut().unwrap().next_attempt_at_ms = 0;
+        storage.put_own_commit_intent(&retry).unwrap();
+        fetcher.events.lock().unwrap().push(device_event(
+            peer,
+            old[0].clone(),
+            99,
+            unix_now_seconds(),
+        ));
+        alice.recover_superseded_invites().await.unwrap();
+        assert_eq!(
+            storage.list_queued_outbound_intents(&group).unwrap().len(),
+            1
+        );
+        assert!(storage.own_commit_intent(&commit_id).unwrap().is_some());
         // Only B replenishes on the next attempt; A's new intent is already queued.
         let mut remaining = remaining;
         remaining.reinvite.as_mut().unwrap().next_attempt_at_ms = 0;
@@ -426,4 +463,76 @@ async fn invite_all_fresh_devices_deletion_proofs_validate_candidates_once_and_b
         work <= 20,
         "ten immutable candidates need one recovery validation plus final lifetime revalidation, got {work}"
     );
+}
+
+#[tokio::test]
+async fn invite_all_fresh_devices_recovery_matches_original_leaf_before_cap() {
+    use cgka_traits::storage::{
+        OutboundIntentStorage, OwnCommitBaseline, OwnCommitIntent, ReinviteRetry,
+    };
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let peer = &accounts[0];
+    app.account_home().create_account("alice").unwrap();
+    let mut alice = client_on_app_relay_plane(&app, "alice").await;
+    let group = alice.create_group("recovery", &[]).await.unwrap();
+    let mut device = client_on_app_relay_plane(&app, &peer.label).await;
+    let original = device
+        .runtime
+        .session_mut()
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let replacement = device
+        .runtime
+        .session_mut()
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let commit_id = MessageId::new(vec![0xea; 32]);
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .put_own_commit_intent(&OwnCommitIntent {
+            commit_id: commit_id.clone(),
+            group_id: group.clone(),
+            source_epoch: cgka_traits::EpochId(0),
+            intent: cgka_traits::engine::SendIntent::Invite {
+                group_id: group.clone(),
+                key_packages: vec![original],
+                initial_admins: vec![],
+            },
+            baseline: OwnCommitBaseline::None,
+            reinvite: Some(ReinviteRetry::default()),
+            reissue_attempts: 0,
+            created_at_ms: 0,
+        })
+        .unwrap();
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    let now = unix_now_seconds();
+    // New devices are newer than A and would fill the outbound cap first.
+    for slot in 0..11 {
+        let package = fresh_key_package_for_account(&app, peer, false).await;
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .push(device_event(peer, package, slot, now));
+    }
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .push(device_event(peer, replacement.clone(), 12, now - 1));
+    alice.recover_superseded_invites().await.unwrap();
+    let queued = storage.list_queued_outbound_intents(&group).unwrap();
+    assert_eq!(queued.len(), 1);
+    let cgka_traits::engine::SendIntent::Invite { key_packages, .. } = &queued[0].intent else {
+        panic!("invite");
+    };
+    assert_eq!(key_packages.len(), 1);
+    assert_eq!(key_packages[0].bytes, replacement.bytes);
+    assert!(storage.own_commit_intent(&commit_id).unwrap().is_none());
 }

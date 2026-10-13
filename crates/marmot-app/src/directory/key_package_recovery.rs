@@ -8,8 +8,9 @@ use nostr_sdk::prelude::RelayUrl;
 use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
 
 use crate::key_package_records::{
-    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, preferred_fresh_key_package_from_records,
-    validate_member_key_package_candidates, without_revoked_slot_winners,
+    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, MemberKeyPackageExclusions,
+    preferred_fresh_key_package_from_records, validate_member_key_package_candidates,
+    without_revoked_slot_winners,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord};
 use crate::{AppError, DirectoryFreshness, MarmotApp};
@@ -38,12 +39,13 @@ pub(super) struct KeyPackageRecoveryRequest<'a> {
     /// Public metadata only. Membership callers must never nominate a cache.
     pub(super) cached_target: Option<KeyPackageRecoveryTarget>,
     pub(super) all_devices: bool,
-    pub(super) excluded_refs: &'a BTreeSet<String>,
+    pub(super) exclusions: &'a MemberKeyPackageExclusions,
 }
 
 impl MarmotApp {
-    /// Member lookups always discover supplementary slots and prove deletion
-    /// coverage. Single-package diagnostics recover only after normal selection
+    /// Member lookups discover supplementary slots and reject observed deletions.
+    /// Superseded-invite recovery additionally requires complete coverage.
+    /// Single-package diagnostics recover only after normal selection
     /// fails. Neither path admits cached bytes as membership authority.
     pub(super) async fn recover_key_package_records(
         &self,
@@ -58,9 +60,10 @@ impl MarmotApp {
             requirements,
             cached_target,
             all_devices,
-            excluded_refs,
+            exclusions,
         } = request;
         let freshness = self.directory_freshness();
+        let strict_coverage = !all_devices || exclusions.obligations.is_some();
         if !all_devices
             && preferred_fresh_key_package_from_records(account, &observed, freshness, requirements)
                 .is_ok_and(|selection| selection.value.is_some())
@@ -94,16 +97,16 @@ impl MarmotApp {
             .collect::<Vec<_>>();
         let mut package_coverage = primary_complete;
         if !supplementary.is_empty() {
+            let query =
+                DirectoryEventQuery::new(KIND_MARMOT_KEY_PACKAGE, vec![account.to_owned()], 32);
+            let query = if all_devices {
+                query.bounded_key_package_prefix()
+            } else {
+                query
+            };
             match self
                 .relay_plane
-                .fetch_directory_events_with_completion(
-                    supplementary.clone(),
-                    vec![DirectoryEventQuery::new(
-                        KIND_MARMOT_KEY_PACKAGE,
-                        vec![account.to_owned()],
-                        32,
-                    )],
-                )
+                .fetch_directory_events_with_completion(supplementary.clone(), vec![query])
                 .await
             {
                 Ok(outcome) => {
@@ -135,10 +138,10 @@ impl MarmotApp {
                 let selection = validated
                     .as_mut()
                     .expect("all-device candidates validated")
-                    .select(|candidate| {
-                        allowed.contains(candidate.key_package_event_id.as_str())
-                            && !excluded_refs.contains(&candidate.key_package_ref_hex)
-                    })?;
+                    .select(
+                        |candidate| allowed.contains(candidate.key_package_event_id.as_str()),
+                        exclusions,
+                    )?;
                 (selection.value, selection.rejected_future)
             } else {
                 let selection = preferred_fresh_key_package_from_records(
@@ -171,7 +174,7 @@ impl MarmotApp {
                 targets.push(target.clone());
             }
             if targets.is_empty() {
-                if !package_coverage {
+                if !package_coverage && (strict_coverage || observed.is_empty()) {
                     return Err(recovery_incomplete());
                 }
                 return Ok(RecoveredKeyPackageRecords {
@@ -186,7 +189,8 @@ impl MarmotApp {
                 });
             }
             attempted.extend(targets.iter().map(|target| target.event_id.clone()));
-            if attempted.len() > RECOVERY_CANDIDATE_LIMIT || !package_coverage || routes.is_empty()
+            if attempted.len() > RECOVERY_CANDIDATE_LIMIT
+                || (strict_coverage && (!package_coverage || routes.is_empty()))
             {
                 return Err(recovery_incomplete());
             }
@@ -228,7 +232,7 @@ impl MarmotApp {
                     }
                 }
                 deletion_coverage &= batch_complete;
-                if batch_complete {
+                if batch_complete || !strict_coverage {
                     checked.extend(batch.iter().map(|target| target.event_id.clone()));
                 }
             }
@@ -240,10 +244,10 @@ impl MarmotApp {
                 // prove any unchecked survivors/replacement winners together.
                 continue;
             }
-            if !deletion_coverage {
+            if strict_coverage && !deletion_coverage {
                 return Err(recovery_incomplete());
             }
-            // No winner changed: the selected immutable candidates are proven.
+            // No winner changed: candidates satisfy this path's evidence policy.
             // Do not re-select the whole set just to discover it is unchanged.
             return Ok(RecoveredKeyPackageRecords {
                 freshness,

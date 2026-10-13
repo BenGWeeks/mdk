@@ -254,7 +254,7 @@ async fn member_selection_deduplicates_packages_in_batch_and_single_author_fallb
 }
 
 #[tokio::test]
-async fn failed_member_refetch_preserves_validation_errors_and_refuses_unproven_packages() {
+async fn failed_member_refetch_preserves_validation_errors_and_observed_packages() {
     for batch_case in ["valid", "absent", "malformed", "incompatible"] {
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
         app.account_home().create_account("inviter").unwrap();
@@ -269,7 +269,7 @@ async fn failed_member_refetch_preserves_validation_errors_and_refuses_unproven_
             .iter()
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
-        // Prewarm checks every candidate through per-author discovery and deletion proof.
+        // Prewarm checks every candidate through per-author discovery and deletion evidence.
         app.prewarm_group_member_key_packages(&refs).await.unwrap();
         assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
             request
@@ -327,11 +327,13 @@ async fn failed_member_refetch_preserves_validation_errors_and_refuses_unproven_
                     && query.authors == vec![account.account_id_hex.clone()]
             })
         }));
-        let error = result
-            .err()
-            .expect("incomplete single-author deletion coverage cannot authorize any candidate");
+        if batch_case == "valid" {
+            assert_eq!(result.unwrap().key_packages.len(), accounts.len());
+            continue;
+        }
+        let error = result.err().expect("unusable packages must fail selection");
         match batch_case {
-            "valid" | "absent" => assert!(matches!(error, AppError::RelayDirectory(_))),
+            "absent" => assert!(matches!(error, AppError::RelayDirectory(_))),
             "malformed" => assert!(matches!(error, AppError::InvalidKeyPackageEvent(_))),
             "incompatible" => assert!(matches!(
                 error,

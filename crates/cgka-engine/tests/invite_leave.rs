@@ -6279,7 +6279,7 @@ async fn multi_device_invite_recovery(partial: bool) {
             source_epoch: alice.epoch(&group).unwrap(),
             intent: SendIntent::Invite {
                 group_id: group.clone(),
-                key_packages: vec![first, third_old, fourth_old.clone()],
+                key_packages: vec![first, third_old.clone(), fourth_old.clone()],
                 initial_admins: vec![],
             },
             baseline: OwnCommitBaseline::None,
@@ -6315,6 +6315,32 @@ async fn multi_device_invite_recovery(partial: bool) {
             panic!("remaining invitation");
         };
         assert_eq!(key_packages, vec![fourth_old]);
+        // Persistence retains A's consumed ref independently of B's remaining leaf.
+        let retry = remaining.reinvite.as_ref().unwrap();
+        let original = cgka_engine::key_package::key_package_metadata(&third_old).unwrap();
+        assert!(
+            retry
+                .consumed_key_package_refs
+                .contains(&original.key_package_ref_hex)
+        );
+        assert!(
+            retry
+                .assigned_signing_keys
+                .contains(&original.signature_key_hex)
+        );
+        // Partial recovery must remember the original ref after removing A's
+        // obligation, and reject a new ref with A's already assigned leaf key.
+        for unavailable in [third_old, third.fresh_key_package().await.unwrap()] {
+            assert!(matches!(
+                alice.reissue_invite_with_key_packages(&commit_id, vec![unavailable]),
+                Err(cgka_traits::EngineError::InvalidWelcome)
+            ));
+            assert!(storage.own_commit_intent(&commit_id).unwrap().is_some());
+            assert_eq!(
+                storage.list_queued_outbound_intents(&group).unwrap().len(),
+                1
+            );
+        }
         alice
             .reissue_invite_with_key_packages(
                 &commit_id,

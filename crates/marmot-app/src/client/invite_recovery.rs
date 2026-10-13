@@ -261,20 +261,40 @@ impl AppClient {
                 Err(error) => return Err(error.into()),
             };
             let mut members = Vec::new();
-            let mut consumed_refs = std::collections::BTreeSet::new();
+            let retry = record.reinvite.as_ref().expect("pending recovery");
+            let mut exclusions = crate::key_package_records::MemberKeyPackageExclusions {
+                refs: retry.consumed_key_package_refs.iter().cloned().collect(),
+                signing_keys: retry.assigned_signing_keys.iter().cloned().collect(),
+                obligations: Some(Default::default()),
+            };
+            if let Some(group) = &group {
+                exclusions.signing_keys.extend(
+                    group
+                        .members
+                        .iter()
+                        .map(|member| hex::encode(&member.credential)),
+                );
+            }
             for package in key_packages {
                 let metadata = self
                     .runtime
                     .session()
                     .key_package_metadata(package)
                     .map_err(cgka_session::SessionError::from)?;
-                consumed_refs.insert(metadata.key_package_ref_hex.clone());
+                exclusions.refs.insert(metadata.key_package_ref_hex.clone());
                 if !group.as_ref().is_some_and(|group| {
                     group
                         .members
                         .iter()
                         .any(|member| hex::encode(&member.credential) == metadata.signature_key_hex)
                 }) {
+                    exclusions
+                        .obligations
+                        .as_mut()
+                        .expect("recovery obligations")
+                        .entry(metadata.credential_identity_hex.clone())
+                        .or_default()
+                        .push(metadata.signature_key_hex);
                     members.push(metadata.credential_identity_hex);
                 }
             }
@@ -292,57 +312,40 @@ impl AppClient {
                             .session()
                             .key_package_metadata(&package)
                             .map_err(cgka_session::SessionError::from)?;
-                        consumed_refs.insert(metadata.key_package_ref_hex);
+                        exclusions.refs.insert(metadata.key_package_ref_hex);
+                        exclusions.signing_keys.insert(metadata.signature_key_hex);
                     }
                 }
             }
-            let packages = if members.is_empty()
-                || group.as_ref().is_none_or(|group| group.is_terminal())
-            {
-                vec![]
-            } else {
-                let requirements = match self
-                    .runtime
-                    .session()
-                    .invite_key_package_requirements(&record.group_id)
-                {
-                    Ok(requirements) => requirements,
-                    Err(error @ cgka_traits::EngineError::Storage(_)) => {
-                        return Err(cgka_session::SessionError::from(error).into());
-                    }
-                    Err(_) => break,
-                };
-                match self
-                    .app
-                    .resolve_member_key_packages_with_exclusions(
-                        members,
-                        crate::directory::MemberResolutionPurpose::CommitFresh,
-                        Some(&requirements),
-                        &consumed_refs,
-                    )
-                    .await
-                {
-                    Ok(resolved) => {
-                        let mut packages = Vec::new();
-                        for package in resolved.key_packages {
-                            let metadata = self
-                                .runtime
-                                .session()
-                                .key_package_metadata(&package)
-                                .map_err(cgka_session::SessionError::from)?;
-                            if !group.as_ref().is_some_and(|group| {
-                                group.members.iter().any(|member| {
-                                    hex::encode(&member.credential) == metadata.signature_key_hex
-                                })
-                            }) {
-                                packages.push(package);
-                            }
+            let packages =
+                if members.is_empty() || group.as_ref().is_none_or(|group| group.is_terminal()) {
+                    vec![]
+                } else {
+                    let requirements = match self
+                        .runtime
+                        .session()
+                        .invite_key_package_requirements(&record.group_id)
+                    {
+                        Ok(requirements) => requirements,
+                        Err(error @ cgka_traits::EngineError::Storage(_)) => {
+                            return Err(cgka_session::SessionError::from(error).into());
                         }
-                        packages
+                        Err(_) => break,
+                    };
+                    match self
+                        .app
+                        .resolve_member_key_packages_with_exclusions(
+                            members,
+                            crate::directory::MemberResolutionPurpose::CommitFresh,
+                            Some(&requirements),
+                            &exclusions,
+                        )
+                        .await
+                    {
+                        Ok(resolved) => resolved.key_packages,
+                        Err(_) => break,
                     }
-                    Err(_) => break,
-                }
-            };
+                };
             match self
                 .runtime
                 .session_mut()
