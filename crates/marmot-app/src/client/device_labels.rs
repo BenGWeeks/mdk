@@ -19,8 +19,10 @@ const DEVICE_LABEL_MAX_TRACKED_ACCOUNTS: usize = 1024;
 const DEVICE_LABEL_MAX_GROUPS_PER_ACCOUNT: usize = 128;
 /// Bound demanded devices within each group.
 const DEVICE_LABEL_MAX_DEVICES_PER_GROUP: usize = 128;
-/// Default tail comparison supplements bounded, registered live viewports.
-const DEVICE_LABEL_RECENT_SENDERS: usize = 64;
+
+// Initial resolved labels for changed remote signature keys. Each worker retains
+// the first value until it drains; comparing current labels suppresses round trips.
+type LabelChanges = HashMap<(String, Vec<u8>), Option<String>>;
 
 type GroupDemand = HashMap<GroupId, HashSet<String>>;
 /// Bound the complete discovery + package fetch wait for each optional account.
@@ -37,6 +39,8 @@ struct Demand {
 pub(crate) struct DeviceLabelEnrichment {
     demand: Arc<Mutex<Demand>>,
     pub(crate) wake: Arc<tokio::sync::Notify>,
+    changes: Arc<Mutex<LabelChanges>>,
+    pub(crate) changed: Arc<tokio::sync::Notify>,
 }
 
 impl DeviceLabelEnrichment {
@@ -121,8 +125,23 @@ type LabelRefresh = std::sync::Weak<tokio::sync::Notify>;
 pub(crate) struct TimelineLabelViews {
     views: Arc<Mutex<Vec<(String, TimelineView, LabelRefresh)>>>,
     workers: Arc<Mutex<HashMap<String, DeviceLabelEnrichment>>>,
+    admission: Arc<Mutex<()>>,
 }
 impl TimelineLabelViews {
+    /// Runtime-wide, lossless coalescing mailbox: no broadcast lag can lose an eviction.
+    fn publish_changes(&self, changes: &LabelChanges) {
+        if changes.is_empty() {
+            return;
+        }
+        let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        for worker in workers.values() {
+            let mut pending = worker.changes.lock().unwrap_or_else(|e| e.into_inner());
+            for (key, before) in changes {
+                pending.entry(key.clone()).or_insert_with(|| before.clone());
+            }
+            worker.changed.notify_one();
+        }
+    }
     pub(crate) fn register_worker(&self, label: &str, worker: &DeviceLabelEnrichment) {
         let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
         if workers
@@ -490,12 +509,56 @@ impl MarmotApp {
         if metadata.credential_identity_hex != fetched.account_id_hex {
             return Ok(false);
         }
-        Ok(self.shared_storage()?.put_device_client_label(
+        self.admit_device_client_label(
             &fetched.account_id_hex,
             &metadata.signature_key,
             &label,
             fetched.created_at,
-        )?)
+        )
+    }
+
+    fn resolved_remote_labels(&self, account: &str) -> HashMap<(String, Vec<u8>), String> {
+        self.resolve_device_labels([account.to_owned()], |_, _, package| {
+            cgka_engine::key_package::key_package_metadata(package)
+                .map_err(|_| AppError::InvalidKeyPackageEvent("invalid advisory package".into()))
+        })
+    }
+
+    fn admit_device_client_label(
+        &self,
+        account: &str,
+        key: &[u8],
+        label: &str,
+        created_at: u64,
+    ) -> Result<bool, AppError> {
+        // Serialize the before/admission/after boundary across local workers.
+        let _guard = self
+            .device_label_timeline_views
+            .admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let storage = self.shared_storage()?;
+        let cached_labels = || -> Result<HashMap<(String, Vec<u8>), String>, AppError> {
+            Ok(storage
+                .device_client_labels(&[account.to_owned()])?
+                .into_iter()
+                .map(|row| ((row.account_id_hex, row.signature_key), row.client_label))
+                .collect())
+        };
+        let before_cache = cached_labels()?;
+        let before = self.resolved_remote_labels(account);
+        let changed = storage.put_device_client_label(account, key, label, created_at)?;
+        let after_cache = cached_labels()?;
+        // Publish every cache key change, even when a higher-precedence source
+        // masks it. Workers compare resolved labels and suppress unchanged views.
+        let changes = before_cache
+            .keys()
+            .chain(after_cache.keys())
+            .filter(|key| before_cache.get(*key) != after_cache.get(*key))
+            .map(|key| (key.clone(), before.get(key).cloned()))
+            .collect();
+        self.device_label_timeline_views.publish_changes(&changes);
+        Ok(changed)
     }
 
     async fn fetch_device_client_labels(
@@ -591,60 +654,10 @@ impl AppClient {
     /// Admit only demanded leaves and publish bounded, read-time display changes.
     pub(crate) fn finish_device_label_pass(&mut self, labels: Vec<FetchedLabel>) -> Vec<GroupId> {
         let demand = self.device_label_enrichment.finish();
-        let mut groups = demand
-            .values()
-            .flat_map(|groups| groups.keys().cloned())
-            .collect::<HashSet<_>>();
-        let demand_groups = groups.clone();
-        let conversation_views = crate::runtime::conversation_label_viewports(self);
-        let displayed = self
-            .app
+        // Register direct clients too; managed workers register at startup.
+        self.app
             .device_label_timeline_views
-            .messages(&self.state.label)
-            .into_iter()
-            .chain(
-                conversation_views
-                    .iter()
-                    .flat_map(|(_, rows)| rows.iter().cloned()),
-            )
-            .collect::<Vec<_>>();
-        // Admission can evict any cached key for an account, including keys in
-        // windows whose groups supplied no demand in this pass.
-        groups.extend(
-            displayed
-                .iter()
-                .filter_map(|row| hex::decode(&row.group_id_hex).ok().map(GroupId::new)),
-        );
-        let mut before = HashMap::new();
-        for group in groups {
-            let roster = self.members(&group).unwrap_or_default();
-            let mut messages = if demand_groups.contains(&group) {
-                self.app
-                    .timeline_messages_with_query(
-                        &self.state.label,
-                        crate::TimelineMessageQuery {
-                            group_id_hex: Some(hex::encode(group.as_slice())),
-                            pagination: crate::TimelinePagination {
-                                limit: Some(DEVICE_LABEL_RECENT_SENDERS),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        },
-                    )
-                    .map(|page| page.messages)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let group_hex = hex::encode(group.as_slice());
-            messages.extend(
-                displayed
-                    .iter()
-                    .filter(|m| m.group_id_hex == group_hex)
-                    .cloned(),
-            );
-            before.insert(group, (roster, messages));
-        }
+            .register_worker(&self.state.label, &self.device_label_enrichment);
         let mut failed_admissions = 0usize;
         for label in labels
             .into_iter()
@@ -665,64 +678,128 @@ impl AppClient {
             };
             if self
                 .app
-                .shared_storage()
-                .and_then(|storage| {
-                    storage
-                        .put_device_client_label(
-                            &label.account,
-                            &label.key,
-                            &sanitized,
-                            label.created_at,
-                        )
-                        .map_err(AppError::from)
-                })
+                .admit_device_client_label(&label.account, &label.key, &sanitized, label.created_at)
                 .is_err()
             {
                 failed_admissions += 1;
             }
         }
-        let mut changed_groups = Vec::new();
-        let mut labels = DeviceLabelResolver::new(&self.app);
-        for (group, (roster, messages)) in before {
-            let roster_changed = self.members(&group).is_ok_and(|after| after != roster);
-            let sender_changed = messages.iter().any(|message| {
-                let mut after = message.sender_device.clone();
-                labels.enrich(&message.group_id_hex, &message.sender, &mut after);
-                after != message.sender_device
-            });
-            if roster_changed || sender_changed {
-                changed_groups.push(group.clone());
-                let group_hex = hex::encode(group.as_slice());
-                let observers = conversation_views
-                    .iter()
-                    .filter(|(_, rows)| {
-                        rows.iter().any(|message| {
-                            if message.group_id_hex != group_hex {
-                                return false;
-                            }
-                            let mut after = message.sender_device.clone();
-                            labels.enrich(&message.group_id_hex, &message.sender, &mut after);
-                            after != message.sender_device
-                        })
-                    })
-                    .map(|(observer, _)| observer.clone())
-                    .collect::<Vec<_>>();
-                crate::runtime::publish_conversation_captures_from_session(
-                    &observers,
-                    self.runtime.session(),
-                    &self.app,
-                    &self.state.label,
-                    &group,
-                );
-            }
-        }
-        self.app
-            .device_label_timeline_views
-            .invalidate_changed(&self.state.label, &mut labels);
+        let changed_groups = self.refresh_device_label_changes();
 
         if failed_admissions > 0 {
             tracing::debug!(target: "marmot_app::device_labels", method = "finish_device_label_pass", failed_admissions, "optional label admission unavailable");
         }
+        changed_groups
+    }
+
+    /// Each local worker resolves its canonical rosters and its own loaded windows.
+    /// Cache changes carry signature keys and initial labels, never message copies.
+    pub(crate) fn refresh_device_label_changes(&mut self) -> Vec<GroupId> {
+        // Keep the drained baseline and all comparisons in one cache revision;
+        // another account's admission must not race this worker's publication.
+        let views = self.app.device_label_timeline_views.clone();
+        let _guard = views.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let changes = std::mem::take(
+            &mut *self
+                .device_label_enrichment
+                .changes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if changes.is_empty() {
+            return Vec::new();
+        }
+        let mut changed_groups = HashSet::new();
+        for record in &self.state.groups {
+            let Ok(bytes) = hex::decode(&record.group_id_hex) else {
+                continue;
+            };
+            let group = GroupId::new(bytes);
+            let Ok(membership) = self.runtime.session().canonical_group_membership(&group) else {
+                continue;
+            };
+            let relevant = membership.devices.iter().any(|leaf| {
+                changes.contains_key(&(
+                    hex::encode(leaf.member.as_slice()),
+                    leaf.signature_key.clone(),
+                ))
+            });
+            if !relevant {
+                continue;
+            }
+            if let Ok(roster) = self.members(&group) {
+                let changed = membership.devices.iter().any(|leaf| {
+                    let account = hex::encode(leaf.member.as_slice());
+                    let Some(before) = changes.get(&(account.clone(), leaf.signature_key.clone()))
+                    else {
+                        return false;
+                    };
+                    let device =
+                        cgka_traits::message::member_device_id(&group, &leaf.signature_key);
+                    roster
+                        .iter()
+                        .find(|m| m.member_id_hex == account)
+                        .and_then(|m| m.devices.as_ref())
+                        .and_then(|devices| devices.iter().find(|d| d.device_id == device))
+                        .is_some_and(|d| &d.client_label != before)
+                });
+                if changed {
+                    changed_groups.insert(group);
+                }
+            }
+        }
+        let conversation_views = crate::runtime::conversation_label_viewports(self);
+        let displayed = self
+            .app
+            .device_label_timeline_views
+            .messages(&self.state.label);
+        let mut resolver = DeviceLabelResolver::new(&self.app);
+        for message in displayed
+            .iter()
+            .chain(conversation_views.iter().flat_map(|(_, rows)| rows.iter()))
+        {
+            if !changes
+                .keys()
+                .any(|(account, _)| account == &message.sender)
+            {
+                continue;
+            }
+            let mut after = message.sender_device.clone();
+            resolver.enrich(&message.group_id_hex, &message.sender, &mut after);
+            if after != message.sender_device
+                && let Ok(bytes) = hex::decode(&message.group_id_hex)
+            {
+                changed_groups.insert(GroupId::new(bytes));
+            }
+        }
+        for group in &changed_groups {
+            let group_hex = hex::encode(group.as_slice());
+            let observers = conversation_views
+                .iter()
+                .filter(|(_, rows)| {
+                    rows.iter().any(|message| {
+                        if message.group_id_hex != group_hex {
+                            return false;
+                        }
+                        let mut after = message.sender_device.clone();
+                        resolver.enrich(&message.group_id_hex, &message.sender, &mut after);
+                        after != message.sender_device
+                    })
+                })
+                .map(|(observer, _)| observer.clone())
+                .collect::<Vec<_>>();
+            crate::runtime::publish_conversation_captures_from_session(
+                &observers,
+                self.runtime.session(),
+                &self.app,
+                &self.state.label,
+                group,
+            );
+        }
+        self.app
+            .device_label_timeline_views
+            .invalidate_changed(&self.state.label, &mut resolver);
+        let mut changed_groups = changed_groups.into_iter().collect::<Vec<_>>();
         changed_groups.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
         changed_groups
     }

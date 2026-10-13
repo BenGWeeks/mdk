@@ -2748,7 +2748,7 @@ async fn device_labels_eviction_refreshes_other_open_group() {
     cache
         .put_device_client_label(&sender, &key, "Evicted", 1)
         .unwrap();
-    for i in 0..15 {
+    for i in 0..storage_sqlite::DEVICE_CLIENT_LABELS_PER_ACCOUNT as u8 - 1 {
         cache
             .put_device_client_label(&sender, &[i; 32], "Sibling", 2 + u64::from(i))
             .unwrap();

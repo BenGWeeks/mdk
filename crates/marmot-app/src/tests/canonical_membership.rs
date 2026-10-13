@@ -3215,3 +3215,257 @@ async fn device_labels_page_queries_are_bounded_by_distinct_senders() {
         "one candidate query per distinct sender, got {queries}"
     );
 }
+
+#[tokio::test]
+async fn device_labels_eviction_refreshes_roster_without_timeline() {
+    device_labels_cross_account_roster_regression(false).await;
+}
+
+#[tokio::test]
+async fn device_labels_admission_and_eviction_refresh_both_local_rosters() {
+    device_labels_cross_account_roster_regression(true).await;
+}
+
+async fn device_labels_cross_account_roster_regression(two_accounts: bool) {
+    let (dir, app, mut alice, group, bob) = member_device_label_fixture().await;
+    let other_group = alice.create_group("roster only", &[&bob]).await.unwrap();
+    let mut carol = if two_accounts {
+        AccountHome::open(dir.path())
+            .create_account("carol")
+            .unwrap();
+        let mut client = app.client("carol").await.unwrap();
+        let group = client.create_group("Carol roster", &[&bob]).await.unwrap();
+        Some((client, group))
+    } else {
+        None
+    };
+    let cache = app.shared_storage().unwrap();
+    let key = cache
+        .device_client_labels(std::slice::from_ref(&bob))
+        .unwrap()
+        .remove(0)
+        .signature_key;
+    // Force the bounded table to be the resolver source, without changing MLS membership.
+    let conn = rusqlite::Connection::open(app.shared_storage_path()).unwrap();
+    conn.execute(
+        "UPDATE directory_users SET key_package_json=NULL WHERE account_id_hex=?1",
+        [&bob],
+    )
+    .unwrap();
+    for directory in app.directory_caches().unwrap() {
+        if let Some(mut entry) = directory.entry(&bob).unwrap() {
+            entry.key_package = None;
+            directory.put_with_reason(&entry, "test").unwrap();
+        }
+    }
+    drop(conn);
+    app.device_label_timeline_views
+        .register_worker("alice", &alice.device_label_enrichment);
+    if let Some((client, _)) = &carol {
+        app.device_label_timeline_views
+            .register_worker("carol", &client.device_label_enrichment);
+    }
+    assert!(
+        alice
+            .members(&other_group)
+            .unwrap()
+            .iter()
+            .find(|m| m.member_id_hex == bob)
+            .unwrap()
+            .devices
+            .as_ref()
+            .unwrap()[0]
+            .client_label
+            .is_some()
+    );
+    if let Some((client, group)) = &carol {
+        assert!(
+            client
+                .members(group)
+                .unwrap()
+                .iter()
+                .find(|m| m.member_id_hex == bob)
+                .unwrap()
+                .devices
+                .as_ref()
+                .unwrap()[0]
+                .client_label
+                .is_some()
+        );
+    }
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut windows = Vec::new();
+    if let Some((client, carol_group)) = &carol {
+        for (owner, window_group) in [(&alice, &other_group), (client, carol_group)] {
+            let device = owner
+                .members(window_group)
+                .unwrap()
+                .into_iter()
+                .find(|m| m.member_id_hex == bob)
+                .unwrap()
+                .devices
+                .unwrap()
+                .remove(0);
+            app.record_account_app_event(
+                &owner.state.label,
+                &AppMessageProjection {
+                    authority: None,
+                    message_id_hex: "shared-label-row".into(),
+                    source_message_id_hex: None,
+                    direction: "received".into(),
+                    group_id_hex: hex::encode(window_group.as_slice()),
+                    sender: bob.clone(),
+                    sender_device: crate::SenderDevice::Exact {
+                        device_id: device.device_id,
+                        leaf_index: device.leaf_index,
+                        client_label: None,
+                        is_this_installation: false,
+                    },
+                    plaintext: "shared label".into(),
+                    kind: MARMOT_APP_EVENT_KIND_CHAT,
+                    tags: vec![],
+                    source_epoch: Some(1),
+                    retention: None,
+                    recorded_at: Some(unix_now_seconds()),
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                },
+            )
+            .unwrap();
+            windows.push(
+                runtime
+                    .subscribe_timeline_messages(
+                        &owner.state.label,
+                        crate::TimelineMessageQuery {
+                            group_id_hex: Some(hex::encode(window_group.as_slice())),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+    }
+    // A demanded known leaf changes its label. Both workers must see the change.
+    alice.device_label_enrichment.schedule(
+        &bob,
+        &group,
+        &cgka_traits::message::member_device_id(&group, &key),
+    );
+    alice.device_label_enrichment.begin();
+    let changed =
+        alice.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+            account: bob.clone(),
+            key: key.clone(),
+            label: "Updated".into(),
+            created_at: u64::MAX / 2,
+        }]);
+    if two_accounts {
+        assert!(changed.contains(&group));
+    }
+    if let Some((client, group)) = &mut carol {
+        assert!(
+            client.finish_device_label_pass(vec![]).contains(group),
+            "other local account must refresh on admission"
+        );
+        assert!(
+            client.finish_device_label_pass(vec![]).is_empty(),
+            "drained change must not notify twice"
+        );
+    }
+    for window in &mut windows {
+        tokio::time::timeout(std::time::Duration::from_secs(5), window.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&window.take_snapshot().messages[0].sender_device, crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Updated")
+        );
+    }
+    // Reconfirmation changes recency but not either account's displayed labels.
+    alice.device_label_enrichment = Default::default();
+    app.device_label_timeline_views
+        .register_worker("alice", &alice.device_label_enrichment);
+    alice.device_label_enrichment.schedule(
+        &bob,
+        &group,
+        &cgka_traits::message::member_device_id(&group, &key),
+    );
+    alice.device_label_enrichment.begin();
+    assert!(
+        alice
+            .finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+                account: bob.clone(),
+                key: key.clone(),
+                label: "Updated".into(),
+                created_at: u64::MAX / 2
+            }])
+            .is_empty()
+    );
+    if let Some((client, _)) = &mut carol {
+        assert!(client.finish_device_label_pass(vec![]).is_empty());
+    }
+    for window in &mut windows {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), window.recv())
+                .await
+                .is_err(),
+            "unchanged labels must not refresh either account's window"
+        );
+    }
+    // Fill the cache so the next demanded admission evicts Bob's roster leaf.
+    for i in 0..storage_sqlite::DEVICE_CLIENT_LABELS_PER_ACCOUNT - 1 {
+        cache
+            .put_device_client_label(&bob, &[i as u8; 32], "Sibling", 2)
+            .unwrap();
+    }
+    // Reset only the discovery cooldown by using a fresh demand owner.
+    alice.device_label_enrichment = Default::default();
+    app.device_label_timeline_views
+        .register_worker("alice", &alice.device_label_enrichment);
+    let new_key = vec![254; 32];
+    alice.device_label_enrichment.schedule(
+        &bob,
+        &group,
+        &cgka_traits::message::member_device_id(&group, &new_key),
+    );
+    alice.device_label_enrichment.begin();
+    let changed =
+        alice.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+            account: bob.clone(),
+            key: new_key,
+            label: "New".into(),
+            created_at: 3,
+        }]);
+    assert!(cache.device_client_label(&bob, &key).unwrap().is_none());
+    assert!(
+        changed.contains(&other_group),
+        "roster-only group must refresh on eviction"
+    );
+    if let Some((client, group)) = &mut carol {
+        assert!(
+            client.finish_device_label_pass(vec![]).contains(group),
+            "other local account must refresh on eviction"
+        );
+        assert!(client.finish_device_label_pass(vec![]).is_empty());
+    }
+    for window in &mut windows {
+        tokio::time::timeout(std::time::Duration::from_secs(5), window.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &window.take_snapshot().messages[0].sender_device,
+            crate::SenderDevice::Exact {
+                client_label: None,
+                ..
+            }
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), window.recv())
+                .await
+                .is_err()
+        );
+    }
+    assert!(alice.finish_device_label_pass(vec![]).is_empty());
+}

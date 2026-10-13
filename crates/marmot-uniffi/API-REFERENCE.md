@@ -32,15 +32,18 @@ whose source-epoch signature key cannot be recovered. MDK never attributes a
 historical message using today's roster or a reused leaf index. Own sends flag
 this installation; sibling installations of the same account do not. Labels
 are advisory and sanitized, with `None` on a cache miss. Bounded background
-KeyPackage fetches cache demanded leaf labels asynchronously (at most 16 per account).
-Exact sender labels resolve at read time without rewriting message rows. A
-64-row tail comparison per demand-associated group detects changed roster/sender
-labels for `GroupStateUpdated` notifications. Separately, a bounded open-viewport re-read
-refreshes affected timeline subscriptions and conversation windows from storage,
-coalesced per window and bounded by loaded size/query limit. All loaded rows are
-compared, including older departed devices and evicted labels in groups that supplied
-no demand. Displayed rows are never republished as message upserts; hosts receive
-current edits and deletions with read-time labels. Unchanged windows receive no
+KeyPackage fetches cache demanded leaf labels asynchronously (at most 64 per remote account).
+Exact sender labels resolve at read time without rewriting message rows.
+Cache admissions publish installation-wide, coalesced remote-account signature-key
+changes to every local account worker, including evictions. Each worker compares
+resolved labels for canonical members in its own groups and emits `GroupStateUpdated`
+only for changed roster or loaded sender labels, including roster-only groups with
+no timeline subscription. A bounded open-viewport re-read refreshes affected timeline
+subscriptions and conversation windows from storage, coalesced per worker/group and
+window and bounded by loaded size/query limit. All loaded rows are compared, including
+older departed devices and groups that supplied no demand.
+Displayed rows are never republished as message upserts; hosts receive
+current edits and deletions with read-time labels. Unchanged rosters and windows receive no
 label refresh. Provenance is
 persisted before projection and survives reopening without rewriting legacy
 history. A signature-key change produces a different ID, as in member projection.

@@ -4,7 +4,7 @@ use cgka_traits::storage::StorageResult;
 use rusqlite::{OptionalExtension, params, params_from_iter};
 
 /// Maximum retained leaf labels per remote account, including invitation selections.
-pub const DEVICE_CLIENT_LABELS_PER_ACCOUNT: usize = 16;
+pub const DEVICE_CLIENT_LABELS_PER_ACCOUNT: usize = 64;
 
 pub struct DeviceClientLabel {
     pub account_id_hex: String,
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn device_labels_cache_is_bounded_and_confirmation_evicts_deterministically() {
         let storage = SqliteSharedStorage::in_memory().unwrap();
-        for i in 0u8..16 {
+        for i in 0u8..64 {
             storage
                 .put_device_client_label("a", &[i], "label", 10)
                 .unwrap();
@@ -114,10 +114,10 @@ mod tests {
             .put_device_client_label("a", &[0], "label", 10)
             .unwrap();
         storage
-            .put_device_client_label("a", &[16], "label", 11)
+            .put_device_client_label("a", &[64], "label", 11)
             .unwrap();
         let labels = storage.device_client_labels(&["a".into()]).unwrap();
-        assert_eq!(labels.len(), 16);
+        assert_eq!(labels.len(), 64);
         assert!(labels.iter().any(|row| row.signature_key == [0]));
         assert!(!labels.iter().any(|row| row.signature_key == [1]));
         assert_eq!(

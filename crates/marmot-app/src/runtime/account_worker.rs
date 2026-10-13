@@ -1800,6 +1800,7 @@ async fn run_app_runtime_account_worker(
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     let device_label_enrichment = client.device_label_enrichment.clone();
     let device_label_wake = device_label_enrichment.wake.clone();
+    let device_labels_changed = device_label_enrichment.changed.clone();
     let mut device_label_task: Option<DeviceLabelTask> = None;
     'worker: loop {
         // Reopening transport/session retains this worker's demand and cooldowns.
@@ -1934,6 +1935,12 @@ async fn run_app_runtime_account_worker(
                     client.finish_audit_recording();
                 }
                 break 'worker;
+            }
+            _ = device_labels_changed.notified() => {
+                for group in client.refresh_device_label_changes() {
+                    publish_app_runtime_group_state_updated(&events, &account_id_hex, &account_label, &group);
+                }
+                publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
             }
             _ = device_label_wake.notified(), if device_label_task.is_none() => {}
             completed = async { (&mut device_label_task.as_mut().expect("label task exists").0).await }, if device_label_task.is_some() => {

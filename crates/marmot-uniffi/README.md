@@ -803,14 +803,17 @@ Member/roster reads and Exact sender enrichment schedule bounded background
 fetches from safe KeyPackage relays; reads perform no network I/O. Attempts,
 including misses and failures, have a one-hour cooldown per account worker.
 Only demanded keys and invitation selections enter the validated cache, capped at
-16 entries per account with least-recently-confirmed eviction. Labels survive
+64 entries per remote account with least-recently-confirmed eviction. Labels survive
 directory slot replacement and resolve at read time; stored message rows never
-change. Completion uses a 64-row tail comparison per demand-associated group for
-changed roster/sender `GroupStateUpdated` notifications. Separately, a bounded
-open-viewport re-read refreshes affected timeline subscriptions and conversation
-windows from storage, coalesced per window and bounded by loaded size/query limit.
-All loaded rows are compared, including older departed devices and evicted labels
-in groups that supplied no demand. Displayed rows are never republished as message
+change. Cache admissions publish installation-wide, coalesced remote-account signature-key
+changes to every local account worker, including evictions. Each worker compares
+resolved labels for canonical members in its own groups and emits `GroupStateUpdated`
+only for changed roster or loaded sender labels, including roster-only groups with
+no timeline subscription. A bounded open-viewport re-read refreshes affected timeline
+subscriptions and conversation windows from storage, coalesced per worker/group and
+window and bounded by loaded size/query limit. All loaded rows are compared, including
+older departed devices and groups that supplied no demand.
+Displayed rows are never republished as message
 upserts; hosts receive current edits and deletions with read-time labels. Unchanged
 windows receive no label refresh. Shutdown stops waiting
 and admitting results; coalesced directory fetches finish independently within

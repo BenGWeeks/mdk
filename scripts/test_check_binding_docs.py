@@ -29,9 +29,13 @@ class BindingDocsTests(unittest.TestCase):
         ):
             with self.subTest(path=relative):
                 text = " ".join((REPO / relative).read_text().split())
-                self.assertIn("64-row tail comparison", text)
+                self.assertIn("installation-wide, coalesced remote-account signature-key changes", text)
+                self.assertIn("every local account worker", text)
+                self.assertIn("roster-only groups", text)
+                self.assertIn("at most 64 per remote account" if relative.endswith("API-REFERENCE.md") else "64 entries per remote account", text)
+                self.assertNotIn("64-row tail comparison", text)
                 self.assertIn("bounded open-viewport re-read", text)
-                self.assertIn("evicted labels", text)
+                self.assertIn("including evictions", text)
                 self.assertIn("current edits and deletions", text)
                 self.assertNotIn("at most 64 recent timeline rows per group", text)
 
