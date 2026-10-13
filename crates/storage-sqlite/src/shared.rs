@@ -332,7 +332,6 @@ impl SqliteSharedStorage {
             .collect()
     }
 
-    /// Read only requested profiles, without follow, relay-list, or key-package rows.
     /// Batched advisory KeyPackage bytes only; no profile, relay, or follow reads.
     pub fn directory_key_packages_for_ids(
         &self,
@@ -360,6 +359,7 @@ impl SqliteSharedStorage {
         Ok(packages)
     }
 
+    /// Read only requested profiles, without follow, relay-list, or key-package rows.
     pub fn directory_profiles_for_ids(
         &self,
         account_ids: &[String],
