@@ -5,6 +5,9 @@
 ### Breaking changes
 
 - `AppError` adds `GroupCatchingUp`; update exhaustive matches.
+- `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
+  publication reserve for the body. Update exhaustive matches; the job keeps
+  its checkpoint and readmits once space frees or on explicit Retry.
 
 ### Added
 
@@ -25,6 +28,37 @@
   strfry) no longer counts as complete coverage. The relay's stored history is
   paged backwards before its end-of-stored-events counts, so older events in
   the replay window are no longer skipped (#2263).
+- An explicit attachment download the device lacks room to publish no longer
+  retries forever. The publication reserve (disk reserve plus four times the
+  plaintext) is checked as soon as a response declares the size, as a body
+  grows, and before the completed-body receipt, counting the staging,
+  checkpoint and decrypted-file bytes the attempt itself still has to write.
+  A shortage, or a database that reports it is full while publishing, parks
+  the job as `AttachmentTransferState::StorageBlocked` with its ciphertext
+  checkpoint instead of scheduling a timer, recording the free space it needs
+  in the worker's own frame. The worker readmits it once free space exceeds
+  that by 4 MiB and admission would pass; a job that parks again waits out its
+  park streak (15 s doubling to an hour), and explicit Retry readmits at once.
+  With a strong validator the in-memory sink publishes a checkpointed body
+  without another request and the file sink re-requests at most its unsaved
+  tail; without one both start over. A full database records at least the free
+  space seen at the refusal plus the body and withdraws the completed-body
+  receipt. If even the park write fails, the error is returned and the lease
+  recovers the job. Parked checkpoints keep their quota reservation for at
+  most seven days after the latest park. Explicit bodies between the transfer
+  limit and 512 MiB now take the file sink and need the reserve plus five
+  bodies free (six with a strong validator) instead of about four, because
+  their staging and checkpoint copies are counted (#2239).
+- Receiving an attachment no longer holds several copies of it in native
+  memory. The body buffer is reserved once from the declared length (an
+  undeclared length grows geometrically to half the transfer limit and then
+  once to the limit, so the buffer never exceeds the limit and the copy while
+  it grows holds at most 1.5 times it; a failed reservation is a transient
+  failure, not an abort), decrypted in place, explicit downloads above the
+  automatic transfer limit stream through the existing private file sink, and
+  in-memory publication stores a body larger than one 64 KiB staging chunk as
+  chunk rows, so SQLite keeps no bind, record or trigger-rewrite copy of it.
+  Integrity checks, resume and retention behavior are unchanged (#2241).
 
 ## 0.13.0 - 2026-10-12
 

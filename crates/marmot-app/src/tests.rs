@@ -23912,3 +23912,91 @@ fn group_create_relay_options_preserve_defaults_and_enforce_host_safety() {
         ));
     }
 }
+
+/// Allocation audit for the crate's own test binary (mdk#2241).
+///
+/// Only threads that opt in are counted: a measuring test drives its fixture on
+/// a dedicated current-thread runtime whose worker and blocking threads all
+/// opt in (see [`alloc_audit::measure`]), so tests that run alongside in the
+/// same process cannot inflate the figure. Memory a measured thread frees but
+/// an unmeasured one allocated lowers the live count, so measuring tests also
+/// check that the body they receive is itself visible in the peak. SQLite
+/// allocates through libc and is measured separately by the storage-sqlite
+/// publication test.
+pub(crate) mod alloc_audit {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    static LIVE: AtomicIsize = AtomicIsize::new(0);
+    static PEAK: AtomicIsize = AtomicIsize::new(0);
+
+    thread_local! {
+        static MEASURED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether this thread's allocations count, without allocating.
+    fn measured() -> bool {
+        MEASURED.try_with(Cell::get).unwrap_or(false)
+    }
+
+    struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() && measured() {
+                let size = layout.size() as isize;
+                let now = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+                PEAK.fetch_max(now, Ordering::Relaxed);
+            }
+            pointer
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            if measured() {
+                LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+            }
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    /// Count this thread's allocations from now on.
+    fn measure_current_thread() {
+        MEASURED.with(|measured| measured.set(true));
+    }
+
+    /// Run `future` on a fresh current-thread runtime whose threads, and the
+    /// calling thread, are measured. Measuring tests are serialized so their
+    /// fixtures never share the counters.
+    pub(crate) fn measure<F: std::future::Future>(future: F) -> F::Output {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _serial = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(measure_current_thread)
+            .build()
+            .unwrap();
+        measure_current_thread();
+        let output = runtime.block_on(future);
+        drop(runtime);
+        MEASURED.with(|measured| measured.set(false));
+        output
+    }
+
+    /// Live measured heap bytes.
+    pub(crate) fn live() -> isize {
+        LIVE.load(Ordering::Relaxed)
+    }
+    /// Start a peak measurement from the current live count.
+    pub(crate) fn reset_peak() {
+        PEAK.store(live(), Ordering::Relaxed);
+    }
+    /// Highest live count since the last reset.
+    pub(crate) fn peak() -> isize {
+        PEAK.load(Ordering::Relaxed)
+    }
+}

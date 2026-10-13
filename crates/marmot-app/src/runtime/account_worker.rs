@@ -4065,6 +4065,7 @@ async fn complete_media_http(
             if let Ok(crate::client::AcquiredMediaBody::File(file)) = result {
                 let storage = client.app.account_storage(&client.state.label);
                 let fallback = super::attachment_controls::default_policy(&client.app.config);
+                let directory = client.app.account_dir(&client.state.label);
                 let tx = media_http.tx.clone();
                 let lifetime = media_http.worker_lifetime.subscribe();
                 let lifecycle = shared.lifecycle();
@@ -4075,6 +4076,7 @@ async fn complete_media_http(
                         attachments::complete_acquired_stored(
                             &storage,
                             &fallback,
+                            &directory,
                             &job,
                             Ok(crate::client::AcquiredMediaBody::File(file)),
                             byte_budget,
