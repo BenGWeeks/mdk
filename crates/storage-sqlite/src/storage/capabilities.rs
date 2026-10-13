@@ -71,6 +71,25 @@ pub(crate) enum StoredMemberCapabilities {
     Legacy(#[serde(deserialize_with = "deserialize_legacy_capabilities")] GroupCapabilities),
 }
 
+/// Capability blobs are derived knowledge, never authoritative MLS state.
+/// Keep strict format decoding, but let callers treat an invalid cache row as
+/// unknown until an authenticated leaf/KeyPackage write replaces it. SQL and
+/// other storage failures are still propagated by the callers.
+pub(crate) fn decode_cached_member_capabilities(record: &[u8]) -> Option<StoredMemberCapabilities> {
+    match deserialize(record) {
+        Ok(capabilities) => Some(capabilities),
+        Err(_) => {
+            tracing::warn!(
+                target: "marmot.storage_sqlite.capabilities",
+                method = "decode_cached_member_capabilities",
+                invalid_rows = 1,
+                "ignoring undecodable member capability cache row"
+            );
+            None
+        }
+    }
+}
+
 fn deserialize_legacy_capabilities<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<GroupCapabilities, D::Error> {
@@ -114,7 +133,9 @@ pub(crate) fn promote_legacy_capabilities(
         let Some(record) = record else {
             continue;
         };
-        let StoredMemberCapabilities::Legacy(caps) = deserialize(&record)? else {
+        let Some(StoredMemberCapabilities::Legacy(caps)) =
+            decode_cached_member_capabilities(&record)
+        else {
             continue;
         };
         let leaves = legacy_leaf_capabilities(group, &member.id, caps);
@@ -184,8 +205,8 @@ impl CapabilityStorage for SqliteAccountStorage {
             params![group_id.as_slice(), member.id.as_slice()], |row| row.get(0),
         ).optional().storage()?;
         let mut leaves = match previous
-            .map(|record| deserialize::<StoredMemberCapabilities>(&record))
-            .transpose()?
+            .as_deref()
+            .and_then(decode_cached_member_capabilities)
         {
             Some(StoredMemberCapabilities::Leaves { leaves, .. }) => leaves,
             Some(StoredMemberCapabilities::Legacy(caps)) => {
@@ -241,7 +262,10 @@ impl CapabilityStorage for SqliteAccountStorage {
         let Some(record) = record else {
             return Ok(None);
         };
-        match deserialize::<StoredMemberCapabilities>(&record)? {
+        let Some(capabilities) = decode_cached_member_capabilities(&record) else {
+            return Ok(None);
+        };
+        match capabilities {
             StoredMemberCapabilities::Legacy(caps) => {
                 // Historical account-only data cannot prove that every sibling
                 // supports the last writer's capabilities. Keep that unknown
@@ -313,6 +337,87 @@ mod tests {
     use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, member_id, sample_group};
     use cgka_traits::storage::GroupStorage;
+
+    #[test]
+    fn undecodable_capability_cache_is_unknown_and_repairable() {
+        use cgka_traits::EpochId;
+        use cgka_traits::storage::{GroupStateCheckpointRef, MessageStorage};
+        for record in [
+            b"broken JSON".as_slice(),
+            br#"{"leaves":{}}"#.as_slice(),
+            br#"{"version":3,"leaves":{}}"#.as_slice(),
+        ] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            let bad = sample_group(gid(1), 0, 1);
+            let good = sample_group(gid(2), 0, 1);
+            let mut caps = GroupCapabilities::default();
+            caps.insert(Capability::Proposal(10));
+            for group in [&bad, &good] {
+                store.put_group(group).unwrap();
+                store
+                    .save_member_capabilities(&group.id, &group.members[0], caps.clone())
+                    .unwrap();
+            }
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE cgka_member_capabilities SET capabilities = ?2 WHERE group_id = ?1",
+                    params![bad.id.as_slice(), record],
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .member_capabilities(&bad.id, &bad.members[0].id)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                store
+                    .member_capabilities(&good.id, &good.members[0].id)
+                    .unwrap(),
+                Some(caps.clone())
+            );
+            // Capturing state must not turn a disposable cache failure into a
+            // failed engine operation, including before the repair write.
+            store.create_group_snapshot(&bad.id, "unknown").unwrap();
+            store
+                .create_group_state_checkpoint(
+                    &bad.id,
+                    &GroupStateCheckpointRef {
+                        id: "unknown".into(),
+                        resulting_epoch: EpochId(0),
+                    },
+                )
+                .unwrap();
+            // Migration and subsequent roster changes also see the bad row.
+            store
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM cgka_schema_migrations WHERE version > 107", [])
+                .unwrap();
+            crate::migrations::run_all(&mut store.lock().unwrap()).unwrap();
+            store.put_group(&bad).unwrap();
+            store
+                .save_member_capabilities(&bad.id, &bad.members[0], caps.clone())
+                .unwrap();
+            assert_eq!(
+                store
+                    .member_capabilities(&bad.id, &bad.members[0].id)
+                    .unwrap(),
+                Some(caps)
+            );
+            store
+                .rollback_group_to_snapshot(&bad.id, "unknown")
+                .unwrap();
+            assert_eq!(
+                store
+                    .member_capabilities(&bad.id, &bad.members[0].id)
+                    .unwrap(),
+                None
+            );
+        }
+    }
 
     #[test]
     fn feature_registry_and_member_capabilities_roundtrip() {

@@ -151,6 +151,9 @@ mod migration_0072_chat_list_pages;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
+#[cfg(test)]
+#[path = "migrations/upgrade_c27300be_tests.rs"]
+mod upgrade_c27300be_tests;
 
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]

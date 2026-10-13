@@ -1,5 +1,6 @@
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
+mod capability_cache_bootstrap;
 mod draft_lifecycle;
 mod group_lookup;
 mod invite_all_fresh_devices;
