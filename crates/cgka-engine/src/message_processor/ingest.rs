@@ -1414,7 +1414,9 @@ impl<S: StorageProvider> Engine<S> {
             &processed,
             &mls_group,
             self.identity.signer.public(),
-        );
+            self.storage.mls_storage(),
+        )
+        .map_err(|error| EngineError::Backend(format!("sender device evidence: {error:?}")))?;
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(bytes) => {
                 let Some(sender) = sender_id else {

@@ -4067,7 +4067,9 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 .own_leaf_node()
                 .map(|leaf| leaf.signature_key().as_slice())
                 .unwrap_or_default(),
-        );
+            provider.storage(),
+        )
+        .map_err(|error| replay_error("sender device evidence", error))?;
         match processed.into_content() {
             ProcessedMessageContent::ProposalMessage(queued) => {
                 if reject_legacy_group_additions && matches!(queued.proposal(), Proposal::Add(_)) {

@@ -4506,3 +4506,51 @@ fn sender_device_finalization_binds_exact_evidence_to_first_source() {
         SenderDevice::Unknown
     );
 }
+
+#[test]
+fn sender_device_legacy_upgrade_requires_compatible_source_epoch() {
+    use cgka_traits::message::SenderDevice;
+    for later_epoch in [Some(8), None, Some(7)] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mut event = chat("legacy", "alice", 10, "hello");
+        event.source_message_id_hex = None;
+        event.source_epoch = Some(7);
+        store.record_app_event(&event).unwrap();
+        event.source_message_id_hex = Some("sibling-envelope".into());
+        event.source_epoch = later_epoch;
+        event.sender_device = SenderDevice::Exact {
+            device_id: "43".repeat(32),
+            leaf_index: 8,
+            client_label: None,
+            is_this_installation: false,
+        };
+        store.record_app_event(&event).unwrap();
+        // Check the incremental projection as well as a full rebuild: neither
+        // may combine the legacy epoch with a sibling's later envelope/device.
+        for rebuild in [false, true] {
+            if rebuild {
+                store
+                    .rebuild_message_timeline_for_group(&event.group_id_hex)
+                    .unwrap();
+            }
+            let raw = store
+                .app_message(&event.group_id_hex, "legacy")
+                .unwrap()
+                .unwrap();
+            let timeline = store
+                .timeline_message(&event.group_id_hex, "legacy")
+                .unwrap()
+                .unwrap();
+            assert_eq!(raw.source_epoch, Some(7));
+            if later_epoch == Some(7) {
+                assert_eq!(timeline.source_message_id_hex, event.source_message_id_hex);
+                assert_eq!(raw.sender_device, event.sender_device);
+            } else {
+                assert_eq!(raw.sender_device, SenderDevice::Unknown);
+                assert_eq!(timeline.source_message_id_hex, None);
+            }
+            assert_eq!(timeline.sender_device, raw.sender_device);
+            assert_eq!(timeline.source_epoch, raw.source_epoch);
+        }
+    }
+}

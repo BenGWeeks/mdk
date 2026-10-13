@@ -192,9 +192,15 @@ async fn check_historical_sender(
             unreachable!()
         };
         match sender_device {
-            cgka_traits::message::SenderDevice::Unknown => {}
-            cgka_traits::message::SenderDevice::Exact { device_id, .. } => {
+            cgka_traits::message::SenderDevice::Exact {
+                device_id,
+                leaf_index,
+                is_this_installation,
+                ..
+            } => {
                 assert_eq!(*device_id, original_device_id);
+                assert_eq!(*leaf_index, old_leaf);
+                assert!(!is_this_installation);
             }
             other => panic!("unexpected historical provenance: {other:?}"),
         }

@@ -755,11 +755,18 @@ impl SqliteAccountStorage {
                  )
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17)
                  ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
-                    source_message_id_hex = COALESCE(app_events.source_message_id_hex, excluded.source_message_id_hex),
+                    -- Preserve a known legacy epoch unless the new envelope agrees.
+                    source_message_id_hex = CASE
+                        WHEN app_events.source_epoch IS NULL OR app_events.source_epoch = excluded.source_epoch
+                            THEN COALESCE(app_events.source_message_id_hex, excluded.source_message_id_hex)
+                        ELSE app_events.source_message_id_hex END,
                     source_epoch = COALESCE(app_events.source_epoch, excluded.source_epoch),
                     direction = excluded.direction,
                     sender = excluded.sender,
                     sender_device = CASE
+                        WHEN app_events.source_epoch IS NOT NULL
+                            AND (excluded.source_epoch IS NULL OR app_events.source_epoch != excluded.source_epoch)
+                            THEN app_events.sender_device
                         WHEN app_events.source_message_id_hex IS NULL
                             THEN COALESCE(excluded.sender_device, app_events.sender_device)
                         WHEN app_events.source_message_id_hex = excluded.source_message_id_hex
