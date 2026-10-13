@@ -7,7 +7,7 @@
 //! evidence that a recipient still owns the private bundle. Unsupported batch
 //! queries fall back to bounded single-author relay requests.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cgka_engine::key_package::key_package_metadata;
@@ -21,8 +21,8 @@ use transport_nostr_adapter::{
 };
 
 use crate::key_package_records::{
+    MEMBER_KEY_PACKAGE_FRESHNESS_WINDOW, eligible_member_key_packages_from_records,
     fresh_relay_list_status_from_records, merge_relay_list_status,
-    preferred_fresh_key_package_from_records,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryFetchOutcome};
 use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp};
@@ -38,7 +38,7 @@ const MEMBER_RESOLUTION_FALLBACK_CONCURRENCY: usize = 8;
 // scoped deletion proof share one deadline. No per-route or candidate retry
 // renews it; slow/incomplete coverage remains retryable rather than absence.
 const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
-const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 12;
+const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 32;
 const RELAY_LIST_EVENTS_PER_AUTHOR: usize = 4;
 const MEMBER_PREWARM_CACHE_LIMIT: usize = 256;
 const MEMBER_PREWARM_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -185,7 +185,7 @@ pub struct MemberKeyPackagePrewarmSummary {
     /// Retained for API compatibility; always zero because packages must be
     /// fetched from relays. Discovery routes may still be reused.
     pub reused_members: u64,
-    /// Packages that required relay resolution during this call.
+    /// Accounts whose packages required relay resolution during this call.
     pub network_resolved_members: u64,
 }
 
@@ -193,6 +193,7 @@ pub struct MemberKeyPackagePrewarmSummary {
 pub(crate) struct MemberKeyPackageResolutionStats {
     pub(crate) requested_members: usize,
     pub(crate) unique_members: usize,
+    pub(crate) stale_fallback_members: usize,
 }
 
 impl From<MemberKeyPackageResolutionStats> for MemberKeyPackagePrewarmSummary {
@@ -235,7 +236,9 @@ impl MarmotApp {
     /// Resolve a roster as one deterministic set.
     ///
     /// Account aliases are canonicalized and duplicate account ids collapse to
-    /// their first input position. Every package is fetched from relays; cached
+    /// their first input position. Each account contributes its fresh eligible
+    /// device packages, newest first, capped at ten; when none are fresh, only
+    /// its newest valid package is used. Every package is fetched from relays; cached
     /// packages are never a fallback if that lookup fails. On error, the error
     /// belonging to the first unresolved canonical member is returned even if
     /// later relay work completed earlier.
@@ -311,6 +314,22 @@ impl MarmotApp {
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
+        self.resolve_member_key_packages_with_exclusions(
+            member_refs,
+            purpose,
+            requirements,
+            &BTreeSet::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_member_key_packages_with_exclusions(
+        &self,
+        member_refs: Vec<String>,
+        purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+        excluded_refs: &BTreeSet<String>,
+    ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::KeyPackage,
             "lookup",
@@ -318,7 +337,12 @@ impl MarmotApp {
         );
         let result = match tokio::time::timeout(
             MEMBER_RESOLUTION_DEADLINE,
-            self.resolve_member_key_packages_inner(&member_refs, purpose, requirements),
+            self.resolve_member_key_packages_inner(
+                &member_refs,
+                purpose,
+                requirements,
+                excluded_refs,
+            ),
         )
         .await
         {
@@ -343,6 +367,7 @@ impl MarmotApp {
         member_refs: &[String],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+        excluded_refs: &BTreeSet<String>,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let directory_observation = self
             .product_analytics
@@ -379,7 +404,7 @@ impl MarmotApp {
 
         let mut outcomes = (0..targets.len())
             .map(|_| None)
-            .collect::<Vec<Option<Result<KeyPackage, AppError>>>>();
+            .collect::<Vec<Option<Result<Vec<FetchedKeyPackage>, AppError>>>>();
         // Even a valid, unexpired cached package may have been consumed on
         // another device. Every purpose, including composition prewarm, must
         // fetch current relay publications; only discovery routes are reused.
@@ -437,8 +462,8 @@ impl MarmotApp {
             &targets,
             &key_package_unresolved,
             &mut outcomes,
-            purpose,
             requirements,
+            excluded_refs,
         )
         .await;
 
@@ -486,13 +511,14 @@ impl MarmotApp {
         }
 
         let mut key_packages = Vec::with_capacity(targets.len());
+        let mut stale_fallback_members = 0;
         for (index, outcome) in outcomes.into_iter().enumerate() {
             match outcome.unwrap_or_else(|| {
                 Err(AppError::MissingKeyPackage(
                     targets[index].account_id_hex.clone(),
                 ))
             }) {
-                Ok(key_package) => {
+                Ok(fetched_packages) => {
                     let safe_inbox = self.retain_safe_discovered_endpoints(
                         targets[index]
                             .relay_lists
@@ -509,7 +535,14 @@ impl MarmotApp {
                             targets[index].account_id_hex.clone(),
                         ));
                     }
-                    key_packages.push(key_package);
+                    if fetched_packages.iter().all(|fetched| {
+                        crate::unix_now_seconds().saturating_sub(fetched.created_at)
+                            > MEMBER_KEY_PACKAGE_FRESHNESS_WINDOW.as_secs()
+                    }) {
+                        stale_fallback_members += 1;
+                    }
+                    key_packages
+                        .extend(self.accept_fetched_key_packages(purpose, &fetched_packages)?);
                 }
                 Err(error) => return Err(error),
             }
@@ -519,26 +552,33 @@ impl MarmotApp {
             stats: MemberKeyPackageResolutionStats {
                 requested_members: member_refs.len(),
                 unique_members: targets.len(),
+                stale_fallback_members,
             },
         })
     }
 
-    fn accept_fetched_key_package(
+    fn accept_fetched_key_packages(
         &self,
         purpose: MemberResolutionPurpose,
-        fetched: FetchedKeyPackage,
-    ) -> Result<KeyPackage, AppError> {
-        let key_package = self.validate_member_key_package_current(
-            &fetched.account_id_hex,
-            fetched.key_package.clone(),
-        )?;
-        match purpose {
-            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
-                self.remember_directory_key_package(&fetched)?
-            }
-            MemberResolutionPurpose::Prewarm => {}
+        fetched: &[FetchedKeyPackage],
+    ) -> Result<Vec<KeyPackage>, AppError> {
+        let packages = fetched
+            .iter()
+            .map(|fetched| {
+                self.validate_member_key_package_current(
+                    &fetched.account_id_hex,
+                    fetched.key_package.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if purpose != MemberResolutionPurpose::Prewarm
+            && let Some(newest) = fetched.first()
+        {
+            // The diagnostic cache remains a single newest-publication hint;
+            // membership selection never reloads it as invitation authority.
+            self.remember_directory_key_package(newest)?;
         }
-        Ok(key_package)
+        Ok(packages)
     }
 
     fn validate_member_key_package_current(
@@ -805,9 +845,9 @@ impl MarmotApp {
         &self,
         targets: &[MemberTarget],
         unresolved: &[usize],
-        outcomes: &mut [Option<Result<KeyPackage, AppError>>],
-        purpose: MemberResolutionPurpose,
+        outcomes: &mut [Option<Result<Vec<FetchedKeyPackage>, AppError>>],
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+        excluded_refs: &BTreeSet<String>,
     ) {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
@@ -886,7 +926,6 @@ impl MarmotApp {
                 fallback.extend(indices);
                 continue;
             };
-            let multiple_authors = indices.len() > 1;
             let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
             for record in records {
                 records_by_author
@@ -894,45 +933,16 @@ impl MarmotApp {
                     .or_default()
                     .push(record);
             }
+            // A batch prefix cannot establish every device slot. Always run
+            // bounded per-author discovery and deletion proof, even for White Noise.
             for index in indices {
-                let account_id = &targets[index].account_id_hex;
-                let account_records = records_by_author.remove(account_id).unwrap_or_default();
-                let selected = preferred_fresh_key_package_from_records(
-                    account_id,
-                    &account_records,
-                    self.directory_freshness(),
-                    requirements,
-                )
-                .and_then(|selection| {
-                    selection
-                        .value
-                        .ok_or_else(|| AppError::MissingKeyPackage(account_id.clone()))
-                });
-                match selected {
-                    Ok(selected)
-                        if purpose == MemberResolutionPurpose::Prewarm
-                            || !multiple_authors
-                            || selected.priority == 2 =>
-                    {
-                        let mut fetched = selected.fetched;
-                        fetched.relay_lists = targets[index].relay_lists.clone();
-                        outcomes[index] = Some(self.accept_fetched_key_package(purpose, fetched));
-                    }
-                    // Bounded multi-author results can hide an older preferred
-                    // slot even when they contain a valid lower-priority one.
-                    // Relays may cap below our requested limit, so even a
-                    // short batch does not prove completeness. Prewarm only
-                    // needs existence, while commits seek the preferred slot.
-                    // A priority-2 winner already has the best tier in a
-                    // newest-first prefix. This is a bounded preference search,
-                    // not proof of relay completeness: neither path can detect
-                    // a newer publication omitted from a non-prefix response.
-                    // Keep observed slot replacements when combining the refetch.
-                    _ => {
-                        fallback.push(index);
-                        fallback_records.insert(index, account_records);
-                    }
-                }
+                fallback.push(index);
+                fallback_records.insert(
+                    index,
+                    records_by_author
+                        .remove(&targets[index].account_id_hex)
+                        .unwrap_or_default(),
+                );
             }
         }
 
@@ -1002,21 +1012,27 @@ impl MarmotApp {
                                         discovery: &app.directory_source_relays(&[]),
                                         requirements,
                                         cached_target: None,
+                                        all_devices: true,
+                                        excluded_refs,
                                     },
                                 )
                                 .await?;
-                            let mut fetched = preferred_fresh_key_package_from_records(
+                            let mut fetched = eligible_member_key_packages_from_records(
                                 &target.account_id_hex,
                                 &records.records,
                                 records.freshness,
                                 requirements,
+                                excluded_refs,
                             )?
-                            .value
-                            .ok_or_else(|| {
-                                AppError::MissingKeyPackage(target.account_id_hex.clone())
-                            })?
-                            .fetched;
-                            fetched.relay_lists = target.relay_lists;
+                            .value;
+                            if fetched.is_empty() {
+                                return Err(AppError::MissingKeyPackage(
+                                    target.account_id_hex.clone(),
+                                ));
+                            }
+                            for package in &mut fetched {
+                                package.relay_lists = target.relay_lists.clone();
+                            }
                             Ok::<_, AppError>(fetched)
                         }
                         .await;
@@ -1028,8 +1044,7 @@ impl MarmotApp {
             .collect::<Vec<_>>()
             .await;
         for (index, result) in fallback_results {
-            outcomes[index] =
-                Some(result.and_then(|fetched| self.accept_fetched_key_package(purpose, fetched)));
+            outcomes[index] = Some(result);
         }
     }
 }

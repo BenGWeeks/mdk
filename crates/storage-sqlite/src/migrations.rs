@@ -228,6 +228,8 @@ mod migration_0105_file_attachment_partials;
 mod migration_0106_retained_attachment_chunks;
 #[path = "migrations/0107_moderation_report_outbox.rs"]
 mod migration_0107_moderation_report_outbox;
+#[path = "migrations/0108_leaf_capabilities.rs"]
+mod migration_0108_leaf_capabilities;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -888,6 +890,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0107_moderation_report_outbox",
         suspend_foreign_keys: &[],
         apply: migration_0107_moderation_report_outbox::apply,
+    },
+    Migration {
+        version: 108,
+        name: "0108_leaf_capabilities",
+        suspend_foreign_keys: &[],
+        apply: migration_0108_leaf_capabilities::apply,
     },
 ];
 
@@ -2343,6 +2351,30 @@ mod tests {
             .is_err()
         );
         conn.close().unwrap();
+    }
+
+    #[test]
+    fn capability_migration_refuses_account_only_reader_before_data_access() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT count(*) FROM cgka_schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(matches!(
+            run(&mut conn, &MIGRATIONS[..107]),
+            Err(StorageError::UnsupportedSchemaVersion {
+                found: 108,
+                latest_supported: 107
+            })
+        ));
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM cgka_schema_migrations", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
     }
 
     #[test]

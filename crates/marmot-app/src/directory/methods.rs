@@ -658,6 +658,8 @@ impl MarmotApp {
                 discovery: &discovery_relays,
                 requirements: None,
                 cached_target,
+                all_devices: false,
+                excluded_refs: &std::collections::BTreeSet::new(),
             })
             .await?;
         let cached_entry = cached_entry.filter(|entry| {

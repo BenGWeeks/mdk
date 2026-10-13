@@ -6,7 +6,7 @@ use cgka_traits::engine::{
     SendIntent, SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
 };
 
-use cgka_traits::storage::WelcomeStorage;
+use cgka_traits::storage::{OutboundIntentStorage, WelcomeStorage};
 use cgka_traits::{GroupId, MessageId};
 use std::collections::{HashMap, HashSet};
 
@@ -79,7 +79,7 @@ impl AppClient {
                         .key_package_metadata(package)
                         .map_err(cgka_session::SessionError::from)?;
                     missing |= !group.members.iter().any(|member| {
-                        hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
+                        hex::encode(&member.credential) == metadata.signature_key_hex
                     });
                 }
                 if !missing || group.is_terminal() {
@@ -261,48 +261,88 @@ impl AppClient {
                 Err(error) => return Err(error.into()),
             };
             let mut members = Vec::new();
+            let mut consumed_refs = std::collections::BTreeSet::new();
             for package in key_packages {
                 let metadata = self
                     .runtime
                     .session()
                     .key_package_metadata(package)
                     .map_err(cgka_session::SessionError::from)?;
+                consumed_refs.insert(metadata.key_package_ref_hex.clone());
                 if !group.as_ref().is_some_and(|group| {
-                    group.members.iter().any(|member| {
-                        hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
-                    })
+                    group
+                        .members
+                        .iter()
+                        .any(|member| hex::encode(&member.credential) == metadata.signature_key_hex)
                 }) {
                     members.push(metadata.credential_identity_hex);
                 }
             }
-            let packages =
-                if members.is_empty() || group.as_ref().is_none_or(|group| group.is_terminal()) {
-                    vec![]
-                } else {
-                    let requirements = match self
-                        .runtime
-                        .session()
-                        .invite_key_package_requirements(&record.group_id)
-                    {
-                        Ok(requirements) => requirements,
-                        Err(error @ cgka_traits::EngineError::Storage(_)) => {
-                            return Err(cgka_session::SessionError::from(error).into());
-                        }
-                        Err(_) => break,
-                    };
-                    match self
-                        .app
-                        .resolve_compatible_member_key_packages(
-                            members,
-                            &requirements,
-                            crate::directory::MemberResolutionPurpose::CommitFresh,
-                        )
-                        .await
-                    {
-                        Ok(resolved) => resolved.key_packages,
-                        Err(_) => break,
+            // A partial recovery already queued another device's replacement.
+            // Its relay publication is no longer available for this remainder.
+            for queued in self
+                .app
+                .account_storage(&self.state.label)?
+                .list_queued_outbound_intents(&record.group_id)?
+            {
+                if let SendIntent::Invite { key_packages, .. } = queued.intent {
+                    for package in key_packages {
+                        let metadata = self
+                            .runtime
+                            .session()
+                            .key_package_metadata(&package)
+                            .map_err(cgka_session::SessionError::from)?;
+                        consumed_refs.insert(metadata.key_package_ref_hex);
                     }
+                }
+            }
+            let packages = if members.is_empty()
+                || group.as_ref().is_none_or(|group| group.is_terminal())
+            {
+                vec![]
+            } else {
+                let requirements = match self
+                    .runtime
+                    .session()
+                    .invite_key_package_requirements(&record.group_id)
+                {
+                    Ok(requirements) => requirements,
+                    Err(error @ cgka_traits::EngineError::Storage(_)) => {
+                        return Err(cgka_session::SessionError::from(error).into());
+                    }
+                    Err(_) => break,
                 };
+                match self
+                    .app
+                    .resolve_member_key_packages_with_exclusions(
+                        members,
+                        crate::directory::MemberResolutionPurpose::CommitFresh,
+                        Some(&requirements),
+                        &consumed_refs,
+                    )
+                    .await
+                {
+                    Ok(resolved) => {
+                        let mut packages = Vec::new();
+                        for package in resolved.key_packages {
+                            let metadata = self
+                                .runtime
+                                .session()
+                                .key_package_metadata(&package)
+                                .map_err(cgka_session::SessionError::from)?;
+                            if !group.as_ref().is_some_and(|group| {
+                                group.members.iter().any(|member| {
+                                    hex::encode(&member.credential) == metadata.signature_key_hex
+                                })
+                            }) {
+                                packages.push(package);
+                            }
+                        }
+                        packages
+                    }
+                    Err(_) => break,
+                }
+            };
             match self
                 .runtime
                 .session_mut()
