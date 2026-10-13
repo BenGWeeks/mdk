@@ -3233,6 +3233,34 @@ typedef struct MarmotChatNotificationSettings {
 } MarmotChatNotificationSettings;
 
 /**
+ * Authenticated source-epoch device evidence, owned by the containing message.
+ */
+typedef enum MarmotSenderDevice_Tag {
+  MARMOT_SENDER_DEVICE_EXACT,
+  MARMOT_SENDER_DEVICE_ONE_OF,
+  MARMOT_SENDER_DEVICE_UNKNOWN,
+} MarmotSenderDevice_Tag;
+
+typedef struct MarmotSenderDevice_Exact_Body {
+  char *device_id;
+  uint32_t leaf_index;
+  char *client_label;
+  bool is_this_installation;
+} MarmotSenderDevice_Exact_Body;
+
+typedef struct MarmotSenderDevice_OneOf_Body {
+  uint32_t device_count;
+} MarmotSenderDevice_OneOf_Body;
+
+typedef struct MarmotSenderDevice {
+  MarmotSenderDevice_Tag tag;
+  union {
+    MarmotSenderDevice_Exact_Body EXACT;
+    MarmotSenderDevice_OneOf_Body ONE_OF;
+  };
+} MarmotSenderDevice;
+
+/**
  * One Nostr tag of the inner Marmot app event, as its string values.
  */
 typedef struct MarmotMessageTag {
@@ -3248,6 +3276,7 @@ typedef struct MarmotAppMessageRecord {
   char *direction;
   char *group_id_hex;
   char *sender;
+  struct MarmotSenderDevice sender_device;
   char *plaintext;
   struct MarmotMarkdownDocument content_tokens;
   /**
@@ -4107,6 +4136,7 @@ typedef struct MarmotTimelineMessageRecord {
   char *direction;
   char *group_id_hex;
   char *sender;
+  struct MarmotSenderDevice sender_device;
   char *plaintext;
   struct MarmotMarkdownDocument content_tokens;
   uint64_t kind;
@@ -4706,6 +4736,7 @@ typedef struct MarmotReceivedMessage {
   char *message_id_hex;
   char *group_id_hex;
   char *sender;
+  struct MarmotSenderDevice sender_device;
   char *sender_display_name;
   char *plaintext;
   struct MarmotMarkdownDocument content_tokens;

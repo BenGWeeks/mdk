@@ -11,6 +11,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Messages expose durable `SenderDevice` provenance (Exact, OneOf or Unknown),
+  matching member-device IDs and distinguishing this installation from account
+  siblings. Historical attribution uses source-epoch evidence; migration 0108
+  leaves legacy rows Unknown. Raw and timeline records agree.
+  Message layouts include an owned tagged enum; regenerate the header and pair
+  it with the matching library. Parent deep-free releases Exact strings.
+
 - Devices are unknown when not canonically admitted or unavailable; known lists
   are authoritative and nonempty for admitted members.
 

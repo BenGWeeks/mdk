@@ -261,15 +261,8 @@ pub(crate) fn member_device(
     leaf: cgka_engine::group_authority::CanonicalMemberDevice,
     client_label: Option<String>,
 ) -> MemberDevice {
-    use sha2::{Digest, Sha256};
-    let mut hash = Sha256::new();
-    hash.update(b"marmot-app/member-device-id/v1");
-    hash.update((group_id.as_slice().len() as u64).to_be_bytes());
-    hash.update(group_id.as_slice());
-    hash.update((leaf.signature_key.len() as u64).to_be_bytes());
-    hash.update(&leaf.signature_key);
     MemberDevice {
-        device_id: hex::encode(hash.finalize()),
+        device_id: cgka_traits::message::member_device_id(group_id, &leaf.signature_key),
         leaf_index: leaf.leaf_index,
         client_label,
         joined_at: None,
@@ -2197,6 +2190,7 @@ pub(crate) fn decode_received_event(
         message_id_hex: event.id,
         source_message_id_hex: source_message_id_hex.to_owned(),
         sender: sender_hex.to_owned(),
+        sender_device: Default::default(),
         sender_display_name,
         group_id: group_id.clone(),
         source_epoch,
@@ -2253,6 +2247,7 @@ pub(crate) fn observe_event(
         GroupEvent::MessageReceived {
             group_id,
             sender,
+            sender_device,
             epoch,
             payload,
             retention,
@@ -2293,6 +2288,7 @@ pub(crate) fn observe_event(
                 return None;
             };
             message.authority = *authority;
+            message.sender_device = sender_device.clone();
             // Gossip remains available to native ingestion, but must never enter
             // the host message summary, including a partially applied batch.
             if !crate::notifications::is_push_gossip_kind(message.kind) {

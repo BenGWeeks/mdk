@@ -2467,6 +2467,27 @@ impl AppClient {
         Ok(members.into_values().collect())
     }
 
+    pub(crate) fn enrich_sender_device(
+        &self,
+        group_id: &GroupId,
+        sender: &str,
+        mut device: crate::SenderDevice,
+    ) -> crate::SenderDevice {
+        if let crate::SenderDevice::Exact {
+            device_id,
+            client_label,
+            ..
+        } = &mut device
+            && let Ok(labels) = self.member_device_labels(std::iter::once(sender.to_owned()))
+        {
+            *client_label = labels.into_iter().find_map(|((_, key), label)| {
+                (cgka_traits::message::member_device_id(group_id, &key) == *device_id)
+                    .then_some(label)
+            });
+        }
+        device
+    }
+
     /// Read each requested account cache once; never discover devices here.
     fn member_device_labels(
         &self,
@@ -4703,6 +4724,7 @@ impl AppClient {
                 published.source_epoch.0,
                 published.retention,
                 published.authority,
+                published.sender_device.clone(),
             )
         });
         if should_project_locally {

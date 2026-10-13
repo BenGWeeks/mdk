@@ -320,6 +320,7 @@ pub enum OpenMlsReplayObservation {
         message_id: String,
         source_epoch: u64,
         sender: Vec<u8>,
+        sender_device: cgka_traits::message::SenderDevice,
         payload: Vec<u8>,
         retention: AppMessageRetentionDecision,
         authority: Option<cgka_traits::app_event::AppMessageAuthority>,
@@ -4059,6 +4060,14 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         };
         let sender_id = crate::identity::member_id_of_processed_message(&processed, &mls_group);
 
+        let sender_device = crate::identity::sender_device_of_processed_message(
+            &processed,
+            &mls_group,
+            mls_group
+                .own_leaf_node()
+                .map(|leaf| leaf.signature_key().as_slice())
+                .unwrap_or_default(),
+        );
         match processed.into_content() {
             ProcessedMessageContent::ProposalMessage(queued) => {
                 if reject_legacy_group_additions && matches!(queued.proposal(), Proposal::Add(_)) {
@@ -4349,6 +4358,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         message_id,
                         source_epoch,
                         sender: sender.as_slice().to_vec(),
+                        sender_device,
                         payload: payload.clone(),
                         authority: if cgka_traits::reporting::requires_source_authority(
                             app_event.kind,

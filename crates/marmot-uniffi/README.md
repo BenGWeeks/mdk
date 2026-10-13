@@ -759,6 +759,20 @@ the conversion cache. Custom events do not change chat-list activity or notifica
 
 ## Device-local membership events
 
+`AppMessageRecordFfi` and `TimelineMessageRecordFfi` expose the same durable
+`sender_device: SenderDevice` (Kotlin `senderDevice`). `Exact { device_id,
+leaf_index, client_label, is_this_installation }` identifies the authenticated
+source-epoch leaf; its ID equals `MemberDeviceFfi.device_id` for that signature
+key and group. `OneOf { device_count }` requires authenticated source-epoch
+membership evidence. `Unknown` is the default for historical rows and messages
+whose source-epoch signature key cannot be recovered. MDK never attributes a
+historical message using today's roster or a reused leaf index. Own sends flag
+this installation; sibling installations of the same account do not. Labels
+are advisory, sanitized and cache-only, with `None` on a miss. Provenance is
+persisted before projection and survives reopening without rewriting legacy
+history. A signature-key change produces a different ID, as in member projection.
+
+
 `group_roster(...)` returns `GroupRosterFfi` with `members: Vec<GroupMemberDetailsFfi>`;
 `group_members(...)` returns `Vec<AppGroupMemberRecordFfi>`. Both member records expose
 `devices: Option<Vec<MemberDeviceFfi>>` (Kotlin `List<MemberDeviceFfi>?`). `None`

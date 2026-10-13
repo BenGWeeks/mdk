@@ -6,6 +6,11 @@
 
 ### Added
 
+- Messages expose durable `SenderDevice` provenance (Exact, OneOf or Unknown),
+  matching member-device IDs and distinguishing this installation from account
+  siblings. Historical attribution uses source-epoch evidence; migration 0108
+  leaves legacy rows Unknown. Raw and timeline records agree.
+
 - Devices are unknown when not canonically admitted or unavailable; known lists
   are authoritative and nonempty for admitted members.
 

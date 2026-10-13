@@ -4,6 +4,8 @@
 //! early app surfaces: encrypted session storage, Nostr MLS peeling, Nostr
 //! transport publishing, and relay-backed app projections.
 
+pub use cgka_traits::message::SenderDevice;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1037,6 +1039,7 @@ pub struct EpochStallEscalation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceivedMessage {
+    pub sender_device: cgka_traits::message::SenderDevice,
     pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     pub message_id_hex: String,
     pub source_message_id_hex: String,
@@ -1100,6 +1103,8 @@ pub(crate) fn prune_seen_events(seen_events: &mut Vec<String>) -> std::vec::Drai
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppMessageRecord {
+    #[serde(default)]
+    pub sender_device: cgka_traits::message::SenderDevice,
     /// Authenticated source-state evidence. Legacy and unresolved rows remain
     /// `None`; recovery must never infer this from current group policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1390,6 +1395,7 @@ pub(crate) struct AccountState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppMessageProjection {
+    pub sender_device: cgka_traits::message::SenderDevice,
     pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     pub(crate) message_id_hex: String,
     pub(crate) source_message_id_hex: Option<String>,
@@ -6560,6 +6566,7 @@ impl MarmotApp {
         source_epoch: u64,
         retention: AppMessageRetentionDecision,
         authority: Option<cgka_traits::app_event::AppMessageAuthority>,
+        sender_device: crate::SenderDevice,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let observation = self
             .product_analytics
@@ -6573,12 +6580,13 @@ impl MarmotApp {
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let authority_update =
                 storage.finalize_app_event_authority(group_id_hex, message_id_hex, authority)?;
-            let retention_update = storage.finalize_app_event_source_retention(
+            let retention_update = storage.finalize_app_event_source_retention_with_sender_device(
                 group_id_hex,
                 message_id_hex,
                 source_message_id_hex,
                 source_epoch,
                 retention,
+                &sender_device,
             )?;
             storage.retain_attachment_uploads_after_commit(
                 group_id_hex,

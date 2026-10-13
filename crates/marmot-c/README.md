@@ -45,6 +45,12 @@ contents plus this README.
 
 ## Binary compatibility
 
+Raw, timeline and live received messages embed `MarmotSenderDevice` with
+`Exact`, `OneOf` and `Unknown` variants. Exact string fields belong to the
+message's deep-free; the optional client label is NULL on cache misses. See
+[sender-device evidence and ownership](API-REFERENCE.md).
+
+
 Build clients against the header shipped with the exact native library they load.
 Output records have concrete C layouts; this API has no tail-extension or
 cross-release layout-compatibility guarantee, and a shared major/minor number does not imply layout compatibility.

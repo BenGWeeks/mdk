@@ -915,6 +915,7 @@ async fn native_restoration_restores_projection_unread_without_invitation() {
             direction: "received".into(),
             group_id_hex: group_hex.clone(),
             sender: nostr::prelude::Keys::generate().public_key().to_hex(),
+            sender_device: Default::default(),
             plaintext: "already retained unread".into(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
@@ -1039,6 +1040,7 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
                 direction: "sent".into(),
                 group_id_hex: group_hex.clone(),
                 sender: account.account_id_hex.clone(),
+                sender_device: Default::default(),
                 plaintext: "held send".into(),
                 kind: MARMOT_APP_EVENT_KIND_CHAT,
                 tags: Vec::new(),
@@ -1218,6 +1220,7 @@ async fn partial_native_projection_retries_without_republishing() {
                 direction: "sent".into(),
                 group_id_hex: group_hex.clone(),
                 sender: account.account_id_hex.clone(),
+                sender_device: Default::default(),
                 plaintext: "pending before storage fault".into(),
                 kind: MARMOT_APP_EVENT_KIND_CHAT,
                 tags: Vec::new(),
@@ -1280,6 +1283,7 @@ async fn partial_native_projection_retries_without_republishing() {
                 group_id: group.clone(),
                 message_id: MessageId::new(vec![kind as u8; 32]),
                 sender: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                sender_device: Default::default(),
                 epoch: client.runtime.group_record(&group).unwrap().epoch,
                 payload: cgka_traits::app_event::MarmotAppEvent::new(
                     &account.account_id_hex,
@@ -1906,6 +1910,81 @@ async fn member_devices_group_accounts_and_survive_self_update_reopen_and_leaf_r
             .is_none()
     );
     assert!(selected.iter().all(|d| !d.is_this_installation));
+    // Both authenticated sibling leaves of one account retain their own device ID.
+    bob_client
+        .send(&group, b"sender provenance original")
+        .await
+        .unwrap();
+    sibling
+        .send(&group, b"sender provenance sibling")
+        .await
+        .unwrap();
+    deliver_new(&mut alice, &relay, &mut alice_cursor).await;
+    alice.sync().await.unwrap();
+    deliver_new(&mut bob_client, &relay, &mut bob_cursor).await;
+    bob_client.sync().await.unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    for (content, index) in [
+        ("sender provenance original", surviving_leaf),
+        ("sender provenance sibling", departing_leaf),
+    ] {
+        let expected_id = &selected
+            .iter()
+            .find(|d| d.leaf_index == index)
+            .unwrap()
+            .device_id;
+        let raw = app
+            .messages("alice")
+            .unwrap()
+            .into_iter()
+            .find(|m| m.plaintext == content)
+            .unwrap();
+        let timeline = app
+            .timeline_message("alice", &group_hex, &raw.message_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw.sender_device, timeline.sender_device);
+        let crate::SenderDevice::Exact { client_label, .. } = &raw.sender_device else {
+            panic!("fresh sibling messages must retain exact device evidence");
+        };
+        assert_eq!(
+            client_label,
+            &selected
+                .iter()
+                .find(|d| d.leaf_index == index)
+                .unwrap()
+                .client_label
+        );
+        assert!(
+            matches!(&raw.sender_device, crate::SenderDevice::Exact { device_id, leaf_index, is_this_installation: false, .. } if device_id == expected_id && *leaf_index == index)
+        );
+        let local = app
+            .messages("bob")
+            .unwrap()
+            .into_iter()
+            .find(|m| m.plaintext == content)
+            .unwrap();
+        assert!(
+            matches!(&local.sender_device, crate::SenderDevice::Exact { device_id, is_this_installation, .. } if device_id == expected_id && *is_this_installation == (index == surviving_leaf))
+        );
+    }
+    let reopened_projection = app_at(&dir, relay.clone());
+    let reopened_messages = reopened_projection.messages("alice").unwrap();
+    for raw in app
+        .messages("alice")
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.plaintext.starts_with("sender provenance"))
+    {
+        assert_eq!(
+            reopened_messages
+                .iter()
+                .find(|m| m.message_id_hex == raw.message_id_hex)
+                .unwrap()
+                .sender_device,
+            raw.sender_device
+        );
+    }
     // Mirror-only staged accounts stay visible without inventing admitted leaves.
     let staged_account = home.create_account("staged").unwrap();
     let storage = app.account_storage("alice").unwrap();
