@@ -1875,6 +1875,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         state.retained_private_material[0].key_package,
         old_state.pending_replacement.unwrap().key_package
     );
+    assert_eq!(state.retained_private_material[0].replaced_at, None);
     assert_eq!(handle.stored_key_package_bundles().unwrap().len(), 2);
 }
 

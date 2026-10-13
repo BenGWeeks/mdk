@@ -75,8 +75,9 @@ days, or at the existing expiry-based deadline if earlier. Startup catches up ov
 generator policy remain unchanged. Welcome consumption still triggers replacement on the next maintenance pass
 (the managed app worker ticks every 15 seconds).
 
-Superseded unconsumed current and pending bundles remain decryptable for 24 hours from `replaced_at`, capped by MLS
-expiry. This deliberately short grace covers Welcomes already in flight while gap filling is unavailable; sweeps
+Superseded unconsumed current and pending bundles remain decryptable until a newer same-slot publication is
+acknowledged, then for 24 hours from that ACK’s persisted wall-clock `replaced_at`, capped by MLS expiry. Staging or
+unsuccessful publication never starts the grace period. This deliberately short grace covers Welcomes already in flight while gap filling is unavailable; sweeps
 run even when network maintenance is paused. Consumed current bundles are deleted atomically on the first replacement
 relay ACK, and consumed retained bundles are removed by the sweep.
 

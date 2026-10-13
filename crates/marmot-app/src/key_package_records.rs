@@ -1543,7 +1543,7 @@ mod tests {
             key_package: KeyPackage::new(vec![1]),
             key_package_ref: retained.clone(),
             not_after: Timestamp(2),
-            replaced_at: Timestamp(1),
+            replaced_at: Some(Timestamp(1)),
         }];
 
         assert_eq!(

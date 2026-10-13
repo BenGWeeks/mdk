@@ -258,7 +258,11 @@ pub struct RetainedKeyPackagePrivateMaterial {
     pub key_package: KeyPackage,
     pub key_package_ref: Vec<u8>,
     pub not_after: Timestamp,
-    pub replaced_at: Timestamp,
+    /// Actual wall-clock time of the first accepted newer same-slot publication.
+    /// Superseded pending material has no grace deadline until that ACK.
+    /// Legacy numeric timestamps deserialize as `Some`; missing values as `None`.
+    #[serde(default)]
+    pub replaced_at: Option<Timestamp>,
 }
 
 /// The one stable replaceable-event slot for an account-device's last-resort
@@ -460,6 +464,34 @@ mod tests {
         fields.remove("historical_authored_event_created_at");
         let restored: super::KeyPackageLifecycleState = serde_json::from_value(json).unwrap();
         assert_eq!(restored, lifecycle);
+    }
+
+    #[test]
+    fn retained_key_package_replacement_ack_timestamp_is_backward_compatible() {
+        use super::RetainedKeyPackagePrivateMaterial;
+        use crate::{KeyPackage, Timestamp};
+        let material = RetainedKeyPackagePrivateMaterial {
+            key_package: KeyPackage::new(vec![1]),
+            key_package_ref: vec![2],
+            not_after: Timestamp(100),
+            replaced_at: Some(Timestamp(42)),
+        };
+        let mut json = serde_json::to_value(&material).unwrap();
+        assert_eq!(json["replaced_at"], serde_json::json!(42));
+        assert_eq!(
+            serde_json::from_value::<RetainedKeyPackagePrivateMaterial>(json.clone()).unwrap(),
+            material
+        );
+        json.as_object_mut().unwrap().remove("replaced_at");
+        let unstamped: RetainedKeyPackagePrivateMaterial = serde_json::from_value(json).unwrap();
+        assert_eq!(unstamped.replaced_at, None);
+        assert_eq!(
+            serde_json::from_value::<RetainedKeyPackagePrivateMaterial>(
+                serde_json::to_value(&unstamped).unwrap()
+            )
+            .unwrap(),
+            unstamped
+        );
     }
 
     use super::MaintenancePhase;

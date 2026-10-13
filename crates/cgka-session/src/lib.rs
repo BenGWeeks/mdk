@@ -529,7 +529,8 @@ impl AccountDeviceSession {
         )?)
     }
 
-    /// Stage with actual wall time for pending-bundle retention.
+    /// Stage without confirming relay replacement. The wall-time argument is
+    /// retained for compatibility; superseded retention starts at a newer ACK.
     pub fn stage_key_package_replacement_at(
         &mut self,
         state: &mut KeyPackageLifecycleState,

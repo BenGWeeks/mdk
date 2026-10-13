@@ -61,12 +61,13 @@ impl<S: StorageProvider> Engine<S> {
         )
     }
 
-    /// Stage with an injected actual supersession time, distinct from the event timestamp.
+    /// Stage a replacement without confirming relay replacement. The staging time
+    /// argument is retained for API compatibility; retention starts only at ACK.
     pub fn stage_key_package_replacement_at(
         &mut self,
         state: &mut KeyPackageLifecycleState,
         authored_created_at: Timestamp,
-        superseded_at: Timestamp,
+        _superseded_at: Timestamp,
         refresh_lead_secs: u64,
         targets: Vec<TransportFanoutTarget>,
     ) -> Result<KeyPackage, EngineError> {
@@ -84,7 +85,7 @@ impl<S: StorageProvider> Engine<S> {
                         key_package: previous.key_package,
                         key_package_ref: previous.key_package_ref,
                         not_after: previous.not_after,
-                        replaced_at: superseded_at,
+                        replaced_at: None,
                     });
             }
             staged.pending_replacement = Some(PendingKeyPackageReplacement {

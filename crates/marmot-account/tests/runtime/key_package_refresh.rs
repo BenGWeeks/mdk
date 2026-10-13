@@ -259,7 +259,7 @@ async fn superseded_pending_key_package_has_same_short_retention_and_ignores_ech
     let lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
     let retained = &lifecycle.retained_private_material[0];
     assert_eq!(retained.key_package, old);
-    wall.set(retained.replaced_at.0 + 86400 - 1);
+    wall.set(retained.replaced_at.unwrap().0 + 86400 - 1);
     runtime
         .observe_key_package_slot_event(
             &lifecycle.stable_slot_id,
@@ -281,7 +281,7 @@ async fn superseded_pending_key_package_has_same_short_retention_and_ignores_ech
             .unwrap(),
         0
     );
-    wall.set(retained.replaced_at.0 + 86400);
+    wall.set(retained.replaced_at.unwrap().0 + 86400);
     assert_eq!(
         runtime
             .sweep_expired_key_package_private_material()
@@ -475,6 +475,37 @@ async fn review_later_foreign_winner_supersedes_failed_pending_after_hour() {
             staged.pending_replacement.as_ref().unwrap().signed_event
         );
         wall.set(63_600 + 86400);
+        runtime
+            .sweep_expired_key_package_private_material()
+            .unwrap();
+        assert!(
+            runtime
+                .durably_owned_key_packages()
+                .unwrap()
+                .contains(&pending.key_package)
+        );
+        assert_eq!(
+            runtime
+                .key_package_maintenance_status()
+                .unwrap()
+                .unwrap()
+                .retained_private_material
+                .last()
+                .unwrap()
+                .replaced_at,
+            None
+        );
+        *publisher.remaining_failures.lock().unwrap() = 0;
+        runtime.publish_fresh_key_package().await.unwrap();
+        let ack_time = 63_600 + 86400;
+        wall.set(ack_time + 86400 - 1);
+        assert_eq!(
+            runtime
+                .sweep_expired_key_package_private_material()
+                .unwrap(),
+            0
+        );
+        wall.set(ack_time + 86400);
         runtime
             .sweep_expired_key_package_private_material()
             .unwrap();
@@ -718,7 +749,7 @@ async fn round_two_no_ack_history_is_bounded_after_restart_and_expiry() {
 }
 
 #[tokio::test]
-async fn round_two_pending_retention_starts_at_actual_supersession() {
+async fn pending_retention_starts_at_ack_wall_time_despite_future_authoring_time() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("future timestamp retention").unwrap();
     let wall = Arc::new(TestWallClock::new(70_000));
@@ -764,4 +795,149 @@ async fn round_two_pending_retention_starts_at_actual_supersession() {
         1
     );
     assert!(!runtime.durably_owned_key_packages().unwrap().contains(&old));
+}
+
+#[tokio::test]
+async fn lost_ack_pending_supersession_retains_welcome_key_until_replacement_ack_grace() {
+    // Exercise Welcome consumption and time-based retirement independently.
+    for consume in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("alice.sqlite");
+        let key = SqlCipherKey::new("lost ACK retention key").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let wall = Arc::new(TestWallClock::new(now));
+        let policy = StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+        let exposed = ExposedThenFailsKeyPackages::default();
+        let mut runtime = AccountDeviceRuntime::new(
+            session(database.clone(), &key, b"alice"),
+            RecordingAdapter::default(),
+            policy.clone(),
+            exposed.clone(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(7)),
+        );
+        // A reaches a relay, but local confirmation is lost.
+        assert!(runtime.publish_fresh_key_package().await.is_err());
+        let old = exposed.publications()[0].key_package.clone();
+        let mut state = runtime.key_package_maintenance_status().unwrap().unwrap();
+        state
+            .pending_replacement
+            .as_mut()
+            .unwrap()
+            .generation_revision = 0;
+        runtime.session().put_key_package_lifecycle(&state).unwrap();
+        drop(runtime);
+        let publisher = FlakyKeyPackages::new(1000);
+        let open = || {
+            AccountDeviceRuntime::new(
+                session(database.clone(), &key, b"alice"),
+                RecordingAdapter::default(),
+                policy.clone(),
+                publisher.clone(),
+            )
+            .with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(7)),
+            )
+        };
+        let mut runtime = open();
+        // Generator upgrade supersedes pending A with B; B never reaches a relay.
+        assert!(runtime.publish_fresh_key_package().await.is_err());
+        let replacement = runtime
+            .key_package_maintenance_status()
+            .unwrap()
+            .unwrap()
+            .pending_replacement
+            .unwrap();
+        assert_ne!(replacement.key_package, old);
+        assert_eq!(
+            runtime
+                .key_package_maintenance_status()
+                .unwrap()
+                .unwrap()
+                .retained_private_material[0]
+                .replaced_at,
+            None
+        );
+        wall.set(now + 86401);
+        assert!(runtime.publish_fresh_key_package().await.is_err());
+        drop(runtime);
+        let mut runtime = open();
+        assert_eq!(
+            runtime
+                .sweep_expired_key_package_private_material()
+                .unwrap(),
+            0,
+            "staging without an ACK must not start the retained bundle grace"
+        );
+        assert!(runtime.durably_owned_key_packages().unwrap().contains(&old));
+        if consume {
+            // A relay can still advertise A and issue a new Welcome after 24h.
+            let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob");
+            let welcome = welcome_for_key_package(
+                &mut bob,
+                &runtime.session().self_id(),
+                old.clone(),
+                "lost ACK invite",
+            )
+            .await;
+            let joined = runtime.session_mut().ingest(welcome).await.unwrap();
+            assert!(
+                joined
+                    .effects
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, GroupEvent::GroupJoined { .. }))
+            );
+            assert_eq!(
+                runtime
+                    .sweep_expired_key_package_private_material()
+                    .unwrap(),
+                1
+            );
+            assert!(!runtime.durably_owned_key_packages().unwrap().contains(&old));
+        } else {
+            // The ACK arrives well after staging/authoring, and survives restart.
+            *publisher.remaining_failures.lock().unwrap() = 0;
+            runtime.publish_fresh_key_package().await.unwrap();
+            drop(runtime);
+            let mut runtime = open();
+            assert_eq!(
+                runtime
+                    .key_package_maintenance_status()
+                    .unwrap()
+                    .unwrap()
+                    .retained_private_material[0]
+                    .replaced_at,
+                Some(Timestamp(now + 86401))
+            );
+            // A later same-slot promotion must not restart A's first-ACK grace.
+            wall.set(now + 86401 + 3600);
+            runtime.publish_fresh_key_package().await.unwrap();
+            wall.set(now + 86401 + 86400 - 1);
+            assert_eq!(
+                runtime
+                    .sweep_expired_key_package_private_material()
+                    .unwrap(),
+                0
+            );
+            assert!(runtime.durably_owned_key_packages().unwrap().contains(&old));
+            wall.set(now + 86401 + 86400);
+            assert_eq!(
+                runtime
+                    .sweep_expired_key_package_private_material()
+                    .unwrap(),
+                1
+            );
+            assert!(!runtime.durably_owned_key_packages().unwrap().contains(&old));
+        }
+    }
 }

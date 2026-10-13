@@ -65,8 +65,8 @@ const KEY_PACKAGE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 /// Refresh the installation's slot age weekly without changing MLS lifetime policy.
 const KEY_PACKAGE_REPUBLISH_INTERVAL: u64 = 7 * 24 * 60 * 60;
 /// A short grace for Welcomes already in flight because gap filling does not
-/// exist yet; deliberately retain superseded unconsumed bundles for 24 hours
-/// rather than deleting immediately or retaining until MLS expiry.
+/// exist yet; retain superseded unconsumed bundles for 24 hours after the
+/// first accepted newer same-slot publication, capped by MLS expiry.
 const REPLACED_KEY_PACKAGE_RETENTION: u64 = 24 * 60 * 60;
 /// Bound forced regeneration in a contested slot, including across restarts.
 const KEY_PACKAGE_SLOT_CONFLICT_REPUBLISH_INTERVAL: u64 = 60 * 60;
@@ -1057,6 +1057,13 @@ where
             &receipt.failed,
             self.wall_clock.now(),
         );
+        // All retained bundles belong to this stable slot and precede the
+        // strictly newer pending artifact. Start only unstamped grace periods;
+        // subsequent promotions and fanout ACKs must not extend earlier ones.
+        let acknowledged_at = self.wall_clock.now();
+        for material in &mut lifecycle.retained_private_material {
+            material.replaced_at.get_or_insert(acknowledged_at);
+        }
         let previous = lifecycle.current_key_package.clone();
         let previous_was_consumed = lifecycle.current_key_package_ref.is_some()
             && lifecycle.current_key_package_ref == lifecycle.last_consumed_key_package_ref;
@@ -1073,7 +1080,7 @@ where
                     key_package,
                     key_package_ref,
                     not_after,
-                    replaced_at: self.wall_clock.now(),
+                    replaced_at: Some(acknowledged_at),
                 });
         }
         lifecycle.current_key_package = Some(replacement.key_package.clone());
@@ -1344,11 +1351,12 @@ where
             let was_consumed = consumed_ref
                 .is_some_and(|consumed| consumed == material.key_package_ref.as_slice());
             if material.not_after <= now
-                || material
-                    .replaced_at
-                    .0
-                    .saturating_add(REPLACED_KEY_PACKAGE_RETENTION)
-                    <= now.0
+                || material.replaced_at.is_some_and(|acknowledged_at| {
+                    acknowledged_at
+                        .0
+                        .saturating_add(REPLACED_KEY_PACKAGE_RETENTION)
+                        <= now.0
+                })
                 || was_consumed
             {
                 consumed_retained_deleted |= was_consumed;
