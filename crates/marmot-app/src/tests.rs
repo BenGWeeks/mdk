@@ -7461,6 +7461,7 @@ async fn key_package_deletion_batch_preserves_partial_results_and_cache_ownershi
             &account.label,
             vec![
                 KeyPackageDeletionTarget {
+                    slot_id: None,
                     event_id_hex: first_event_id,
                     source_relays: vec![
                         TransportEndpoint("wss://relay.example".into()),
@@ -7468,6 +7469,7 @@ async fn key_package_deletion_batch_preserves_partial_results_and_cache_ownershi
                     ],
                 },
                 KeyPackageDeletionTarget {
+                    slot_id: None,
                     event_id_hex: retained_event_id,
                     source_relays: vec![TransportEndpoint("wss://second.example".into())],
                 },
@@ -7559,6 +7561,7 @@ async fn key_package_deletion_routes_endpoints_through_relay_safety_policy() {
         .delete_key_package_events(
             &account.label,
             vec![KeyPackageDeletionTarget {
+                slot_id: None,
                 event_id_hex: "66".repeat(32),
                 source_relays: vec![TransportEndpoint("ws://127.0.0.1:7777".into())],
             }],
@@ -7588,6 +7591,7 @@ async fn key_package_deletion_routes_endpoints_through_relay_safety_policy() {
         .delete_key_package_events(
             &dev_account.label,
             vec![KeyPackageDeletionTarget {
+                slot_id: None,
                 event_id_hex: "77".repeat(32),
                 source_relays: vec![TransportEndpoint("ws://127.0.0.1:7777".into())],
             }],

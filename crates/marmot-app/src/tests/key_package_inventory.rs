@@ -536,6 +536,18 @@ async fn sign_out_deletes_owned_legacy_slot_but_preserves_unowned_events() {
         .await
         .unwrap();
     assert_eq!(kind5_targets(&relay), vec![legacy.id]);
+    assert!(
+        relay
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == 5)
+            .all(|event| event
+                .tags
+                .iter()
+                .all(|tag| tag.first().is_none_or(|name| name != "a")))
+    );
     assert_eq!(outcome.key_packages_deleted, 1);
     runtime.shutdown().await;
 }
@@ -623,10 +635,12 @@ async fn listing_does_not_publish_and_partial_deletion_still_uses_explicit_targe
             &account.label,
             vec![
                 KeyPackageDeletionTarget {
+                    slot_id: None,
                     event_id_hex: older.id.clone(),
                     source_relays: vec![endpoint(DIRECTORY)],
                 },
                 KeyPackageDeletionTarget {
+                    slot_id: None,
                     event_id_hex: newer.id.clone(),
                     source_relays: vec![endpoint(DIRECTORY)],
                 },
@@ -1316,5 +1330,75 @@ async fn assert_sign_out_discovers_older_installation_events(wipe: bool) {
     let targets = kind5_targets(&relay).into_iter().collect::<BTreeSet<_>>();
     assert_eq!(targets, BTreeSet::from([installation.id, legacy.id]));
     assert!(siblings.iter().all(|event| !targets.contains(&event.id)));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn sign_out_coordinate_covers_superseded_events_beyond_fetch_limit() {
+    let (_dir, runtime, account, fetcher, relay) = runtime_inventory_fixture().await;
+    let app = runtime.app_for_test();
+    let (_, lifecycle) = app
+        .capture_local_key_package_ownership_and_lifecycle(&account.label)
+        .unwrap();
+    let slot = lifecycle.unwrap().stable_slot_id;
+    // An unowned package keeps these versions out of the owned-ref queries:
+    // discovery must use the installation's d query, capped at 12 events.
+    let package = fresh_key_package_for_account(app, &account, false).await;
+    let versions = (0..15)
+        .map(|index| key_package_event(&account, package.clone(), &slot, 10 + index))
+        .collect::<Vec<_>>();
+    let sibling = key_package_event(&account, package.clone(), OTHER_SLOT, 30);
+    let mut events = versions.clone();
+    events.push(sibling.clone());
+    seed_fetcher(&fetcher, &account, events, &[DIRECTORY]);
+    let before = nostr_sdk::prelude::Timestamp::now().as_secs();
+    let outcome = runtime
+        .sign_out(
+            &account.label,
+            SignOutOptions {
+                delete_key_packages: true,
+            },
+        )
+        .await
+        .unwrap();
+    let after = nostr_sdk::prelude::Timestamp::now().as_secs();
+    assert_key_package_queries_use_limit_12(&fetcher);
+    assert_eq!(outcome.key_packages_deleted, 12);
+    let targets = kind5_targets(&relay).into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(targets.len(), 12);
+    assert!(
+        !targets.contains(&versions[0].id),
+        "oldest version was not fetched"
+    );
+    assert!(!targets.contains(&sibling.id));
+    let coordinate = format!("30443:{}:{slot}", account.account_id_hex);
+    let deletions = relay.published_events.lock().unwrap().clone();
+    let deletions = deletions
+        .iter()
+        .filter(|event| event.kind == 5)
+        .collect::<Vec<_>>();
+    assert_eq!(deletions.len(), 12);
+    for deletion in &deletions {
+        assert!(
+            deletion
+                .tags
+                .contains(&vec!["a".into(), coordinate.clone()])
+        );
+        assert!((before..=after).contains(&deletion.created_at));
+        assert_eq!(deletion.pubkey, account.account_id_hex);
+    }
+    // NIP-09's coordinate and timestamp predicate covers even unfetched versions.
+    assert!(
+        versions
+            .iter()
+            .all(|version| deletions.iter().any(|deletion| {
+                deletion.pubkey == version.pubkey
+                    && version.created_at <= deletion.created_at
+                    && deletion
+                        .tags
+                        .contains(&vec!["a".into(), coordinate.clone()])
+            }))
+    );
+    drop(deletions);
     runtime.shutdown().await;
 }

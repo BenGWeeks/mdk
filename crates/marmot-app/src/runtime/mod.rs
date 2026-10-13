@@ -4093,6 +4093,7 @@ impl MarmotAppRuntime {
             .into_iter()
             .filter(|event| seen.insert(event.key_package_event_id.clone()))
             .map(|event| KeyPackageDeletionTarget {
+                slot_id: Some(event.key_package_id),
                 event_id_hex: event.key_package_event_id,
                 source_relays: event
                     .source_relays
