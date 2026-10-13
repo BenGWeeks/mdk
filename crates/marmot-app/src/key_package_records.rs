@@ -338,7 +338,15 @@ impl ValidatedMemberKeyPackages {
         allows: impl Fn(&FetchedKeyPackage) -> bool,
         exclusions: &MemberKeyPackageExclusions,
     ) -> Result<DirectorySelection<Vec<FetchedKeyPackage>>, AppError> {
-        let now = crate::unix_now_seconds();
+        self.select_at(crate::unix_now_seconds(), allows, exclusions)
+    }
+
+    pub(crate) fn select_at(
+        &mut self,
+        now: u64,
+        allows: impl Fn(&FetchedKeyPackage) -> bool,
+        exclusions: &MemberKeyPackageExclusions,
+    ) -> Result<DirectorySelection<Vec<FetchedKeyPackage>>, AppError> {
         let mut refs = BTreeSet::new();
         let mut keys = BTreeSet::new();
         let mut eligible = self

@@ -95,6 +95,52 @@ async fn invite_all_fresh_devices_caps_newest_slots_and_deduplicates_refs() {
 }
 
 #[tokio::test]
+async fn invite_all_fresh_devices_publication_age_includes_exact_freshness_boundary() {
+    let (_directory, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = 1_700_000_000;
+    let window = MEMBER_KEY_PACKAGE_FRESHNESS_WINDOW.as_secs();
+    let mut records = Vec::new();
+    for (slot, age) in [window - 1, window, window + 1].into_iter().enumerate() {
+        records.push(RelayEventRecord {
+            event: device_event(
+                account,
+                fresh_key_package_for_account(&app, account, false).await,
+                slot,
+                now - age,
+            ),
+            endpoints: vec![],
+        });
+    }
+    // MLS lifetime validation remains independent of publication age. Only the
+    // selection clock is fixed so the exact second boundary cannot drift.
+    let mut candidates = crate::key_package_records::validate_member_key_package_candidates(
+        &account.account_id_hex,
+        &records,
+        DirectoryFreshness {
+            max_created_at: now,
+        },
+        None,
+    );
+    let selected = candidates
+        .select_at(
+            now,
+            |_| true,
+            &crate::key_package_records::MemberKeyPackageExclusions::default(),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(
+        selected
+            .iter()
+            .map(|package| package.key_package_event_id.clone())
+            .collect::<Vec<_>>(),
+        vec![records[0].event.id.clone(), records[1].event.id.clone()],
+        "include ages window - 1 and window; exclude window + 1 seconds",
+    );
+}
+
+#[tokio::test]
 async fn invite_all_fresh_devices_publication_age_and_single_stale_fallback() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let account = &accounts[0];
