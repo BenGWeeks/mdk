@@ -66,6 +66,40 @@ pub(crate) fn select_lowest_digest_per_leaf(
     selected.into_values().map(|(_, index)| index).collect()
 }
 
+/// Choose one proposal per leaf, then limit each active admin account to
+/// departures that leave at least one of its canonical leaves. Leaf ordering
+/// makes the surviving leaf independent of proposal arrival order.
+pub(crate) fn select_admin_safe_self_remove_batch(
+    mls_group: &MlsGroup,
+    candidates: &[(LeafNodeIndex, [u8; 32])],
+) -> Result<Vec<usize>, cgka_traits::EngineError> {
+    let admins = crate::app_components::admins_of_group(mls_group)?;
+    let mut remaining_admin_leaves = BTreeMap::new();
+    for member in mls_group.members() {
+        if let Ok(credential) = openmls::prelude::BasicCredential::try_from(member.credential)
+            && let Ok(account) = <[u8; 32]>::try_from(credential.identity())
+            && admins.contains(&account)
+        {
+            *remaining_admin_leaves.entry(account).or_insert(0usize) += 1;
+        }
+    }
+    let mut selected = Vec::new();
+    for index in select_lowest_digest_per_leaf(candidates) {
+        let PubkeyResult::Ok(account) = pubkey_at_leaf_index(mls_group, candidates[index].0) else {
+            // Match the individual proposal policy's fail-closed posture.
+            continue;
+        };
+        if let Some(remaining) = remaining_admin_leaves.get_mut(&account) {
+            if *remaining <= 1 {
+                continue;
+            }
+            *remaining -= 1;
+        }
+        selected.push(index);
+    }
+    Ok(selected)
+}
+
 /// Inspect a QueuedProposal and decide whether we should auto-commit.
 ///
 /// Criteria:

@@ -756,6 +756,186 @@ async fn sibling_device_membership_preserves_activity_targets() {
     }
 }
 
+/// Two admin installations request departure in the same source epoch.
+async fn concurrent_admin_sibling_leaves() -> (
+    [Engine<SqliteAccountStorage>; 3],
+    SqliteAccountStorage,
+    GroupId,
+    [TransportMessage; 2],
+) {
+    let device = |label: &[u8], storage: SqliteAccountStorage| {
+        EngineBuilder::new(storage)
+            .identity(pad32(label))
+            .account_identity_proof_signer(proof_signer(label))
+            .feature_registry(selfremove_registry())
+            .peeler(Box::new(MockPeeler))
+            .build()
+            .unwrap()
+    };
+    let mut a1 = device(b"alice", SqliteAccountStorage::in_memory().unwrap());
+    let mut a2 = device(b"alice", SqliteAccountStorage::in_memory().unwrap());
+    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = device(b"bob", bob_storage.clone());
+    let kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = a1
+        .create_group(CreateGroupRequest {
+            name: "concurrent admin leaves".into(),
+            description: String::new(),
+            members: vec![kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("founding group")
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let kp = a2.fresh_key_package().await.unwrap();
+    let SendResult::GroupEvolution {
+        msg,
+        pending,
+        mut welcomes,
+    } = a1
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("sibling invite")
+    };
+    a1.confirm_published(pending).await.unwrap();
+    a2.join_welcome(welcomes.remove(0)).await.unwrap();
+    bob.ingest(route_group_commit(msg, &group_id))
+        .await
+        .unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    let mut proposals = Vec::new();
+    for leaver in [&mut a1, &mut a2] {
+        let SendResult::Proposal { msg } = leaver
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("SelfRemove proposal")
+        };
+        proposals.push(route_group_commit(msg, &group_id));
+    }
+    (
+        [a1, a2, bob],
+        bob_storage,
+        group_id,
+        proposals.try_into().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn concurrent_admin_sibling_leaves_publish_only_one_departure() {
+    for reverse in [false, true] {
+        let ([mut a1, mut a2, mut bob], _, group_id, mut proposals) =
+            concurrent_admin_sibling_leaves().await;
+        if reverse {
+            proposals.reverse();
+        }
+        let admins = bob.admin_pubkeys(&group_id).unwrap();
+        for proposal in &proposals {
+            for peer in [&mut a1, &mut a2, &mut bob] {
+                peer.ingest(proposal.clone()).await.unwrap();
+            }
+        }
+        advance_selfremove_auto_commit(&mut bob, &group_id).await;
+        let mut publications = bob.drain_auto_publish();
+        assert_eq!(publications.len(), 1);
+        let publication = publications.remove(0);
+        assert_eq!(
+            bob.members(&group_id).unwrap().len(),
+            2,
+            "the published batch must preserve an admin leaf"
+        );
+        let selected_members = bob.members(&group_id).unwrap();
+        // All-failed publication must rebuild the same safe selection.
+        bob.publish_failed(publication.pending).await.unwrap();
+        advance_selfremove_auto_commit(&mut bob, &group_id).await;
+        let mut retry = bob.drain_auto_publish();
+        assert_eq!(retry.len(), 1);
+        let retry = retry.remove(0);
+        assert_eq!(bob.members(&group_id).unwrap(), selected_members);
+        bob.confirm_published(retry.pending).await.unwrap();
+        for peer in [&mut a1, &mut a2] {
+            peer.ingest(route_group_commit(retry.msg.clone(), &group_id))
+                .await
+                .unwrap();
+            converge_buffered_commit(peer, &group_id);
+        }
+        assert_eq!(bob.members(&group_id).unwrap().len(), 2);
+        assert_eq!(bob.admin_pubkeys(&group_id).unwrap(), admins);
+        assert!(a1.group_record(&group_id).unwrap().removed);
+        assert!(!a2.group_record(&group_id).unwrap().removed);
+        assert_eq!(
+            a2.members(&group_id).unwrap(),
+            bob.members(&group_id).unwrap()
+        );
+        assert_eq!(a2.admin_pubkeys(&group_id).unwrap(), admins);
+        advance_selfremove_auto_commit(&mut bob, &group_id).await;
+        assert!(bob.drain_auto_publish().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_admin_sibling_leaves_cannot_confirm_orphaned_admin() {
+    let ([_, _, mut bob], storage, group_id, proposals) = concurrent_admin_sibling_leaves().await;
+    // Obtain a legitimate pending handle for a single sibling departure.
+    bob.ingest(proposals[0].clone()).await.unwrap();
+    advance_selfremove_auto_commit(&mut bob, &group_id).await;
+    let publication = bob.drain_auto_publish().remove(0);
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let (mut group, signer) = load_group_and_signer(&storage, &bob.self_id(), &group_id);
+    let source_epoch = group.epoch();
+    group.clear_pending_commit(provider.storage()).unwrap();
+    group.clear_pending_proposals(provider.storage()).unwrap();
+    // Simulate an invalid staged batch left by another producer/older scheduler.
+    for proposal in proposals {
+        let msg = MlsMessageIn::tls_deserialize_exact(proposal.payload.as_slice()).unwrap();
+        let protocol: ProtocolMessage = match msg.extract() {
+            MlsMessageBodyIn::PublicMessage(msg) => msg.into(),
+            MlsMessageBodyIn::PrivateMessage(msg) => msg.into(),
+            _ => panic!("proposal message"),
+        };
+        let ProcessedMessageContent::ProposalMessage(queued) = group
+            .process_message(&provider, protocol)
+            .unwrap()
+            .into_content()
+        else {
+            panic!("SelfRemove proposal")
+        };
+        group
+            .store_pending_proposal(provider.storage(), *queued)
+            .unwrap();
+    }
+    group
+        .commit_to_pending_proposals(&provider, &signer)
+        .unwrap();
+    let result = bob.confirm_published(publication.pending).await;
+    assert!(
+        matches!(result, Err(EngineError::UnknownMember { .. })),
+        "confirmation must reject the orphaned admin: {result:?}"
+    );
+    let (group, _) = load_group_and_signer(&storage, &bob.self_id(), &group_id);
+    assert_eq!(group.epoch(), source_epoch);
+    assert_eq!(group.members().count(), 3);
+    assert!(group.pending_commit().is_some());
+    bob.publish_failed(publication.pending).await.unwrap();
+    assert_eq!(bob.members(&group_id).unwrap().len(), 3);
+}
+
 /// Leaving removes one installation, while account-level administration survives.
 #[tokio::test]
 async fn admin_sibling_leaf_leave_preserves_admin_account() {
