@@ -5058,3 +5058,151 @@ fn deletion_provenance_changes_refresh_chat_preview() {
     assert!(preview.plaintext.is_empty());
     assert_eq!(preview.deletion_source, crate::DeletionSource::Admin);
 }
+
+#[test]
+fn multi_device_pair_upgrade_preserves_direct_filters_and_activity_policy() {
+    let local = "aa".repeat(32);
+    let peer = "bb".repeat(32);
+    let mut projected = direct_group(GROUP, &local, &peer);
+    projected.member_count = Some(14);
+    projected.direct_member_ids_hex = None;
+    let store = setup_store_with_group(projected);
+    let mut roster = sample_group(GroupId::new(hex::decode(GROUP).unwrap()), 7, 0);
+    roster.members = [vec![0xaa; 4], vec![0xbb; 10]]
+        .concat()
+        .into_iter()
+        .map(|byte| cgka_traits::group::Member {
+            id: cgka_traits::types::MemberId::new(vec![byte; 32]),
+            credential: Vec::new(),
+        })
+        .collect();
+    store.put_group(&roster).unwrap();
+    {
+        let mut conn = store.lock().unwrap();
+        // Recreate first open of an older database, when this migration exists.
+        conn.execute("DELETE FROM cgka_schema_migrations WHERE version = 108", [])
+            .unwrap();
+        crate::migrations::run_all(&mut conn).unwrap();
+    }
+    let row = store
+        .refresh_chat_list_row(&local, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.conversation_kind, ChatConversationKind::Direct);
+    assert_eq!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .unindexed_direct_conversation_group_ids()
+            .unwrap()
+            .is_empty()
+    );
+    let input = store.chat_presentation_input(GROUP).unwrap().unwrap();
+    assert_eq!(input.member_count, Some(2));
+    assert_eq!(input.members, vec![local.clone(), peer.clone()]);
+    store
+        .initialize_chat_read_state(&local, GROUP, &no_mentions)
+        .unwrap();
+    let before = store.chat_list_row(GROUP).unwrap().unwrap();
+    for (index, system_type) in [
+        GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+        GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .record_app_event(&group_system(
+                &format!("pair-system-{index}"),
+                &peer,
+                unix_now_seconds() + 1,
+                system_type,
+                &format!(r#"{{"v":1,"system_type":"{system_type}","text":"Changed"}}"#),
+            ))
+            .unwrap();
+        let after = store
+            .refresh_chat_list_row(&local, GROUP, &no_mentions)
+            .unwrap()
+            .unwrap();
+        assert!(after.last_message.is_none());
+        assert_eq!(after.unread_count, 0);
+        assert_eq!(after.activity_sort_at, before.activity_sort_at);
+    }
+
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Left)
+        .unwrap();
+    store
+        .record_app_event(&chat(
+            "after-departure",
+            &peer,
+            unix_now_seconds() + 2,
+            "hello",
+        ))
+        .unwrap();
+    let departed = store
+        .refresh_chat_list_row(&local, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap();
+    assert_eq!(departed.self_membership, SelfMembership::Left);
+    assert_eq!(
+        store.account_unread_total().unwrap(),
+        AccountUnreadTotal::default()
+    );
+    assert!(
+        select_reusable_direct_conversation(
+            &store.direct_conversation_candidate_rows(&peer).unwrap(),
+            &local,
+            &peer,
+            &HashMap::from([(GROUP.to_owned(), vec![local.clone(), peer.clone()])]),
+        )
+        .is_none()
+    );
+
+    // After every local leaf leaves, the surviving peer's ten leaves are one
+    // account. Preserve the existing one-account Group and non-reuse rules.
+    roster
+        .members
+        .retain(|member| member.id.as_slice() == [0xbb; 32]);
+    store.put_group(&roster).unwrap();
+    let mut remaining = group();
+    remaining.profile_name.clear();
+    remaining.member_count = Some(1);
+    remaining.self_membership = SelfMembership::Left;
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![remaining],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(&local, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.conversation_kind, ChatConversationKind::Group);
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .chat_presentation_input(GROUP)
+            .unwrap()
+            .unwrap()
+            .member_count,
+        Some(1)
+    );
+}

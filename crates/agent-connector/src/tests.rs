@@ -8377,3 +8377,90 @@ async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
         "the pre-edit entries the lagging relay served must not come back"
     );
 }
+
+async fn multi_device_group_info_snapshot() -> marmot_app::AppGroupConversationSnapshot {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), relay_url.clone()));
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let peer = runtime.create_identity(setup).await.unwrap();
+    let group = runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "Named pair",
+            std::slice::from_ref(&peer.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut snapshot = runtime
+        .group_conversation_snapshot(&agent.account.account_id_hex, &group)
+        .await
+        .unwrap();
+    runtime.shutdown().await;
+    assert_eq!(snapshot.members.len(), 2);
+    snapshot.members = [
+        vec![snapshot.members[0].clone(); 4],
+        vec![snapshot.members[1].clone(); 10],
+    ]
+    .concat();
+    snapshot.mls_state.member_count = 14;
+    snapshot
+}
+
+#[tokio::test]
+async fn multi_device_group_info_counts_accounts_for_activation() {
+    let mut snapshot = multi_device_group_info_snapshot().await;
+    assert_eq!(crate::messaging::group_info_member_count(&snapshot), 2);
+    // A named pair retains the connector's existing effective-DM activation policy.
+    assert_eq!(snapshot.group.profile.name, "Named pair");
+    let mut third = snapshot.members[0].clone();
+    third.member_id_hex = "cc".repeat(32);
+    snapshot.members = vec![
+        snapshot.members[0].clone(),
+        snapshot.members[4].clone(),
+        third,
+    ];
+    snapshot.mls_state.member_count = 3;
+    assert_eq!(crate::messaging::group_info_member_count(&snapshot), 3);
+    snapshot.members.truncate(1);
+    snapshot.mls_state.member_count = 1;
+    assert_eq!(crate::messaging::group_info_member_count(&snapshot), 1);
+}
+
+#[tokio::test]
+async fn multi_device_group_info_home_diagnostics_use_projected_account_count() {
+    let snapshot = multi_device_group_info_snapshot().await;
+    assert_eq!(
+        crate::diagnostics::diagnostic_home_membership(Some(&snapshot.group)),
+        (Some(2), Some(true))
+    );
+}
+
+#[tokio::test]
+async fn multi_device_group_info_direct_invite_admission_counts_accounts() {
+    let snapshot = multi_device_group_info_snapshot().await;
+    let direct = crate::messaging::group_info_member_count(&snapshot) == 2;
+    assert!(crate::invite_policy::invite_policy_allows(
+        agent_control::AgentControlInvitePolicy::AnyAuthenticatedDirect,
+        true,
+        false,
+        direct,
+    ));
+    assert!(!crate::invite_policy::invite_policy_allows(
+        agent_control::AgentControlInvitePolicy::AnyAuthenticatedDirect,
+        false,
+        false,
+        direct,
+    ));
+}
