@@ -153,22 +153,113 @@ impl Drop for DeviceLabelDemandRegistration {
     }
 }
 
-/// Created before spawn so even an unpolled, cancelled task clears its flag.
+/// Created before spawn so even an unpolled, cancelled task retries its scope.
 struct LabelPublicationGuard {
     state: Weak<Mutex<LabelEventState>>,
     generation: u64,
+    deadline: Instant,
+    // Retry a cancelled executor once on the admission executor, then on a
+    // fenced OS thread if that executor has also been destroyed.
+    retry: bool,
+    executor_id: Option<tokio::runtime::Id>,
+    fallback: Option<tokio::runtime::Handle>,
 }
 impl Drop for LabelPublicationGuard {
     fn drop(&mut self) {
-        if let Some(state) = self.state.upgrade() {
-            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.generation == self.generation {
-                state.pending = None;
-                state.task = None;
-                // A destroyed executor cannot serve the next admission.
-                state.executor = None;
+        let Some(shared) = self.state.upgrade() else {
+            return;
+        };
+        let retry = {
+            let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if state.generation != self.generation {
+                return;
             }
+            state.task = None;
+            // Do not overwrite a managed executor installed since admission.
+            if state.executor.as_ref().map(tokio::runtime::Handle::id) == self.executor_id {
+                state.executor = self.fallback.clone();
+            }
+            if self.retry && state.pending.is_some() {
+                // Fence the rejected spawn's late abort-handle installation.
+                state.generation = state.generation.wrapping_add(1);
+                Some(state.generation)
+            } else {
+                state.pending = None;
+                None
+            }
+        };
+        if let Some(generation) = retry {
+            spawn_label_publication(
+                shared,
+                generation,
+                self.fallback.take(),
+                None,
+                self.deadline,
+            );
         }
+    }
+}
+
+// Spawning can synchronously drop the future (and lock state through its
+// guard). Aborting can also start cancellation. Neither runs under state.
+fn spawn_label_publication(
+    shared: Arc<Mutex<LabelEventState>>,
+    generation: u64,
+    executor: Option<tokio::runtime::Handle>,
+    fallback: Option<tokio::runtime::Handle>,
+    deadline: Instant,
+) {
+    let guard = LabelPublicationGuard {
+        state: Arc::downgrade(&shared),
+        generation,
+        deadline,
+        retry: executor.is_some(),
+        executor_id: executor.as_ref().map(tokio::runtime::Handle::id),
+        fallback,
+    };
+    let publication_state = shared.clone();
+    let publish = move || {
+        let mut state = publication_state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.generation != generation {
+            return;
+        }
+        if let Some(account_id_hex) = state.pending.take()
+            && let Some(events) = &state.events
+        {
+            let _ = events.send(crate::MarmotAppEvent::DeviceLabelsChanged { account_id_hex });
+        }
+        state.task = None;
+        // Disarm cancellation without discarding the managed executor.
+        state.generation = state.generation.wrapping_add(1);
+    };
+    if let Some(executor) = executor {
+        let task = executor
+            .spawn(async move {
+                let _guard = guard;
+                tokio::time::sleep_until(deadline).await;
+                publish();
+            })
+            .abort_handle();
+        let installed = {
+            let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if state.generation == generation && state.pending.is_some() {
+                state.task = Some(task.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if !installed {
+            task.abort();
+        }
+    } else {
+        // Synchronous hosts and destroyed executors still get a fixed-window
+        // publisher. Generation fencing suppresses it after runtime teardown.
+        std::thread::spawn(move || {
+            let _guard = guard;
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            publish();
+        });
     }
 }
 
@@ -191,12 +282,15 @@ impl DeviceLabelEvents {
             .executor = Some(executor);
     }
     pub(crate) fn stop(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.generation = state.generation.wrapping_add(1);
-        state.pending = None;
-        state.events = None;
-        state.executor = None;
-        if let Some(task) = state.task.take() {
+        let task = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.generation = state.generation.wrapping_add(1);
+            state.pending = None;
+            state.events = None;
+            state.executor = None;
+            state.task.take()
+        };
+        if let Some(task) = task {
             task.abort();
         }
     }
@@ -270,59 +364,39 @@ impl DeviceLabelEvents {
             }
         }
     }
+    /// Prefer the managed executor over the admission caller's executor. If
+    /// its stored handle is stale, retain the pending scope and deadline and
+    /// retry on the caller's executor, then a teardown-fenced OS thread. A
+    /// destroyed executor must never silently lose an admitted label change.
     fn publish_change(&self, account: &str) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.events.is_none() {
-            return;
-        }
-        if let Some(scope) = &mut state.pending {
-            if scope.as_deref() != Some(account) {
-                *scope = None;
-            }
-            return;
-        }
-        state.pending = Some(Some(account.to_owned()));
-        state.generation = state.generation.wrapping_add(1);
-        let generation = state.generation;
-        let guard = LabelPublicationGuard {
-            state: Arc::downgrade(&self.state),
-            generation,
-        };
-        let shared = self.state.clone();
-        let publish = move || {
-            let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-            if state.generation != generation {
+        let (generation, executor) = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.events.is_none() {
                 return;
             }
-            if let Some(account_id_hex) = state.pending.take()
-                && let Some(events) = &state.events
-            {
-                let _ = events.send(crate::MarmotAppEvent::DeviceLabelsChanged { account_id_hex });
+            if let Some(scope) = &mut state.pending {
+                if scope.as_deref() != Some(account) {
+                    *scope = None;
+                }
+                return;
             }
-            state.task = None;
-            // Disarm cancellation without discarding the managed executor.
+            state.pending = Some(Some(account.to_owned()));
             state.generation = state.generation.wrapping_add(1);
+            (state.generation, state.executor.clone())
         };
-        if let Some(executor) = &state.executor {
-            let deadline = Instant::now() + DEVICE_LABEL_CHANGE_COALESCE_INTERVAL;
-            state.task = Some(
-                executor
-                    .spawn(async move {
-                        let _guard = guard;
-                        tokio::time::sleep_until(deadline).await;
-                        publish();
-                    })
-                    .abort_handle(),
-            );
-        } else {
-            // Before runtime start, synchronous hosts have no managed executor.
-            // This fixed-window publisher is still fenced by runtime teardown.
-            std::thread::spawn(move || {
-                let _guard = guard;
-                std::thread::sleep(DEVICE_LABEL_CHANGE_COALESCE_INTERVAL);
-                publish();
-            });
-        }
+        let current = tokio::runtime::Handle::try_current().ok();
+        let fallback = current.filter(|current| {
+            executor
+                .as_ref()
+                .is_none_or(|executor| executor.id() != current.id())
+        });
+        spawn_label_publication(
+            self.state.clone(),
+            generation,
+            executor,
+            fallback,
+            Instant::now() + DEVICE_LABEL_CHANGE_COALESCE_INTERVAL,
+        );
     }
 }
 
@@ -793,6 +867,91 @@ mod tests {
         }
         assert_eq!(events.demand_receiver_count(), 0);
     }
+    // Admission is synchronous: a Tokio timeout on the calling task cannot
+    // interrupt a mutex deadlock. Keep it on a detached OS thread and bound
+    // both admission and delivery from the test thread.
+    fn admission_after_executor_destruction(earlier_publication: bool, async_admission: bool) {
+        let labels = DeviceLabelEvents::default();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(2);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            labels.attach(events);
+            if earlier_publication {
+                labels.publish_change("a");
+                tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                    .await
+                    .expect("earlier publication must complete")
+                    .unwrap();
+            }
+        });
+        drop(executor);
+        let (done, completion) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let survivor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            if !async_admission {
+                labels.publish_change("b");
+                done.send(()).unwrap();
+            }
+            survivor.block_on(async {
+                if async_admission {
+                    labels.publish_change("b");
+                    done.send(()).unwrap();
+                }
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                        .await
+                        .expect("stale executor must not lose the admitted change")
+                        .unwrap(),
+                    crate::MarmotAppEvent::DeviceLabelsChanged {
+                        account_id_hex: Some("b".into())
+                    }
+                );
+                done.send(()).unwrap();
+            });
+        });
+        completion
+            .recv_timeout(Duration::from_secs(3))
+            .expect("admission deadlocked on a destroyed executor");
+        completion
+            .recv_timeout(Duration::from_secs(3))
+            .expect("publication did not finish on the surviving executor");
+    }
+
+    #[test]
+    fn device_labels_round7_admission_after_unused_executor_destruction() {
+        admission_after_executor_destruction(false, true);
+    }
+
+    #[test]
+    fn device_labels_round7_admission_after_completed_executor_destruction() {
+        admission_after_executor_destruction(true, true);
+    }
+
+    #[test]
+    fn device_labels_round7_synchronous_admission_after_executor_destruction() {
+        admission_after_executor_destruction(false, false);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn device_labels_round7_stop_fences_cancelled_publisher() {
+        let labels = DeviceLabelEvents::default();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(2);
+        labels.attach(events);
+        labels.publish_change("a");
+        labels.stop();
+        tokio::task::yield_now().await;
+        tokio::time::advance(DEVICE_LABEL_CHANGE_COALESCE_INTERVAL).await;
+        assert!(receiver.try_recv().is_err());
+        assert!(labels.state.lock().unwrap().pending.is_none());
+        assert!(labels.state.lock().unwrap().task.is_none());
+    }
+
     #[test]
     fn device_labels_round6_cancelled_executor_allows_later_publication() {
         let labels = DeviceLabelEvents::default();
@@ -812,6 +971,10 @@ mod tests {
             .build()
             .unwrap();
         survivor.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("cancelled publisher must deliver its pending change")
+                .unwrap();
             labels.publish_change("b");
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(1), receiver.recv())
@@ -869,13 +1032,17 @@ mod tests {
             labels.publish_change("a");
         });
         drop(managed);
-        assert!(labels.state.lock().unwrap().pending.is_none());
-        labels.publish_change("b");
         let survivor = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         survivor.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("unpolled cancelled publisher must deliver its pending change")
+                .unwrap();
+            assert!(labels.state.lock().unwrap().pending.is_none());
+            labels.publish_change("b");
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(1), receiver.recv())
                     .await
