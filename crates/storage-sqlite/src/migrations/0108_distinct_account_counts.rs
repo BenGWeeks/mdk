@@ -4,7 +4,7 @@ use rusqlite::{Transaction, params};
 use std::collections::BTreeSet;
 
 /// Correct the projected people count from the stored authoritative roster.
-/// Counts, peer indexes, presentation invalidation and the migration ledger
+/// Counts, peer indexes, unread/base-row readiness and the migration ledger
 /// commit together. Groups without a readable stored roster are repaired by hydration.
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     let mut query = tx
@@ -34,8 +34,8 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             .iter()
             .map(|member| member.id.as_slice())
             .collect();
-        tx.execute("UPDATE account_groups SET member_count = ?2 WHERE group_id_hex = ?1 AND member_count IS NOT ?2",
-            params![id, accounts.len() as i64]).storage()?;
+        let count_changed = tx.execute("UPDATE account_groups SET member_count = ?2 WHERE group_id_hex = ?1 AND member_count IS NOT ?2",
+            params![id, accounts.len() as i64]).storage()? != 0;
         // The count-change trigger clears presentation members before rebuilding.
         tx.execute(
             "DELETE FROM direct_conversation_members WHERE group_id_hex = ?1",
@@ -45,6 +45,21 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         let ids: Vec<_> = accounts.iter().map(hex::encode).collect();
         let pair = ids.len() == 2 && accounts.iter().all(|id| id.len() == 32);
         if pair && name.trim().is_empty() {
+            if count_changed {
+                // Group-system events stop contributing unread activity in Direct
+                // chats. A newer chat can leave preview/high-water checks valid,
+                // so explicitly require unread and base-row preparation again.
+                tx.execute(
+                    "DELETE FROM chat_list_unread_ready_groups WHERE group_id_hex = ?1",
+                    [&id],
+                )
+                .storage()?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO chat_presentation_row_work(group_id_hex) VALUES(?1)",
+                    [&id],
+                )
+                .storage()?;
+            }
             for member in &ids {
                 tx.execute("INSERT INTO direct_conversation_members(group_id_hex, member_id_hex) VALUES(?1, ?2)", params![id, member]).storage()?;
             }

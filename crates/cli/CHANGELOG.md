@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- TUI group details show each account once when a person has multiple devices.
+
 ## [0.13.0] - 2026-10-12
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through

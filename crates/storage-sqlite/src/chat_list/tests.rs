@@ -1956,6 +1956,66 @@ fn chat_list_reads_cached_projection_without_rebuilding() {
 }
 
 #[test]
+fn upgrade_to_distinct_accounts_rebuilds_unread_after_direct_reclassification() {
+    let mut projected = group();
+    projected.profile_name.clear();
+    projected.member_count = Some(14);
+    let store = setup_store_with_group(projected);
+    let mut roster = sample_group(GroupId::new(vec![0x11]), 7, 0);
+    roster.members = [vec![0xaa; 4], vec![0xbb; 10]]
+        .concat()
+        .into_iter()
+        .map(|byte| cgka_traits::group::Member {
+            id: cgka_traits::types::MemberId::new(vec![byte; 32]),
+            credential: Vec::new(),
+        })
+        .collect();
+    store.put_group(&roster).unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&group_system(
+            "made-admin",
+            REMOTE,
+            10,
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
+        ))
+        .unwrap();
+    let mut newer_chat = chat("newer-chat", REMOTE, 20, "hello");
+    newer_chat.source_epoch = Some(11);
+    store.record_app_event(&newer_chat).unwrap();
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let before = store.chat_list_row(GROUP).unwrap().unwrap();
+    assert_eq!(before.conversation_kind, ChatConversationKind::Group);
+    assert_eq!(before.unread_count, 2);
+    assert_eq!(
+        before.first_unread_message_id_hex.as_deref(),
+        Some("made-admin")
+    );
+    assert_eq!(before.last_message.unwrap().message_id_hex, "newer-chat");
+
+    // Migration 108 is data-only: this populated schema and leaf-count projection
+    // are exactly the version-107 input, with its migration ledger restored.
+    {
+        let mut conn = store.lock().unwrap();
+        conn.execute("DELETE FROM cgka_schema_migrations WHERE version = 108", [])
+            .unwrap();
+        crate::migrations::run_all(&mut conn).unwrap();
+    }
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let after = store.chat_list_row(GROUP).unwrap().unwrap();
+    assert_eq!(after.conversation_kind, ChatConversationKind::Direct);
+    assert_eq!(after.unread_count, 1);
+    assert_eq!(
+        after.first_unread_message_id_hex.as_deref(),
+        Some("newer-chat")
+    );
+    assert_eq!(after.last_message.unwrap().message_id_hex, "newer-chat");
+}
+
+#[test]
 fn ensure_chat_list_rows_backfills_missing_projection_rows() {
     let store = setup_store();
     store

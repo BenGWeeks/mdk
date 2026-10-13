@@ -4453,6 +4453,11 @@ mod distinct_account_count_tests {
             conn.execute("INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at, member_count) VALUES(?1, 'fixture', ?2, 7, ?3)",
                 params![id, if byte == 4 { "Named pair" } else { "" }, accounts.len() as i64]).unwrap();
             conn.execute("INSERT INTO chat_list_rows(group_id_hex, group_name, activity_sort_at, updated_at, presentation_json) VALUES(?1, '', 7, 7, X'01')", [&id]).unwrap();
+            conn.execute(
+                "INSERT INTO chat_list_unread_ready_groups(group_id_hex) VALUES(?1)",
+                [&id],
+            )
+            .unwrap();
         }
         // An unreadable engine group is independently quarantined by hydration.
         conn.execute(
@@ -4492,6 +4497,19 @@ mod distinct_account_count_tests {
             Some(vec![1]),
             "presentation invalidation also rolls back"
         );
+        let readiness: (bool, bool) = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM chat_list_unread_ready_groups WHERE group_id_hex=?1),
+                    EXISTS(SELECT 1 FROM chat_presentation_row_work WHERE group_id_hex=?1)",
+                [hex::encode([1; 16])],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            readiness,
+            (true, false),
+            "readiness invalidation also rolls back"
+        );
         conn.execute_batch("DROP TRIGGER fail_pair_backfill;")
             .unwrap();
         run(&mut conn, MIGRATIONS).unwrap();
@@ -4505,6 +4523,19 @@ mod distinct_account_count_tests {
                 )
                 .unwrap();
             assert_eq!(count, expected);
+            let readiness: (bool, bool) = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chat_list_unread_ready_groups WHERE group_id_hex=?1),
+                        EXISTS(SELECT 1 FROM chat_presentation_row_work WHERE group_id_hex=?1)",
+                [&id], |r| Ok((r.get(0)?, r.get(1)?)),
+            ).unwrap();
+            assert_eq!(
+                readiness,
+                if byte == 1 {
+                    (false, true)
+                } else {
+                    (true, false)
+                }
+            );
             let peers: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM direct_conversation_members WHERE group_id_hex=?1",
