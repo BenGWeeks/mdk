@@ -123,6 +123,8 @@ pub(crate) const DEVICE_LABEL_CHANGE_COALESCE_INTERVAL: Duration = Duration::fro
 #[derive(Default)]
 struct LabelEventState {
     events: Option<tokio::sync::broadcast::Sender<crate::MarmotAppEvent>>,
+    // Worker-only notifications must never count as host event subscribers.
+    changes: Option<tokio::sync::broadcast::Sender<Option<String>>>,
     executor: Option<tokio::runtime::Handle>,
     task: Option<tokio::task::AbortHandle>,
     generation: u64,
@@ -226,6 +228,9 @@ fn spawn_label_publication(
         if let Some(account_id_hex) = state.pending.take()
             && let Some(events) = &state.events
         {
+            if let Some(changes) = &state.changes {
+                let _ = changes.send(account_id_hex.clone());
+            }
             let _ = events.send(crate::MarmotAppEvent::DeviceLabelsChanged { account_id_hex });
         }
         state.task = None;
@@ -275,6 +280,14 @@ impl DeviceLabelEvents {
         state.events = Some(events);
         state.executor = tokio::runtime::Handle::try_current().ok();
     }
+    pub(crate) fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<Option<String>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .changes
+            .get_or_insert_with(|| tokio::sync::broadcast::channel(128).0)
+            .subscribe()
+    }
     pub(crate) fn set_executor(&self, executor: tokio::runtime::Handle) {
         self.state
             .lock()
@@ -287,6 +300,7 @@ impl DeviceLabelEvents {
             state.generation = state.generation.wrapping_add(1);
             state.pending = None;
             state.events = None;
+            state.changes = None;
             state.executor = None;
             state.task.take()
         };
@@ -848,6 +862,33 @@ impl AppClient {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn device_labels_round8_internal_changes_do_not_subscribe_to_host_events() {
+        let labels = super::DeviceLabelEvents::default();
+        let (events, receiver) = tokio::sync::broadcast::channel(2);
+        drop(receiver);
+        labels.attach(events.clone());
+        let mut worker = labels.subscribe_changes();
+        assert_eq!(events.receiver_count(), 0);
+
+        labels.publish_change("a");
+        labels.publish_change("b");
+        assert_eq!(worker.recv().await.unwrap(), None);
+        assert_eq!(events.receiver_count(), 0);
+
+        let mut host = events.subscribe();
+        labels.publish_change("c");
+        assert_eq!(worker.recv().await.unwrap(), Some("c".into()));
+        assert_eq!(
+            host.recv().await.unwrap(),
+            crate::MarmotAppEvent::DeviceLabelsChanged {
+                account_id_hex: Some("c".into()),
+            }
+        );
+        labels.stop();
+        assert!(worker.recv().await.is_err());
+    }
+
     use super::*;
     #[test]
     fn device_labels_worker_teardown_releases_demand() {

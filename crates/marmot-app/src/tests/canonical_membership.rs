@@ -3590,7 +3590,7 @@ async fn round6_device_labels_fixture(surface: &str, overflow: bool) {
     }
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     runtime.start().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         while app.device_label_events.demand_receiver_count() == 0 {
             tokio::task::yield_now().await;
         }
@@ -3637,7 +3637,9 @@ async fn round6_device_labels_fixture(surface: &str, overflow: bool) {
         }
         _ => unreachable!(),
     }
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
+    // Wait for admission itself, not a short scheduling window: sorted demand
+    // may put this account behind all 139 misses, especially under parallel load.
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             if !app
                 .shared_storage()

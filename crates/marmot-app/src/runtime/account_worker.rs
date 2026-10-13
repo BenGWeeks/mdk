@@ -1800,7 +1800,7 @@ async fn run_app_runtime_account_worker(
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     let device_label_enrichment = client.device_label_enrichment.clone();
     let device_label_wake = device_label_enrichment.wake.clone();
-    let mut device_label_events = events.subscribe();
+    let mut device_label_events = client.app.device_label_events.subscribe_changes();
     let _device_label_demands = client
         .app
         .device_label_events
@@ -1940,7 +1940,7 @@ async fn run_app_runtime_account_worker(
             }
             event = device_label_events.recv() => {
                 let scope = match event {
-                    Ok(MarmotAppEvent::DeviceLabelsChanged { account_id_hex }) => Some(account_id_hex),
+                    Ok(account_id_hex) => Some(account_id_hex),
                     Err(broadcast::error::RecvError::Lagged(_)) => Some(None),
                     _ => None,
                 };
