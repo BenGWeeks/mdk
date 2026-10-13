@@ -1696,6 +1696,7 @@ impl MarmotApp {
                 self.remember_directory_relay_list_event(&account_id_hex, &record)?;
             }
             KIND_MARMOT_KEY_PACKAGE => {
+                self.remember_own_key_package_slot_observation(&record.event)?;
                 let mut fetched = key_package_from_record(record)?;
                 fetched.relay_lists = self
                     .account_relay_list_status_for_account_id(&account_id_hex)
