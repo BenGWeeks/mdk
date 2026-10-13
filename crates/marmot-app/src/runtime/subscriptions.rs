@@ -432,6 +432,9 @@ impl TimelineWindowHandle {
 /// and broadcast-lag refreshes mutate the same window through [`recv`](Self::recv).
 /// The store remains the durable source of truth; this is the view.
 pub struct RuntimeTimelineMessagesSubscription {
+    // Hosted subscriptions resolve advisory labels after policy rehydration.
+    // In-memory window tests have no shared app cache.
+    pub(crate) label_app: Option<MarmotApp>,
     pub(crate) policy_window_size: usize,
     pub(crate) policy_storage: storage_sqlite::SqliteAccountStorage,
     pub(crate) window: TimelineWindowHandle,
@@ -479,8 +482,20 @@ impl RuntimeTimelineMessagesSubscription {
             // An unrelated block must not turn every delta into a full page read.
             let signal = if let TimelineSubscriptionSignal::Projection(update) = signal {
                 let storage = self.policy_storage.clone();
+                let app = self.label_app.clone();
                 match blocking_app_task(move || {
-                    filter_projection_for_block_policy(&storage, *update)
+                    let mut update = filter_projection_for_block_policy(&storage, *update)?;
+                    if let Some(app) = app {
+                        for message in &mut update.update.timeline_messages {
+                            app.enrich_timeline_device_label(message);
+                        }
+                        for change in &mut update.update.timeline_changes {
+                            if let TimelineMessageChange::Upsert { message, .. } = change {
+                                app.enrich_timeline_device_label(message);
+                            }
+                        }
+                    }
+                    Ok(update)
                 })
                 .await
                 {
@@ -1266,6 +1281,7 @@ impl MarmotAppRuntime {
             }
         });
         Ok(RuntimeTimelineMessagesSubscription {
+            label_app: Some(self.accounts.app.clone()),
             policy_window_size,
             policy_storage: subscription_policy_storage,
             window,
@@ -2225,5 +2241,96 @@ mod presented_invalidation_tests {
         assert!(
             matches!(sub.recv().await, Some(RuntimeChatListUpdate::RemoveRow { group_id_hex, .. }) if group_id_hex == "04")
         );
+    }
+}
+
+#[cfg(test)]
+mod device_label_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timeline_device_labels_survive_block_policy_rehydration() {
+        let root = tempfile::tempdir().unwrap();
+        let account = marmot_account::AccountHome::open(root.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(root.path(), "wss://relay.example");
+        let group = GroupId::new([1]);
+        let group_hex = hex::encode(group.as_slice());
+        let device = crate::SenderDevice::Exact {
+            device_id: cgka_traits::message::member_device_id(&group, b"known-leaf"),
+            leaf_index: 2,
+            client_label: None,
+            is_this_installation: false,
+        };
+        app.shared_storage()
+            .unwrap()
+            .put_device_client_label(&account.account_id_hex, b"known-leaf", "Cached Client", 1)
+            .unwrap();
+        let update = app
+            .record_account_app_event(
+                "alice",
+                &crate::AppMessageProjection {
+                    authority: None,
+                    message_id_hex: "42".repeat(32),
+                    source_message_id_hex: None,
+                    direction: "received".into(),
+                    group_id_hex: group_hex.clone(),
+                    sender: account.account_id_hex.clone(),
+                    sender_device: device,
+                    plaintext: "label survives policy reload".into(),
+                    kind: 9,
+                    tags: Vec::new(),
+                    source_epoch: Some(1),
+                    retention: None,
+                    recorded_at: Some(1),
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                },
+            )
+            .unwrap();
+        let runtime = app.runtime();
+        let mut subscription = runtime
+            .subscribe_timeline_messages(
+                "alice",
+                TimelineMessageQuery {
+                    group_id_hex: Some(group_hex),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .adopt_block_list(
+                &storage_sqlite::StoredBlockList {
+                    event_id: "43".repeat(32),
+                    event_created_at: 1,
+                    ..Default::default()
+                },
+                &[("44".repeat(32), false)],
+                1,
+                &account.account_id_hex,
+                &|_, _| false,
+            )
+            .unwrap();
+        assert!(storage.has_blocked_users().unwrap());
+        runtime
+            .events
+            .send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+                account_id_hex: account.account_id_hex,
+                account_label: "alice".into(),
+                update,
+            }))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), subscription.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&subscription.take_snapshot().messages[0].sender_device,
+            crate::SenderDevice::Exact { client_label: Some(label), .. } if label == "Cached Client")
+        );
+        runtime.shutdown_and_close().await.unwrap();
     }
 }

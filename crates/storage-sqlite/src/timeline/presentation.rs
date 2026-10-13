@@ -17,6 +17,24 @@ impl ConversationPresentationPage {
     pub fn page(&self) -> &TimelinePage {
         &self.page
     }
+    /// Enrich only advisory labels; authenticated device attribution and system
+    /// provenance remain immutable. The captured page is bounded to 200 rows.
+    pub fn enrich_sender_device_labels(
+        &mut self,
+        mut label: impl FnMut(&str, &str, &str) -> Option<String>,
+    ) {
+        for message in &mut self.page.messages {
+            if let cgka_traits::message::SenderDevice::Exact {
+                device_id,
+                client_label,
+                ..
+            } = &mut message.sender_device
+            {
+                *client_label = label(&message.group_id_hex, &message.sender, device_id);
+            }
+        }
+    }
+
     pub fn store_epoch(&self) -> &[u8] {
         &self.store_epoch
     }

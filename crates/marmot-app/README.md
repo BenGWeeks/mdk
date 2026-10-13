@@ -248,11 +248,15 @@ Missing device labels schedule optional background kind-30443 discovery from saf
 KeyPackage relays. Authoritative roster and message reads perform no network I/O.
 Each account worker admits at most eight accounts per pass and twelve events per
 account, with one pass in flight and a one-hour re-fetch interval even for misses
-or failures. Validated, sanitized labels are retained by account and leaf signature
-key independently of replaceable directory slots; invitation selection also fills
-this cache. Completion uses `GroupStateUpdated` for demanded groups and
-`ProjectionUpdated` when existing Exact sender rows change. Hosts refresh their
-roster/timeline through the existing subscriptions; unavailable labels remain `None`.
+or failures. Only demanded leaf keys and invitation selections enter the sanitized
+label cache, capped at 16 entries per account with least-recently-confirmed eviction.
+Labels survive directory slot replacement and resolve at read time for Exact
+senders; message rows and retained history are never rewritten. Completion coalesces
+`GroupStateUpdated` and `ProjectionUpdated` only for changed roster or recent sender
+labels (at most 64 recent timeline rows per group). Hosts refresh their roster/timeline
+through the existing subscriptions; unavailable labels remain `None`. Shutdown stops
+waiting and admitting results; shared directory fetches can finish independently
+within their relay connect/fetch timeouts.
 
 
 **Creating and inviting.** Group creation and invites take pubkeys at the action boundary. The app canonicalizes and

@@ -1217,6 +1217,7 @@ fn timeline_subscription_with(
     stopping: watch::Receiver<bool>,
 ) -> RuntimeTimelineMessagesSubscription {
     RuntimeTimelineMessagesSubscription {
+        label_app: None,
         policy_window_size: window.messages.len().max(1),
         policy_storage: storage_sqlite::SqliteAccountStorage::in_memory().unwrap(),
         window: timeline_window_handle(store, window, window_limit),

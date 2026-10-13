@@ -2457,7 +2457,16 @@ impl AppClient {
         let labels = if let Some(labels) = cached_labels {
             labels
         } else {
-            owned_labels = self.member_device_labels(members.keys().cloned());
+            let keys = devices
+                .iter()
+                .map(|leaf| {
+                    (
+                        hex::encode(leaf.member.as_slice()),
+                        leaf.signature_key.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            owned_labels = self.member_device_labels(members.keys().cloned(), Some(&keys));
             &owned_labels
         };
         for leaf in devices {
@@ -2467,7 +2476,11 @@ impl AppClient {
                     .get(&(account_id.clone(), leaf.signature_key.clone()))
                     .cloned();
                 if label.is_none() {
-                    self.device_label_enrichment.schedule(&account_id, group_id);
+                    self.device_label_enrichment.schedule(
+                        &account_id,
+                        group_id,
+                        &cgka_traits::message::member_device_id(group_id, &leaf.signature_key),
+                    );
                 }
                 member
                     .devices
@@ -2489,20 +2502,16 @@ impl AppClient {
         sender: &str,
         mut device: crate::SenderDevice,
     ) -> crate::SenderDevice {
+        self.app
+            .enrich_sender_device_label(group_id, sender, &mut device);
         if let crate::SenderDevice::Exact {
             device_id,
-            client_label,
+            client_label: None,
             ..
-        } = &mut device
+        } = &device
         {
-            let labels = self.member_device_labels(std::iter::once(sender.to_owned()));
-            *client_label = labels.into_iter().find_map(|((_, key), label)| {
-                (cgka_traits::message::member_device_id(group_id, &key) == *device_id)
-                    .then_some(label)
-            });
-            if client_label.is_none() {
-                self.device_label_enrichment.schedule(sender, group_id);
-            }
+            self.device_label_enrichment
+                .schedule(sender, group_id, device_id);
         }
         device
     }
@@ -2545,6 +2554,7 @@ impl AppClient {
     fn member_device_labels(
         &self,
         account_ids: impl IntoIterator<Item = String>,
+        keys: Option<&[(String, Vec<u8>)]>,
     ) -> MemberDeviceLabels {
         let account_ids = account_ids.into_iter().collect::<Vec<_>>();
         if account_ids.is_empty() {
@@ -2599,9 +2609,15 @@ impl AppClient {
             }
         }
         match self.app.shared_storage().and_then(|storage| {
-            storage
-                .device_client_labels(&account_ids)
-                .map_err(AppError::from)
+            match keys {
+                Some(keys) => keys
+                    .iter()
+                    .map(|(account, key)| storage.device_client_label(account, key))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|rows| rows.into_iter().flatten().collect()),
+                None => storage.device_client_labels(&account_ids),
+            }
+            .map_err(AppError::from)
         }) {
             Ok(cached) => {
                 for row in cached {
@@ -2832,7 +2848,7 @@ impl AppClient {
                 }
             }
         }
-        let labels = self.member_device_labels(account_ids);
+        let labels = self.member_device_labels(account_ids, None);
         let mut skipped_malformed_group_records = 0usize;
         for group in &self.state.groups {
             let Ok(bytes) = hex::decode(&group.group_id_hex) else {

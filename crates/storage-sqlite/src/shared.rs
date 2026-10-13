@@ -2,7 +2,7 @@ mod device_labels;
 mod error;
 mod migrations;
 mod presentation;
-pub use device_labels::DeviceClientLabel;
+pub use device_labels::{DEVICE_CLIENT_LABELS_PER_ACCOUNT, DeviceClientLabel};
 pub use presentation::{DirectoryPresentation, DirectoryPresentationChanges};
 
 use error::SharedSqliteResultExt;

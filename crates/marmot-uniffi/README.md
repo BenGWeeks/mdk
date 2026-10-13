@@ -802,10 +802,14 @@ bidirectional override/isolate characters and trimmed. A cache miss returns `Non
 Member/roster reads and Exact sender enrichment schedule bounded background
 fetches from safe KeyPackage relays; reads perform no network I/O. Attempts,
 including misses and failures, have a one-hour cooldown per account worker.
-Validated labels survive directory slot replacement. Inviters also retain labels
-from every selected package. Completion emits `GroupStateUpdated` for demanded
-groups and `ProjectionUpdated` for existing Exact sender rows whose labels change,
-so hosts re-read their roster or refresh their timeline subscription.
+Only demanded keys and invitation selections enter the validated cache, capped at
+16 entries per account with least-recently-confirmed eviction. Labels survive
+directory slot replacement and resolve at read time; stored message rows never
+change. Completion coalesces `GroupStateUpdated` and `ProjectionUpdated` for changed
+roster or recent sender labels (at most 64 recent timeline rows per group), so hosts
+re-read their roster or refresh their timeline subscription. Shutdown stops waiting
+and admitting results; coalesced directory fetches finish independently within
+relay connect/fetch timeouts.
 `joined_at` is always `None`; no join timestamp is inferred or backfilled. Treat
 labels and device identifiers as private presentation data, never log them.
 

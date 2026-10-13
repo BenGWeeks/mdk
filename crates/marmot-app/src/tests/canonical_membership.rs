@@ -2313,6 +2313,15 @@ async fn member_device_labels_reuse_validation_until_package_changes() {
 /// A receiver learns Alice's leaf through Welcome, without observing her publication.
 #[tokio::test]
 async fn welcome_device_labels_enrich_member_and_existing_exact_sender() {
+    welcome_device_labels_read_time_fixture(false).await;
+}
+
+#[tokio::test]
+async fn device_labels_cache_success_survives_rejected_history_writes() {
+    welcome_device_labels_read_time_fixture(true).await;
+}
+
+async fn welcome_device_labels_read_time_fixture(reject_history: bool) {
     let inviter_dir = tempfile::tempdir().unwrap();
     let receiver_dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(inviter_dir.path());
@@ -2458,6 +2467,21 @@ async fn welcome_device_labels_enrich_member_and_existing_exact_sender() {
             .unwrap();
         assert!(member.devices.as_ref().unwrap()[0].client_label.is_none());
     }
+    let path = receiver.account_storage_path("bob");
+    let keys = receiver.account_home().load_signing_keys("bob").unwrap();
+    let key = receiver
+        .sqlcipher_key("bob", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    if reject_history {
+        connection.execute_batch("CREATE TRIGGER reject_label_history BEFORE UPDATE OF sender_device ON app_events BEGIN SELECT RAISE(ABORT, 'reject history writes'); END;").unwrap();
+    }
     release.notify_one();
     let mut notified_group = false;
     let mut notified_timeline = false;
@@ -2494,6 +2518,18 @@ async fn welcome_device_labels_enrich_member_and_existing_exact_sender() {
         is_this_installation: false,
     };
     assert_eq!(raw_after.sender_device, expected);
+    assert_eq!(
+        receiver
+            .account_storage("bob")
+            .unwrap()
+            .app_message(&raw_after.group_id_hex, &raw_after.message_id_hex)
+            .unwrap()
+            .unwrap()
+            .sender_device,
+        raw_before.sender_device,
+        "background enrichment must never rewrite history"
+    );
+
     let timeline = receiver
         .timeline_message(
             "bob",
@@ -2503,6 +2539,60 @@ async fn welcome_device_labels_enrich_member_and_existing_exact_sender() {
         .unwrap()
         .unwrap();
     assert_eq!(timeline.sender_device, expected);
+    assert_eq!(
+        receiver
+            .message_by_id("bob", &raw_after.group_id_hex, &raw_after.message_id_hex)
+            .unwrap()
+            .unwrap()
+            .sender_device,
+        expected
+    );
+    for page in [
+        receiver
+            .timeline_messages_with_query(
+                "bob",
+                crate::TimelineMessageQuery {
+                    group_id_hex: Some(raw_after.group_id_hex.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        receiver
+            .timeline_messages_by_wall_clock_with_query(
+                "bob",
+                crate::TimelineMessageQuery {
+                    group_id_hex: Some(raw_after.group_id_hex.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+    ] {
+        assert_eq!(
+            page.messages
+                .iter()
+                .find(|row| row.message_id_hex == raw_after.message_id_hex)
+                .unwrap()
+                .sender_device,
+            expected
+        );
+    }
+    let window = runtime
+        .open_conversation_window("bob", &group, Default::default())
+        .await
+        .unwrap();
+    let snapshot = &window.snapshot;
+    assert_eq!(
+        snapshot
+            .page
+            .page()
+            .messages
+            .iter()
+            .find(|row| row.message_id_hex == raw_after.message_id_hex)
+            .unwrap()
+            .sender_device,
+        expected
+    );
+    drop(window);
     runtime.shutdown().await;
     assert_eq!(
         fetcher
@@ -2604,6 +2694,7 @@ async fn inviter_device_label_cache_retains_every_selected_leaf_after_slot_repla
             relay_lists: AccountRelayListStatus::empty(),
         };
         // The common validated-package acceptance seam used by create and invite.
+        app.remember_device_client_label(&selected).unwrap();
         app.remember_directory_key_package(&selected).unwrap();
     }
     assert_ne!(keys[0], keys[1]);
@@ -2701,5 +2792,181 @@ async fn device_label_fetch_validates_signatures_freshness_and_local_event_bound
             .await
             .len(),
         crate::client::device_labels::DEVICE_LABEL_EVENT_LIMIT
+    );
+}
+
+#[tokio::test]
+async fn device_labels_unrelated_passes_do_not_admit_or_notify() {
+    let (_dir, app, mut client, group, account) = member_device_label_fixture().await;
+    let before = app
+        .shared_storage()
+        .unwrap()
+        .device_client_labels(std::slice::from_ref(&account))
+        .unwrap()
+        .len();
+    let row = app
+        .shared_storage()
+        .unwrap()
+        .device_client_labels(std::slice::from_ref(&account))
+        .unwrap()
+        .remove(0);
+    let id = cgka_traits::message::member_device_id(&group, &row.signature_key);
+    client.pending_projection_updates.clear();
+    tokio::time::pause();
+    for pass in 0..40u8 {
+        tokio::time::advance(crate::client::device_labels::DEVICE_LABEL_REFETCH_INTERVAL).await;
+        client
+            .device_label_enrichment
+            .schedule(&account, &group, &id);
+        let _ = client.device_label_enrichment.begin();
+        let changed =
+            client.finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+                account: account.clone(),
+                key: vec![pass; 32],
+                label: "Unrelated".into(),
+                created_at: u64::from(pass),
+            }]);
+        assert!(changed.is_empty(), "unrelated labels must not notify");
+        assert!(client.pending_projection_updates.is_empty());
+    }
+    assert_eq!(
+        app.shared_storage()
+            .unwrap()
+            .device_client_labels(&[account])
+            .unwrap()
+            .len(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn device_labels_unchanged_demand_produces_zero_notifications() {
+    let (_dir, app, mut client, group, account) = member_device_label_fixture().await;
+    let row = app
+        .shared_storage()
+        .unwrap()
+        .device_client_labels(std::slice::from_ref(&account))
+        .unwrap()
+        .remove(0);
+    let id = cgka_traits::message::member_device_id(&group, &row.signature_key);
+    client
+        .device_label_enrichment
+        .schedule(&account, &group, &id);
+    client.pending_projection_updates.clear();
+    assert!(client.device_label_enrichment.begin().contains(&account));
+    assert!(
+        client
+            .finish_device_label_pass(vec![crate::client::device_labels::FetchedLabel {
+                account,
+                key: row.signature_key,
+                label: row.client_label,
+                created_at: row.created_at + 1,
+            }])
+            .is_empty()
+    );
+    assert!(client.pending_projection_updates.is_empty());
+}
+
+#[tokio::test]
+async fn device_labels_read_time_overrides_legacy_values_and_ignores_cache_errors() {
+    let (_dir, app, _client, group, account) = member_device_label_fixture().await;
+    let cached = app
+        .shared_storage()
+        .unwrap()
+        .device_client_labels(std::slice::from_ref(&account))
+        .unwrap()
+        .remove(0);
+    let device = crate::SenderDevice::Exact {
+        device_id: cgka_traits::message::member_device_id(&group, &cached.signature_key),
+        leaf_index: 5,
+        client_label: Some("Stale persisted label".into()),
+        is_this_installation: false,
+    };
+    let group_hex = hex::encode(group.as_slice());
+    let projection = AppMessageProjection {
+        authority: None,
+        message_id_hex: "legacy-label".into(),
+        source_message_id_hex: None,
+        direction: "received".into(),
+        group_id_hex: group_hex.clone(),
+        sender: account,
+        sender_device: device.clone(),
+        plaintext: "legacy label fixture".into(),
+        kind: MARMOT_APP_EVENT_KIND_CHAT,
+        tags: Vec::new(),
+        source_epoch: Some(1),
+        retention: None,
+        recorded_at: Some(unix_now_seconds()),
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    let mut legacy =
+        crate::conversions::stored_app_event_from_projection(&projection, unix_now_seconds());
+    legacy.sender_device = device.clone();
+    app.account_storage("alice")
+        .unwrap()
+        .record_app_event(&legacy)
+        .unwrap();
+    let mut expected = device;
+    if let crate::SenderDevice::Exact { client_label, .. } = &mut expected {
+        *client_label = Some(cached.client_label);
+    }
+    assert_eq!(
+        app.message_by_id("alice", &group_hex, "legacy-label")
+            .unwrap()
+            .unwrap()
+            .sender_device,
+        expected
+    );
+    assert_eq!(
+        app.timeline_message("alice", &group_hex, "legacy-label")
+            .unwrap()
+            .unwrap()
+            .sender_device,
+        expected
+    );
+    // Cache resolution also applies to both copies carried in live updates.
+    let update = app
+        .record_account_app_event(
+            "alice",
+            &AppMessageProjection {
+                message_id_hex: "new-label".into(),
+                ..projection
+            },
+        )
+        .unwrap();
+    assert_eq!(update.timeline_messages[0].sender_device, expected);
+    assert!(
+        matches!(&update.timeline_changes[0], crate::TimelineMessageChange::Upsert { message, .. } if message.sender_device == expected)
+    );
+    assert!(matches!(
+        app.account_storage("alice")
+            .unwrap()
+            .app_message(&group_hex, "new-label")
+            .unwrap()
+            .unwrap()
+            .sender_device,
+        crate::SenderDevice::Exact {
+            client_label: None,
+            ..
+        }
+    ));
+    app.shared_storage().unwrap().close().unwrap();
+    if let crate::SenderDevice::Exact { client_label, .. } = &mut expected {
+        *client_label = None;
+    }
+    assert_eq!(
+        app.message_by_id("alice", &group_hex, "legacy-label")
+            .unwrap()
+            .unwrap()
+            .sender_device,
+        expected
+    );
+    assert_eq!(
+        app.timeline_message("alice", &group_hex, "legacy-label")
+            .unwrap()
+            .unwrap()
+            .sender_device,
+        expected
     );
 }

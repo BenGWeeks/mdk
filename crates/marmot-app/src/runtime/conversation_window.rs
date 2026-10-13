@@ -338,14 +338,37 @@ pub(super) fn capture_conversation(
     query: ConversationWindowQuery,
     epoch: &[u8],
 ) -> Result<CapturedConversation, ConversationWindowError> {
-    capture_conversation_from_session(
+    let mut captured = capture_conversation_from_session(
         client.runtime.session(),
         &client.app,
         &client.state.label,
         group,
         query,
         epoch,
-    )
+    )?;
+    captured
+        .account
+        .page
+        .enrich_sender_device_labels(|group_hex, sender, device_id| {
+            hex::decode(group_hex).ok().and_then(|bytes| {
+                client
+                    .app
+                    .cached_sender_device_label(&GroupId::new(bytes), sender, device_id)
+            })
+        });
+    for message in &captured.account.page.page().messages {
+        if let crate::SenderDevice::Exact {
+            device_id,
+            client_label: None,
+            ..
+        } = &message.sender_device
+        {
+            client
+                .device_label_enrichment
+                .schedule(&message.sender, group, device_id);
+        }
+    }
+    Ok(captured)
 }
 
 /// Read fresh compact authority and account rows in one snapshot. A missing
@@ -772,7 +795,14 @@ impl Reader {
                 if app.account_home().account(&label)?.account_id_hex != account_id {
                     return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
                 }
-                let account = captured.account;
+                let mut account = captured.account;
+                account
+                    .page
+                    .enrich_sender_device_labels(|group_hex, sender, device_id| {
+                        hex::decode(group_hex).ok().and_then(|bytes| {
+                            app.cached_sender_device_label(&GroupId::new(bytes), sender, device_id)
+                        })
+                    });
                 let state = if let Some(authority) = captured.authority {
                     let facts = authority.facts;
                     ConversationHeaderState {

@@ -534,6 +534,7 @@ impl MarmotApp {
         )?;
         match purpose {
             MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
+                let _ = self.remember_device_client_label(&fetched);
                 self.remember_directory_key_package(&fetched)?
             }
             MemberResolutionPurpose::Prewarm => {}

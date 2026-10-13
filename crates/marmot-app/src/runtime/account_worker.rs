@@ -904,10 +904,10 @@ fn handle_startup_sync_command(
     }
 }
 
-/// Relay-only startup Welcome work. Dropping the worker aborts the task so no
-/// detached publication can outlive relay-plane/account shutdown; the exact
-/// durable artifact remains retryable on the next open.
-/// Cancelling or shutting down the account worker cancels optional directory I/O.
+/// Dropping the worker stops waiting for optional label discovery. The shared
+/// directory service owns coalesced fetches, which can outlive this waiter and
+/// finish within their relay connect/fetch timeouts; no results are admitted here
+/// after worker shutdown.
 struct DeviceLabelTask(JoinHandle<Vec<crate::client::device_labels::FetchedLabel>>);
 impl Drop for DeviceLabelTask {
     fn drop(&mut self) {
@@ -915,6 +915,9 @@ impl Drop for DeviceLabelTask {
     }
 }
 
+/// Relay-only startup Welcome work. Dropping the worker aborts the task so no
+/// detached publication can outlive relay-plane/account shutdown; the exact
+/// durable artifact remains retryable on the next open.
 struct WelcomeRecoveryTask {
     handle: JoinHandle<CompletedWelcomeDeliveryRecovery>,
     message_ids: Vec<MessageId>,

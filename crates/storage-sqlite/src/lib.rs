@@ -121,9 +121,10 @@ pub use prepared_group_image_upload::{
     PreparedGroupImageUploadState,
 };
 pub use shared::{
-    DeviceClientLabel, DirectoryPresentation, DirectoryPresentationChanges,
-    PublicDirectoryProfileRecord, PublicDirectoryUserRecord, SqliteSharedStorage,
-    StoredAuditLogSettings, StoredRelayTelemetrySettings, StoredUsageDiagnosticsSettings,
+    DEVICE_CLIENT_LABELS_PER_ACCOUNT, DeviceClientLabel, DirectoryPresentation,
+    DirectoryPresentationChanges, PublicDirectoryProfileRecord, PublicDirectoryUserRecord,
+    SqliteSharedStorage, StoredAuditLogSettings, StoredRelayTelemetrySettings,
+    StoredUsageDiagnosticsSettings,
 };
 pub use storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]

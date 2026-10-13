@@ -329,7 +329,7 @@ pub(crate) fn stored_app_event_from_projection(
         source_message_id_hex: message.source_message_id_hex.clone(),
         direction: message.direction.clone(),
         sender: message.sender.clone(),
-        sender_device: message.sender_device.clone(),
+        sender_device: sender_device_without_label(message.sender_device.clone()),
         plaintext: message.plaintext.clone(),
         kind: message.kind,
         tags: message.tags.clone(),
@@ -348,7 +348,7 @@ pub(crate) fn stored_app_event_from_message_record(record: &AppMessageRecord) ->
         source_message_id_hex: None,
         direction: record.direction.clone(),
         sender: record.sender.clone(),
-        sender_device: record.sender_device.clone(),
+        sender_device: sender_device_without_label(record.sender_device.clone()),
         plaintext: record.plaintext.clone(),
         kind: record.kind,
         tags: record.tags.clone(),
@@ -522,4 +522,12 @@ pub(crate) fn group_push_token_from_account(
         owner_sig: token.owner_sig,
         updated_at_ms: token.updated_at_ms,
     })
+}
+
+/// Labels are optional read-time display data, never durable message facts.
+pub(crate) fn sender_device_without_label(mut device: crate::SenderDevice) -> crate::SenderDevice {
+    if let crate::SenderDevice::Exact { client_label, .. } = &mut device {
+        *client_label = None;
+    }
+    device
 }

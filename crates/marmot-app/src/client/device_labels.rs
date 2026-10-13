@@ -17,12 +17,18 @@ pub(crate) const DEVICE_LABEL_REFETCH_INTERVAL: Duration = Duration::from_secs(3
 const DEVICE_LABEL_MAX_TRACKED_ACCOUNTS: usize = 1024;
 /// Bound group notification demand associated with a single remote account.
 const DEVICE_LABEL_MAX_GROUPS_PER_ACCOUNT: usize = 128;
+/// Bound demanded devices within each group.
+const DEVICE_LABEL_MAX_DEVICES_PER_GROUP: usize = 128;
+/// Completion only compares the recent viewport, never retained history.
+const DEVICE_LABEL_RECENT_SENDERS: usize = 64;
+
+type GroupDemand = HashMap<GroupId, HashSet<String>>;
 /// Bound the complete discovery + package fetch wait for each optional account.
 const DEVICE_LABEL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 struct Demand {
-    groups: BTreeMap<String, HashSet<GroupId>>,
+    groups: BTreeMap<String, GroupDemand>,
     attempted: HashMap<String, Instant>,
     active: HashSet<String>,
 }
@@ -34,7 +40,7 @@ pub(crate) struct DeviceLabelEnrichment {
 }
 
 impl DeviceLabelEnrichment {
-    pub(crate) fn schedule(&self, account: &str, group: &GroupId) {
+    pub(crate) fn schedule(&self, account: &str, group: &GroupId, device_id: &str) {
         let now = Instant::now();
         let mut demand = self.demand.lock().unwrap_or_else(|e| e.into_inner());
         if !demand.active.contains(account)
@@ -54,8 +60,11 @@ impl DeviceLabelEnrichment {
             return;
         }
         let groups = demand.groups.entry(account.to_owned()).or_default();
-        if groups.len() < DEVICE_LABEL_MAX_GROUPS_PER_ACCOUNT {
-            groups.insert(group.clone());
+        if groups.contains_key(group) || groups.len() < DEVICE_LABEL_MAX_GROUPS_PER_ACCOUNT {
+            let devices = groups.entry(group.clone()).or_default();
+            if devices.len() < DEVICE_LABEL_MAX_DEVICES_PER_GROUP {
+                devices.insert(device_id.to_owned());
+            }
         }
         self.wake.notify_one();
     }
@@ -78,7 +87,7 @@ impl DeviceLabelEnrichment {
         accounts
     }
 
-    fn finish(&self) -> BTreeMap<String, HashSet<GroupId>> {
+    fn finish(&self) -> BTreeMap<String, GroupDemand> {
         let mut demand = self.demand.lock().unwrap_or_else(|e| e.into_inner());
         let accounts = std::mem::take(&mut demand.active);
         accounts
@@ -97,14 +106,75 @@ impl DeviceLabelEnrichment {
 }
 
 pub(crate) struct FetchedLabel {
-    account: String,
-    key: Vec<u8>,
-    label: String,
-    created_at: u64,
+    pub(crate) account: String,
+    pub(crate) key: Vec<u8>,
+    pub(crate) label: String,
+    pub(crate) created_at: u64,
 }
 
 impl MarmotApp {
-    /// Cache every validated selected package, independent of its replaceable directory slot.
+    /// Advisory reads are local, account-bounded, and never affect attribution.
+    pub(crate) fn enrich_sender_device_label(
+        &self,
+        group: &GroupId,
+        sender: &str,
+        device: &mut crate::SenderDevice,
+    ) {
+        if let crate::SenderDevice::Exact {
+            device_id,
+            client_label,
+            ..
+        } = device
+        {
+            *client_label = self.cached_sender_device_label(group, sender, device_id);
+        }
+    }
+
+    pub(crate) fn cached_sender_device_label(
+        &self,
+        group: &GroupId,
+        sender: &str,
+        device_id: &str,
+    ) -> Option<String> {
+        self.shared_storage()
+            .ok()
+            .and_then(|storage| storage.device_client_labels(&[sender.to_owned()]).ok())
+            .and_then(|labels| {
+                labels.into_iter().find_map(|row| {
+                    (cgka_traits::message::member_device_id(group, &row.signature_key) == device_id)
+                        .then(|| {
+                            crate::key_package_records::sanitize_client_label(&row.client_label)
+                        })
+                        .flatten()
+                })
+            })
+    }
+
+    pub(crate) fn enrich_message_device_label(&self, message: &mut crate::AppMessageRecord) {
+        if let Ok(bytes) = hex::decode(&message.group_id_hex) {
+            self.enrich_sender_device_label(
+                &GroupId::new(bytes),
+                &message.sender,
+                &mut message.sender_device,
+            );
+        } else if let crate::SenderDevice::Exact { client_label, .. } = &mut message.sender_device {
+            *client_label = None;
+        }
+    }
+
+    pub(crate) fn enrich_timeline_device_label(&self, message: &mut crate::TimelineMessageRecord) {
+        if let Ok(bytes) = hex::decode(&message.group_id_hex) {
+            self.enrich_sender_device_label(
+                &GroupId::new(bytes),
+                &message.sender,
+                &mut message.sender_device,
+            );
+        } else if let crate::SenderDevice::Exact { client_label, .. } = &mut message.sender_device {
+            *client_label = None;
+        }
+    }
+
+    /// Cache a validated invitation selection or this installation's publication.
     pub(crate) fn remember_device_client_label(
         &self,
         fetched: &crate::FetchedKeyPackage,
@@ -219,57 +289,114 @@ impl MarmotApp {
 }
 
 impl AppClient {
-    /// Admit advisory cache facts and refresh existing Exact sender rows, then notify hosts.
+    /// Admit only demanded leaves and publish bounded, read-time display changes.
     pub(crate) fn finish_device_label_pass(&mut self, labels: Vec<FetchedLabel>) -> Vec<GroupId> {
-        let groups = self.device_label_enrichment.finish();
-        let mut changed_groups = HashSet::new();
+        let demand = self.device_label_enrichment.finish();
+        let groups = demand
+            .values()
+            .flat_map(|groups| groups.keys().cloned())
+            .collect::<HashSet<_>>();
+        let mut before = HashMap::new();
+        for group in groups {
+            let roster = self.members(&group).unwrap_or_default();
+            let messages = self
+                .app
+                .timeline_messages_with_query(
+                    &self.state.label,
+                    crate::TimelineMessageQuery {
+                        group_id_hex: Some(hex::encode(group.as_slice())),
+                        pagination: crate::TimelinePagination {
+                            limit: Some(DEVICE_LABEL_RECENT_SENDERS),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .map(|page| page.messages)
+                .unwrap_or_default();
+            before.insert(group, (roster, messages));
+        }
         let mut failed_admissions = 0usize;
-        for label in labels {
-            let result = (|| -> Result<(), AppError> {
-                self.app.shared_storage()?.put_device_client_label(
-                    &label.account,
-                    &label.key,
-                    &label.label,
-                    label.created_at,
-                )?;
-                let Some(accepted) = self
-                    .app
-                    .shared_storage()?
-                    .device_client_labels(std::slice::from_ref(&label.account))?
-                    .into_iter()
-                    .find(|row| row.signature_key == label.key)
-                else {
-                    return Ok(());
-                };
-                if let Some(groups) = groups.get(&label.account) {
-                    for group in groups {
-                        changed_groups.insert(group.clone());
-                        let id = cgka_traits::message::member_device_id(group, &label.key);
-                        let update = self
-                            .app
-                            .account_storage(&self.state.label)?
-                            .enrich_sender_device_label(
-                                &hex::encode(group.as_slice()),
-                                &label.account,
-                                &id,
-                                &accepted.client_label,
-                            )?;
-                        if let Some(update) = update {
-                            self.pending_projection_updates
-                                .push(self.app.app_projection_update(&self.state.label, update)?);
-                        }
-                    }
-                }
-                Ok(())
-            })();
-            if result.is_err() {
+        for label in labels
+            .into_iter()
+            .take(DEVICE_LABEL_MAX_ACCOUNTS_PER_PASS * DEVICE_LABEL_EVENT_LIMIT)
+        {
+            let Some(groups) = demand.get(&label.account) else {
+                continue;
+            };
+            let relevant = groups.iter().any(|(group, ids)| {
+                ids.contains(&cgka_traits::message::member_device_id(group, &label.key))
+            });
+            if !relevant {
+                continue;
+            }
+            let Some(sanitized) = crate::key_package_records::sanitize_client_label(&label.label)
+            else {
+                continue;
+            };
+            if self
+                .app
+                .shared_storage()
+                .and_then(|storage| {
+                    storage
+                        .put_device_client_label(
+                            &label.account,
+                            &label.key,
+                            &sanitized,
+                            label.created_at,
+                        )
+                        .map_err(AppError::from)
+                })
+                .is_err()
+            {
                 failed_admissions += 1;
+            }
+        }
+        let mut changed_groups = Vec::new();
+        for (group, (roster, messages)) in before {
+            let roster_changed = self.members(&group).is_ok_and(|after| after != roster);
+            let mut changed_messages = Vec::new();
+            for mut message in messages {
+                let before = message.sender_device.clone();
+                self.app.enrich_timeline_device_label(&mut message);
+                if before != message.sender_device {
+                    changed_messages.push(message);
+                }
+            }
+            if roster_changed || !changed_messages.is_empty() {
+                changed_groups.push(group.clone());
+                crate::runtime::publish_conversation_captures_from_session(
+                    &self.conversation_captures,
+                    self.runtime.session(),
+                    &self.app,
+                    &self.state.label,
+                    &group,
+                );
+            }
+            if !changed_messages.is_empty() {
+                let changes = changed_messages
+                    .iter()
+                    .cloned()
+                    .map(|message| crate::TimelineMessageChange::Upsert {
+                        trigger: crate::TimelineUpdateTrigger::MessageEditedOrReprojected,
+                        message: Box::new(message),
+                    })
+                    .collect();
+                self.pending_projection_updates
+                    .push(crate::AppProjectionUpdate {
+                        group_id_hex: hex::encode(group.as_slice()),
+                        timeline_messages: changed_messages,
+                        timeline_changes: changes,
+                        chat_list_row: None,
+                        chat_list_trigger: crate::ChatListUpdateTrigger::SnapshotRefresh,
+                    });
             }
         }
         if failed_admissions > 0 {
             tracing::debug!(target: "marmot_app::device_labels", method = "finish_device_label_pass", failed_admissions, "optional label admission unavailable");
         }
-        changed_groups.into_iter().collect()
+        changed_groups.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        changed_groups
     }
 }
 
@@ -281,25 +408,25 @@ mod tests {
         let state = DeviceLabelEnrichment::default();
         let group = GroupId::new([1]);
         for _ in 0..50 {
-            state.schedule("account", &group);
+            state.schedule("account", &group, "device");
         }
         assert_eq!(state.begin(), vec!["account"]);
-        state.schedule("account", &GroupId::new([2]));
+        state.schedule("account", &GroupId::new([2]), "device");
         assert!(state.begin().is_empty());
         // A slow pass must not consume part of the minimum re-fetch cooldown.
         tokio::time::advance(Duration::from_secs(30)).await;
         assert_eq!(state.finish()["account"].len(), 2);
-        state.schedule("account", &group);
+        state.schedule("account", &group, "device");
         assert!(state.begin().is_empty(), "misses have cooldown too");
         tokio::time::advance(DEVICE_LABEL_REFETCH_INTERVAL - Duration::from_secs(1)).await;
-        state.schedule("account", &group);
+        state.schedule("account", &group, "device");
         assert!(state.begin().is_empty());
         tokio::time::advance(Duration::from_secs(1)).await;
-        state.schedule("account", &group);
+        state.schedule("account", &group, "device");
         assert_eq!(state.begin(), vec!["account"]);
         state.finish();
         for i in 0..DEVICE_LABEL_MAX_TRACKED_ACCOUNTS * 2 {
-            state.schedule(&format!("remote-{i}"), &group);
+            state.schedule(&format!("remote-{i}"), &group, "device");
         }
         assert!(state.demand.lock().unwrap().groups.len() <= DEVICE_LABEL_MAX_TRACKED_ACCOUNTS);
         assert_eq!(state.begin().len(), DEVICE_LABEL_MAX_ACCOUNTS_PER_PASS);

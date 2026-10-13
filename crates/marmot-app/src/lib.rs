@@ -3229,7 +3229,11 @@ impl MarmotApp {
                 limit: query.limit,
             })?
             .into_iter()
-            .map(app_message_record_from_stored)
+            .map(|record| {
+                let mut message = app_message_record_from_stored(record);
+                self.enrich_message_device_label(&mut message);
+                message
+            })
             .collect())
     }
 
@@ -3248,7 +3252,9 @@ impl MarmotApp {
         if !storage.is_app_author_visible(&record.sender, group_id_hex)? {
             return Ok(None);
         }
-        Ok(Some(app_message_record_from_stored(record)))
+        let mut message = app_message_record_from_stored(record);
+        self.enrich_message_device_label(&mut message);
+        Ok(Some(message))
     }
 
     /// Resolve the reacted-to target for a reaction notification from the
@@ -3282,7 +3288,11 @@ impl MarmotApp {
         )
         .entered();
         self.ensure_account_state(label)?;
-        Ok(self.account_storage(label)?.message_timeline(query)?)
+        let mut page = self.account_storage(label)?.message_timeline(query)?;
+        for message in &mut page.messages {
+            self.enrich_timeline_device_label(message);
+        }
+        Ok(page)
     }
 
     pub(crate) fn timeline_messages_by_wall_clock_with_query(
@@ -3291,9 +3301,13 @@ impl MarmotApp {
         query: TimelineMessageQuery,
     ) -> Result<TimelinePage, AppError> {
         self.ensure_account_state(label)?;
-        Ok(self
+        let mut page = self
             .account_storage(label)?
-            .message_timeline_by_wall_clock(query)?)
+            .message_timeline_by_wall_clock(query)?;
+        for message in &mut page.messages {
+            self.enrich_timeline_device_label(message);
+        }
+        Ok(page)
     }
 
     pub fn message_edit_history(
@@ -3331,9 +3345,13 @@ impl MarmotApp {
         message_id_hex: &str,
     ) -> Result<Option<TimelineMessageRecord>, AppError> {
         self.ensure_account_state(label)?;
-        Ok(self
+        let mut message = self
             .account_storage(label)?
-            .timeline_message(group_id_hex, message_id_hex)?)
+            .timeline_message(group_id_hex, message_id_hex)?;
+        if let Some(message) = &mut message {
+            self.enrich_timeline_device_label(message);
+        }
+        Ok(message)
     }
 
     pub fn chat_list(
@@ -6590,7 +6608,7 @@ impl MarmotApp {
                 source_message_id_hex,
                 source_epoch,
                 retention,
-                &sender_device,
+                &crate::conversions::sender_device_without_label(sender_device.clone()),
             )?;
             storage.retain_attachment_uploads_after_commit(
                 group_id_hex,
@@ -6794,8 +6812,16 @@ impl MarmotApp {
     fn app_projection_update(
         &self,
         label: &str,
-        storage_update: TimelineProjectionUpdate,
+        mut storage_update: TimelineProjectionUpdate,
     ) -> Result<AppProjectionUpdate, AppError> {
+        for message in &mut storage_update.messages {
+            self.enrich_timeline_device_label(message);
+        }
+        for change in &mut storage_update.changes {
+            if let TimelineMessageChange::Upsert { message, .. } = change {
+                self.enrich_timeline_device_label(message);
+            }
+        }
         let changed_message_ids = storage_update
             .changes
             .iter()
@@ -7739,6 +7765,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 source_relays: accepted.iter().map(|endpoint| endpoint.0.clone()).collect(),
                 relay_lists,
             };
+            let _ = self.app.remember_device_client_label(&fetched);
             if self.app.remember_directory_key_package(&fetched).is_err() {
                 tracing::warn!(
                     target: "marmot_app::key_packages",

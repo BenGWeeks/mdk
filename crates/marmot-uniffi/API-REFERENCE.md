@@ -32,8 +32,10 @@ whose source-epoch signature key cannot be recovered. MDK never attributes a
 historical message using today's roster or a reused leaf index. Own sends flag
 this installation; sibling installations of the same account do not. Labels
 are advisory and sanitized, with `None` on a cache miss. Bounded background
-KeyPackage fetches fill missing labels asynchronously, including existing Exact
-sender rows; existing group-state and projection notifications refresh hosts. Provenance is
+KeyPackage fetches cache demanded leaf labels asynchronously (at most 16 per account).
+Exact sender labels resolve at read time without rewriting message rows; coalesced
+group-state and projection notifications refresh changed roster or recent sender
+labels only. Provenance is
 persisted before projection and survives reopening without rewriting legacy
 history. A signature-key change produces a different ID, as in member projection.
 

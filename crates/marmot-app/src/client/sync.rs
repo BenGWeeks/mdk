@@ -5346,28 +5346,12 @@ impl AppClient {
         let label = self.state.label.clone();
         let buffered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress_updates = buffered.clone();
-        let sender_account = hex::encode(self.runtime.session().self_id().as_slice());
-        let cached_labels = self.member_device_labels(std::iter::once(sender_account.clone()));
         let observe = std::sync::Arc::new(
             move |session: &cgka_session::AccountDeviceSession,
                   published: &marmot_account::PublishedApplicationMessage| {
                 // UPDATE-only finalization cannot create absent rows or clear an
                 // invalidation. Revival requires the live-group check in the final
                 // effects handler and intentionally waits for that handler.
-                let mut sender_device = published.sender_device.clone();
-                if let crate::SenderDevice::Exact {
-                    device_id,
-                    client_label,
-                    ..
-                } = &mut sender_device
-                {
-                    *client_label = cached_labels.iter().find_map(|((account, key), label)| {
-                        (account == &sender_account
-                            && cgka_traits::message::member_device_id(&published.group_id, key)
-                                == *device_id)
-                            .then(|| label.clone())
-                    });
-                }
                 let result = app.finalize_account_app_event_source_retention(
                     &label,
                     &hex::encode(published.group_id.as_slice()),
@@ -5376,7 +5360,7 @@ impl AppClient {
                     published.source_epoch.0,
                     published.retention,
                     published.authority,
-                    sender_device,
+                    published.sender_device.clone(),
                 );
                 match result {
                     Ok(update) => {
@@ -5714,7 +5698,7 @@ impl AppClient {
 
     fn project_received_message(
         &mut self,
-        message: crate::ReceivedMessage,
+        mut message: crate::ReceivedMessage,
         carried_media_secret: Option<&cgka_traits::EncryptedMediaSecret>,
         group_metadata: Option<&cgka_traits::Group>,
         summary: &mut SyncSummary,
@@ -5749,6 +5733,13 @@ impl AppClient {
                 );
             }
             return Ok(());
+        }
+        message.sender_device =
+            self.enrich_sender_device(&message.group_id, &message.sender, message.sender_device);
+        for row in &mut summary.messages {
+            if row.group_id == message.group_id && row.message_id_hex == message.message_id_hex {
+                row.sender_device = message.sender_device.clone();
+            }
         }
         let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
             && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
