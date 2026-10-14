@@ -2177,6 +2177,10 @@ impl MarmotAppRuntime {
         self.accounts.group_co_members(account_ref).await
     }
 
+    /// One row per projected account, with sibling leaves grouped as devices.
+    /// Known devices are authoritative and nonempty at the captured local MLS
+    /// frontier; unknown devices are None. Staged removals can omit admitted
+    /// accounts, so use [`Self::group_roster`] for the completeness flag.
     pub async fn group_members(
         &self,
         account_ref: &str,
@@ -2218,6 +2222,9 @@ impl MarmotAppRuntime {
         self.accounts.group_mls_state(account_ref, group_id).await
     }
 
+    /// Account roster with an explicit [`AppGroupRoster::complete`] guarantee.
+    /// Seeded reads hydrate first; failed authoritative reads return errors.
+    /// Snapshots/recovery describe a captured local epoch, not remote freshness.
     pub async fn group_roster(
         &self,
         account_ref: &str,

@@ -580,6 +580,7 @@ impl AccountManager {
             .await?;
         Ok(crate::groups::app_group_roster_from_session(
             crate::groups::AppGroupRosterSession {
+                complete: snapshot.roster_complete,
                 group_record: snapshot.group,
                 members: snapshot.members,
                 mls_state: snapshot.mls_state,
@@ -621,6 +622,7 @@ impl AccountManager {
                 .await
                 .unwrap_or_default();
         Ok(AppGroupConversationSnapshot {
+            roster_complete: session.complete,
             my_account_id_hex: account.account_id_hex,
             group: session.group_record,
             members: session.members,

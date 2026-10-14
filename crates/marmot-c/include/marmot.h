@@ -3563,6 +3563,12 @@ typedef struct MarmotGroupConversationSnapshot {
  * `marmot_group_roster_free`.
  */
 typedef struct MarmotGroupRoster {
+  /**
+   * True means exact canonical account/leaf coverage at the captured
+   * nonterminal local frontier. Staged mismatches and Left/Removed or
+   * disbanded history are false. This does not assert remote freshness.
+   */
+  bool complete;
   char *group_id_hex;
   struct MarmotGroupMemberDetails *members;
   uintptr_t members_len;

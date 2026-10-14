@@ -86,6 +86,41 @@ impl SqliteOpenMlsStorage {
     }
 }
 
+impl crate::SqliteAccountStorage {
+    /// Opaque token for the current persisted canonical MLS membership frontier.
+    /// Reads only GroupContext, never the ratchet tree or projected roster.
+    /// Epoch plus tree/transcript hashes distinguish same-epoch branch replacement
+    /// and rollback. Pending commits leave the canonical context unchanged until
+    /// merge; a missing context (for example after disband) returns None.
+    /// Never log or persist this token.
+    pub fn canonical_membership_frontier(
+        &self,
+        group_id: &MarmotGroupId,
+    ) -> StorageResult<Option<[u8; 32]>> {
+        use sha2::{Digest, Sha256};
+
+        let context: Option<openmls::group::GroupContext> = self
+            .openmls
+            .read_group_entity(
+                labels::GROUP_CONTEXT_LABEL,
+                &openmls::group::GroupId::from_slice(group_id.as_slice()),
+            )
+            .map_err(|error| match error {
+                SqliteOpenMlsStorageError::Storage(error) => error,
+                error => StorageError::Backend(error.to_string()),
+            })?;
+        Ok(context.map(|context| {
+            let mut digest = Sha256::new();
+            digest.update(context.epoch().as_u64().to_be_bytes());
+            for hash in [context.tree_hash(), context.confirmed_transcript_hash()] {
+                digest.update((hash.len() as u64).to_be_bytes());
+                digest.update(hash);
+            }
+            digest.finalize().into()
+        }))
+    }
+}
+
 pub(crate) fn mls_group_key(group_id: &MarmotGroupId) -> StorageResult<Vec<u8>> {
     let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
     SqliteOpenMlsStorage::group_key(&mls_group_id)
