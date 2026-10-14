@@ -345,7 +345,7 @@ pub(crate) struct AppGroupRosterSession {
 /// decisions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppGroupConversationSnapshot {
-    /// Same captured-frontier guarantee as [`AppGroupRoster::complete`].
+    /// Same current canonical membership guarantee as [`AppGroupRoster::complete`].
     pub roster_complete: bool,
     pub my_account_id_hex: String,
     pub group: AppGroupRecord,
@@ -387,7 +387,9 @@ pub struct AppGroupRoster {
     /// membership). Pending UI confirmation after MLS join may be complete.
     /// PendingPublish/Merging/Recovering/Unrecoverable can be complete if the
     /// captured validated membership matches; this does not assert remote
-    /// freshness. Worker snapshots retain this guarantee at their own frontier.
+    /// freshness. Worker snapshots are incomplete when their captured canonical
+    /// membership frontier differs from the current stored frontier, until a
+    /// fresh capture covers the current accounts and leaves.
     /// Seeded reads hydrate before returning rows; failed hydration/quarantine
     /// and authoritative read failures error rather than return provisional rows.
     #[serde(default)]

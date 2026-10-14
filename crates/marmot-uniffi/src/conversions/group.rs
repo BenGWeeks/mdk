@@ -495,8 +495,10 @@ pub struct GroupRosterFfi {
     /// Left/Removed copies. Pending UI confirmation after MLS join can be true.
     /// PendingPublish/Merging/Recovering/Unrecoverable alone do not decide this:
     /// validated matching membership can be complete at the local epoch even
-    /// while catch-up is outstanding. Snapshots refer to their captured frontier,
-    /// not remote freshness. Seeded reads hydrate first; failed hydration,
+    /// while catch-up is outstanding. Snapshots are incomplete when their captured
+    /// canonical membership frontier differs from the current stored frontier,
+    /// until a fresh capture covers the current accounts and leaves. This does
+    /// not guarantee remote freshness. Seeded reads hydrate first; failed hydration,
     /// quarantine and authoritative read failures return errors, not seed rows.
     /// Kotlin: complete: Boolean. Swift: complete: Bool.
     pub complete: bool,

@@ -66,6 +66,13 @@ The shared store is unencrypted and owner-only, with WAL, `synchronous=NORMAL`, 
 ON, `trusted_schema=OFF`, `temp_store=MEMORY`, and terminal close. See the
 [app storage boundaries](../../docs/marmot-architecture/further-context/app-sqlite-storage-boundaries.md).
 
+`canonical_membership_frontier(group_id)` reads only the persisted MLS GroupContext
+and returns an opaque token covering its epoch and tree/transcript hashes. App
+workers compare it with their captured token to invalidate roster completeness
+when canonical membership changes, including same-epoch branch replacement.
+Pending commits do not advance the token until merge. Missing context returns
+`None`; storage failures remain errors. Tokens stay in memory and are never logged.
+
 ## Chat-list selection
 
 `chat_list_selection_snapshot(view)` captures all eligible IDs for one of the four native `ChatListView`s in one

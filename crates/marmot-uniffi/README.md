@@ -771,8 +771,10 @@ instead of a roster/count heuristic. Staged additions/removals and departed or
 disbanded copies can be incomplete even if self-membership is Member or every
 returned row has devices. Pending UI acceptance after MLS join can be complete;
 seeded reads hydrate before returning rows, and authoritative failures error.
-Recovery/catch-up completeness refers to the captured local epoch, not remote
-freshness. See the [full roster contract](API-REFERENCE.md) for state semantics.
+Completeness requires the captured canonical membership frontier to match the
+current stored frontier. During catch-up or repair, snapshots report false after
+that frontier changes until a fresh capture is available. This does not
+guarantee remote freshness. See the [full roster contract](API-REFERENCE.md) for state semantics.
 Each device has `device_id`, `leaf_index`, `client_label`, `joined_at`, and
 `is_this_installation`. The active installation sorts first,
 then devices sort by leaf index. Account-level `local`/`is_self` retain their

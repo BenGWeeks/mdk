@@ -995,9 +995,10 @@ fn recover_post_canonical_result<T: Default>(
 /// session and are served from this snapshot instead.
 /// MLS membership/epoch only change on a committed group operation, which the
 /// catch-up surfaces via `GroupStateUpdated` so subscribers re-read once it
-/// lands. Storage-owned self-membership is refreshed separately when a roster
-/// is served, so an observed departure during catch-up is not hidden by this
-/// snapshot. The snapshot is only used until catch-up completes.
+/// lands. Roster reads compare the captured canonical membership frontier with
+/// the current stored frontier and refresh storage-owned self-membership, so
+/// admissions and departures during catch-up invalidate completeness without
+/// rebuilding the roster. The snapshot is only used until catch-up completes.
 ///
 /// Capture is atomic: if any known group's member or MLS projection cannot be
 /// read, the whole snapshot fails and the worker defers reads to live state
@@ -1008,6 +1009,7 @@ pub(crate) struct GroupReadSnapshot {
     members: HashMap<GroupId, Vec<AppGroupMemberRecord>>,
     mls_state: HashMap<GroupId, AppGroupMlsState>,
     roster_complete: HashMap<GroupId, bool>,
+    pub(crate) membership_frontiers: HashMap<GroupId, [u8; 32]>,
     quarantined: Vec<AppQuarantinedGroup>,
 }
 
@@ -2787,6 +2789,8 @@ impl AppClient {
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
         let mut roster_complete = HashMap::new();
+        let mut membership_frontiers = HashMap::new();
+        let storage = self.app.account_storage(&self.state.label)?;
         // Device enrichment is shared across groups in this worker capture.
         // Only roster accounts are read; no full directory or history scan.
         let mut account_ids = std::collections::BTreeSet::new();
@@ -2812,6 +2816,9 @@ impl AppClient {
             let (records, complete) =
                 self.member_projection_with_profiles(&group_id, &profiles, Some(&labels))?;
             roster_complete.insert(group_id.clone(), complete);
+            if let Some(frontier) = storage.canonical_membership_frontier(&group_id)? {
+                membership_frontiers.insert(group_id.clone(), frontier);
+            }
             let state = self.group_mls_state_unchecked(&group_id)?;
             groups.insert(group_id.clone(), group_record);
             members.insert(group_id.clone(), records);
@@ -2830,6 +2837,7 @@ impl AppClient {
             members,
             mls_state,
             roster_complete,
+            membership_frontiers,
             quarantined: self.quarantined_groups(),
         })
     }

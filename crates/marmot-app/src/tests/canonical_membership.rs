@@ -2361,8 +2361,8 @@ async fn group_roster_completeness_hydration_pending_and_departed_views() {
         assert!(!roster.complete);
         let public = crate::groups::app_group_roster_from_session(roster, "", HashMap::new());
         assert!(!public.complete);
-        // The raw captured snapshot remains complete at its earlier frontier;
-        // runtime reads overlay the newer stored departure.
+        // The internal capture is immutable. Worker responses must overlay
+        // current storage and invalidate this cached completeness evidence.
         assert!(snapshot.group_roster(&group).unwrap().complete);
     }
 }

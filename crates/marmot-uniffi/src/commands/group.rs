@@ -688,7 +688,9 @@ impl Marmot {
     /// Check GroupRosterFfi.complete: true guarantees exactly the distinct
     /// admitted MLS accounts, no omitted account holding a leaf, and non-null,
     /// nonempty authoritative devices covering every leaf at the local captured
-    /// frontier. Staged mismatches and departed/disbanded copies are incomplete.
+    /// frontier, which must match current stored canonical membership. Snapshots
+    /// behind that frontier, staged mismatches and departed/disbanded copies are
+    /// incomplete.
     /// Pending UI acceptance after MLS join can be complete; recovery/catch-up
     /// does not imply remote freshness. Seeded reads hydrate before returning;
     /// hydration/quarantine or authoritative failures error. member_count equals

@@ -241,8 +241,10 @@ at the captured MLS frontier and always nonempty. `AppGroupRoster.complete`
 checks that the projected account set exactly matches canonical admitted MLS
 membership, with all leaves represented, for a nonterminal local copy. Staged
 additions/removals and historical departed/disbanded copies can be incomplete.
-Seeded reads hydrate before returning rows; recovery and snapshots describe the
-local captured epoch. Pending UI acceptance after MLS join can already be
+Seeded reads hydrate before returning rows. Completeness requires the captured
+canonical membership frontier to match the current stored frontier; snapshot
+reads during catch-up or repair report false after that frontier changes, until
+a fresh capture is available. This does not guarantee remote freshness. Pending UI acceptance after MLS join can already be
 complete. Hosts should use the flag instead of inferring completeness from counts
 or device presence. See the [full binding contract](../marmot-uniffi/API-REFERENCE.md)
 for state guarantees and the PR #2279 distinct-account count dependency.
