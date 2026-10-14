@@ -271,12 +271,17 @@ pub(crate) fn member_device(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// One row per projected account identity; sibling MLS leaves share this row.
+/// The projection may include staged accounts or omit still-admitted accounts.
+/// Use [`AppGroupRoster::complete`] for the whole-roster guarantee.
 pub struct AppGroupMemberRecord {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
     #[serde(default)]
-    /// None means unknown; Some contains canonical admitted devices (always nonempty).
+    /// None means unknown (for example an unadmitted staged or historical row).
+    /// Some is authoritative at the captured admitted MLS frontier and nonempty;
+    /// an empty list is never used to represent unknown devices.
     pub devices: Option<Vec<MemberDevice>>,
 }
 
@@ -317,6 +322,7 @@ pub struct AppGroupMlsState {
 /// Session-consistent group record, members, and MLS state captured in one live read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppGroupRosterSession {
+    pub complete: bool,
     pub group_record: AppGroupRecord,
     pub members: Vec<AppGroupMemberRecord>,
     pub mls_state: AppGroupMlsState,
@@ -332,6 +338,8 @@ pub(crate) struct AppGroupRosterSession {
 /// decisions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppGroupConversationSnapshot {
+    /// Same current canonical membership guarantee as [`AppGroupRoster::complete`].
+    pub roster_complete: bool,
     pub my_account_id_hex: String,
     pub group: AppGroupRecord,
     pub members: Vec<AppGroupMemberRecord>,
@@ -340,12 +348,16 @@ pub struct AppGroupConversationSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// One projected account, with all of its known admitted MLS device leaves.
+/// Completeness of this row does not establish completeness of the roster.
 pub struct AppGroupRosterMember {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
     #[serde(default)]
-    /// None means unknown; Some contains canonical admitted devices (always nonempty).
+    /// None means unknown (for example an unadmitted staged or historical row).
+    /// Some is authoritative at the captured admitted MLS frontier and nonempty;
+    /// an empty list is never used to represent unknown devices.
     pub devices: Option<Vec<MemberDevice>>,
     pub is_admin: bool,
     pub is_self: bool,
@@ -353,17 +365,40 @@ pub struct AppGroupRosterMember {
     pub display_name: Option<String>,
 }
 
-/// Lightweight membership projection for roster screens and change detection.
+/// Account-deduplicated membership projection for roster screens and change detection.
+/// See [`Self::complete`] before presenting this as the admitted roster.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupRoster {
+    /// True exactly when self-membership is Member, the local copy is nonterminal,
+    /// its projected accounts equal distinct canonical admitted MLS accounts,
+    /// and every leaf is covered
+    /// by its account's authoritative, nonempty devices. No admitted account is
+    /// omitted and no unadmitted account is included.
+    ///
+    /// False for mismatched staged additions/removals, disbanded history, and
+    /// Left/Removed copies (their retained evidence cannot describe ongoing
+    /// membership). Pending UI confirmation after MLS join may be complete.
+    /// PendingPublish/Merging/Recovering/Unrecoverable can be complete if the
+    /// captured validated membership matches; this does not assert remote
+    /// freshness. Worker snapshots are incomplete when their captured canonical
+    /// membership frontier differs from the current stored frontier, until a
+    /// fresh capture covers the current accounts and leaves.
+    /// Seeded reads hydrate before returning rows; failed hydration/quarantine
+    /// and authoritative read failures error rather than return provisional rows.
+    #[serde(default)]
+    pub complete: bool,
     pub group_id_hex: String,
     pub members: Vec<AppGroupRosterMember>,
+    /// Existing projected epoch; a pending commit can report a proposed epoch.
+    /// Completeness and devices refer to admitted MLS leaves, not staged leaves.
     pub epoch: u64,
     /// Monotonic change token for MLS roster state plus caller membership.
     /// Non-roster MLS commits may bump this revision; directory-only
     /// display-name changes do not.
     pub roster_revision: u64,
     pub self_membership: SelfMembership,
+    /// Unchanged count semantics; equality with row count requires PR #2279's
+    /// distinct-account counting and a complete matching projection.
     pub member_count: usize,
     pub lifecycle_state: AppGroupLifecycleState,
 }
@@ -376,6 +411,7 @@ pub(crate) fn app_group_roster_from_session(
     use std::collections::HashSet;
 
     let AppGroupRosterSession {
+        complete,
         group_record,
         members,
         mls_state,
@@ -403,6 +439,7 @@ pub(crate) fn app_group_roster_from_session(
         SelfMembership::Removed => 2,
     };
     AppGroupRoster {
+        complete: complete && group_record.self_membership == SelfMembership::Member,
         group_id_hex: group_record.group_id_hex,
         members,
         epoch,
@@ -3021,6 +3058,7 @@ mod group_roster_api_tests {
         };
         let roster = app_group_roster_from_session(
             AppGroupRosterSession {
+                complete: false,
                 group_record: record,
                 members,
                 mls_state,
@@ -3028,6 +3066,7 @@ mod group_roster_api_tests {
             self_id,
             HashMap::from([(self_id.to_owned(), "Alice".to_owned())]),
         );
+        assert!(!roster.complete);
         assert_eq!(roster.epoch, 7);
         assert_eq!(roster.roster_revision, 23);
         assert_eq!(roster.self_membership, SelfMembership::Removed);

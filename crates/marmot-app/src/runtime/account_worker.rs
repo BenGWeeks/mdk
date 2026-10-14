@@ -6259,6 +6259,17 @@ fn group_roster_from_snapshot(
     {
         session.group_record.self_membership = membership;
     }
+    // Catch-up/repair can commit membership and then await more work while this
+    // pre-work snapshot is still serving reads. Compare the canonical context,
+    // not the projected epoch (which can describe a pending commit), and never
+    // rebuild canonical leaves on this read path. Missing/changed context also
+    // invalidates old evidence after deletion, rollback or branch replacement.
+    let current_frontier = app
+        .account_storage(account_label)?
+        .canonical_membership_frontier(group_id)?;
+    session.complete &= session.group_record.self_membership == crate::SelfMembership::Member
+        && current_frontier.is_some()
+        && snapshot.membership_frontiers.get(group_id).copied() == current_frontier;
     Ok(session)
 }
 
@@ -7471,6 +7482,175 @@ mod tests {
             reused_account_id_credential: false,
             kind,
             phase,
+        }
+    }
+
+    async fn group_roster_snapshot_admission(sibling: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let remote_dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let secret = home
+            .load_signing_keys("bob")
+            .unwrap()
+            .secret_key()
+            .to_secret_hex();
+        AccountHome::open(remote_dir.path())
+            .import_account("bob", &secret)
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let remote = MarmotApp::with_relay(remote_dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let mut bob_client = app.client("bob").await.unwrap();
+        bob_client.publish_key_package().await.unwrap();
+        let mut client = app.client("alice").await.unwrap();
+        let initial = if sibling {
+            vec![bob.account_id_hex.as_str()]
+        } else {
+            vec![]
+        };
+        let group = client
+            .create_group("snapshot admission", &initial)
+            .await
+            .unwrap();
+        let snapshot = client.group_read_snapshot().unwrap();
+        let before = snapshot.group_roster(&group).unwrap();
+        assert!(before.complete);
+        let mut sibling_client = remote.client("bob").await.unwrap();
+        let mut kp = sibling_client.publish_key_package().await.unwrap();
+        let artifact = sibling_client
+            .runtime
+            .key_package_maintenance_status()
+            .unwrap()
+            .unwrap()
+            .authored_signed_event
+            .unwrap();
+        let publication: transport_nostr_peeler::NostrTransportEvent =
+            serde_json::from_slice(&artifact.bytes).unwrap();
+        kp.source = Some(cgka_traits::engine::KeyPackageSource {
+            event_id: MessageId::new(hex::decode(publication.id).unwrap()),
+        });
+        let (commands, mut receiver) = mpsc::channel(8);
+        // Catch-up owns the client, admits a real leaf, then awaits a read response.
+        // The worker must answer that read while the work future remains pending.
+        let work = async {
+            let effects = client
+                .runtime
+                .send(cgka_traits::SendIntent::Invite {
+                    group_id: group.clone(),
+                    key_packages: vec![kp],
+                    initial_admins: vec![],
+                })
+                .await
+                .unwrap();
+            client
+                .observe_drained_session_events(&effects)
+                .await
+                .unwrap();
+            let current = client.group_roster_session(&group).unwrap();
+            assert!(current.complete);
+            assert_eq!(current.members.len(), 2);
+            let admitted = current
+                .members
+                .iter()
+                .find(|row| row.member_id_hex == bob.account_id_hex)
+                .unwrap()
+                .devices
+                .as_ref()
+                .unwrap();
+            assert_eq!(admitted.len(), if sibling { 2 } else { 1 });
+            let (respond, response) = oneshot::channel();
+            commands
+                .send(AccountWorkerCommand::GroupRoster {
+                    group_id: group.clone(),
+                    respond,
+                })
+                .await
+                .unwrap();
+            let stale = timeout(Duration::from_secs(2), response)
+                .await
+                .expect("roster reads must stay available while catch-up waits")
+                .unwrap()
+                .unwrap();
+            assert_eq!(stale.members, before.members);
+            assert_eq!(
+                stale.group_record.self_membership,
+                crate::SelfMembership::Member
+            );
+            assert!(
+                !stale.complete,
+                "an admitted account or sibling leaf invalidates the captured frontier"
+            );
+        };
+        let mut pending = VecDeque::new();
+        serve_snapshot_reads_until(
+            Some(snapshot),
+            work,
+            &mut receiver,
+            &mut pending,
+            &app,
+            "alice",
+        )
+        .await;
+        assert!(pending.is_empty());
+        let fresh = client.group_read_snapshot().unwrap();
+        let roster = group_roster_from_snapshot(&app, "alice", &fresh, &group).unwrap();
+        assert!(roster.complete);
+        assert_eq!(roster.members.len(), 2);
+        let devices = roster
+            .members
+            .iter()
+            .find(|row| row.member_id_hex == bob.account_id_hex)
+            .unwrap()
+            .devices
+            .as_ref()
+            .unwrap();
+        assert_eq!(devices.len(), if sibling { 2 } else { 1 });
+    }
+
+    #[tokio::test]
+    async fn group_roster_snapshot_account_admission_invalidates_completeness() {
+        group_roster_snapshot_admission(false).await;
+    }
+
+    #[tokio::test]
+    async fn group_roster_snapshot_sibling_admission_invalidates_completeness() {
+        group_roster_snapshot_admission(true).await;
+    }
+
+    #[tokio::test]
+    async fn group_roster_snapshot_departure_overlay_invalidates_completeness() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("snapshot roster", &[]).await.unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        let snapshot = client.group_read_snapshot().unwrap();
+        assert!(
+            group_roster_from_snapshot(&app, "alice", &snapshot, &group)
+                .unwrap()
+                .complete
+        );
+        for membership in [crate::SelfMembership::Left, crate::SelfMembership::Removed] {
+            app.set_group_self_membership("alice", &group_hex, crate::SelfMembership::Member)
+                .unwrap();
+            app.set_group_self_membership("alice", &group_hex, membership)
+                .unwrap();
+            let roster = group_roster_from_snapshot(&app, "alice", &snapshot, &group).unwrap();
+            assert_eq!(roster.group_record.self_membership, membership);
+            assert!(
+                !roster.complete,
+                "old leaf evidence cannot make a newer departure complete"
+            );
+            assert_eq!(roster.members, snapshot.members(&group).unwrap());
         }
     }
 

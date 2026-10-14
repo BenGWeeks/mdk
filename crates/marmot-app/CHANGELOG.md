@@ -11,6 +11,8 @@
   siblings. Historical attribution uses source-epoch evidence; migration 0108
   leaves legacy rows Unknown. Raw and timeline records agree.
 
+- `AppGroupRoster.complete` reports exact account/leaf coverage of captured canonical MLS membership. Staged additions/removals and departed/disbanded copies report false; member_count is unchanged (distinct-account count equality depends on PR #2279).
+
 - Devices are unknown when not canonically admitted or unavailable; known lists
   are authoritative and nonempty for admitted members.
 

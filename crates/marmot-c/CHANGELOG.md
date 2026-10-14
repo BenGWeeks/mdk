@@ -18,6 +18,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   Message layouts include an owned tagged enum; regenerate the header and pair
   it with the matching library. Parent deep-free releases Exact strings.
 
+- `MarmotGroupRoster` adds returned `bool complete` for canonical account/leaf coverage. This ABI layout change requires matching regenerated headers and libraries. Parent deep-free ownership is unchanged; member_count is unchanged (PR #2279 supplies distinct-account counting).
+
 - Devices are unknown when not canonically admitted or unavailable; known lists
   are authoritative and nonempty for admitted members.
 

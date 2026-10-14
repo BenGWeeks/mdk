@@ -615,7 +615,12 @@ impl Marmot {
         normalize_member_ref_ffi(&member_ref)
     }
 
-    /// Membership roster for `group_id_hex`.
+    /// One row per projected account, with sibling devices grouped together.
+    /// Null devices mean unknown; non-null device lists are authoritative at the
+    /// captured admitted MLS frontier and nonempty. Staged removals can omit
+    /// accounts still holding leaves even when every returned row has devices.
+    /// Use group_roster and its complete flag for whole-roster guarantees.
+    /// Seeded reads hydrate first; authoritative failures return errors.
     pub async fn group_members(
         &self,
         account_ref: String,
@@ -679,7 +684,17 @@ impl Marmot {
         group_conversation_snapshot_for(self, &account_ref, &group_id).await
     }
 
-    /// Lightweight membership roster projection for membership screens.
+    /// One row per projected account for membership screens.
+    /// Check GroupRosterFfi.complete: true guarantees exactly the distinct
+    /// admitted MLS accounts, no omitted account holding a leaf, and non-null,
+    /// nonempty authoritative devices covering every leaf at the local captured
+    /// frontier, which must match current stored canonical membership. Snapshots
+    /// behind that frontier, staged mismatches and departed/disbanded copies are
+    /// incomplete.
+    /// Pending UI acceptance after MLS join can be complete; recovery/catch-up
+    /// does not imply remote freshness. Seeded reads hydrate before returning;
+    /// hydration/quarantine or authoritative failures error. member_count equals
+    /// row count only with PR #2279 distinct-account counting and a complete view.
     pub async fn group_roster(
         &self,
         account_ref: String,

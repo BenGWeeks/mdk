@@ -249,11 +249,15 @@ impl From<MemberDevice> for MemberDeviceFfi {
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
+/// One projected account identity, shared by all sibling MLS device leaves.
+/// Use GroupRosterFfi.complete to check whole-roster coverage.
 pub struct AppGroupMemberRecordFfi {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
-    /// None means unknown; Some contains canonical admitted devices (always nonempty).
+    /// Null means unknown, including unadmitted staged and historical rows.
+    /// Non-null means authoritative at the captured admitted MLS frontier and
+    /// always nonempty; never infer whole-roster completeness from this field.
     pub devices: Option<Vec<MemberDeviceFfi>>,
 }
 
@@ -295,11 +299,15 @@ pub struct MemberRefFfi {
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
+/// One projected account identity; known devices cover its admitted MLS leaves.
+/// A known device list on every returned row does not prove roster completeness.
 pub struct GroupMemberDetailsFfi {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
-    /// None means unknown; Some contains canonical admitted devices (always nonempty).
+    /// Null means unknown, including unadmitted staged and historical rows.
+    /// Non-null means authoritative at the captured admitted MLS frontier and
+    /// always nonempty; never infer whole-roster completeness from this field.
     pub devices: Option<Vec<MemberDeviceFfi>>,
     pub is_admin: bool,
     pub is_self: bool,
@@ -475,15 +483,37 @@ pub(crate) fn group_details_from_conversation_snapshot_ffi(
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
+/// Account-deduplicated roster at one locally captured MLS frontier.
+/// Hosts must check complete before presenting an admitted membership list.
 pub struct GroupRosterFfi {
+    /// True exactly when self-membership is Member, the local copy is nonterminal,
+    /// projected accounts equal distinct canonical admitted MLS accounts, and
+    /// every admitted leaf is covered
+    /// by non-null, nonempty devices, and no admitted account is omitted.
+    ///
+    /// False for mismatched staged additions/removals, disbanded history, and
+    /// Left/Removed copies. Pending UI confirmation after MLS join can be true.
+    /// PendingPublish/Merging/Recovering/Unrecoverable alone do not decide this:
+    /// validated matching membership can be complete at the local epoch even
+    /// while catch-up is outstanding. Snapshots are incomplete when their captured
+    /// canonical membership frontier differs from the current stored frontier,
+    /// until a fresh capture covers the current accounts and leaves. This does
+    /// not guarantee remote freshness. Seeded reads hydrate first; failed hydration,
+    /// quarantine and authoritative read failures return errors, not seed rows.
+    /// Kotlin: complete: Boolean. Swift: complete: Bool.
+    pub complete: bool,
     pub group_id_hex: String,
     pub members: Vec<GroupMemberDetailsFfi>,
+    /// Existing projected epoch; a pending commit can report a proposed epoch.
+    /// Completeness and devices refer to admitted MLS leaves, not staged leaves.
     pub epoch: u64,
     /// Monotonic change token for MLS roster state plus caller membership.
     /// Non-roster MLS commits may bump this revision; directory-only
     /// display-name changes do not.
     pub roster_revision: u64,
     pub self_membership: SelfMembershipFfi,
+    /// Row-count equality requires PR #2279's distinct-account counting and a
+    /// complete matching projection. Count semantics are unchanged here.
     pub member_count: u32,
     pub lifecycle_state: GroupLifecycleStateFfi,
 }
@@ -513,6 +543,7 @@ pub(crate) fn group_roster_ffi(roster: AppGroupRoster) -> Result<GroupRosterFfi,
         })
         .collect::<Result<Vec<_>, MarmotKitError>>()?;
     Ok(GroupRosterFfi {
+        complete: roster.complete,
         group_id_hex: roster.group_id_hex,
         members,
         epoch: roster.epoch,
@@ -809,6 +840,7 @@ mod group_roster_tests {
     fn group_roster_ffi_preserves_self_membership_and_revision() {
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let roster = AppGroupRoster {
+            complete: false,
             group_id_hex: "01".repeat(16),
             members: vec![AppGroupRosterMember {
                 member_id_hex: self_id.to_owned(),
@@ -831,6 +863,10 @@ mod group_roster_tests {
             member_count: 1,
             lifecycle_state: AppGroupLifecycleState::Stable,
         };
+        let mut complete_roster = roster.clone();
+        complete_roster.complete = true;
+        complete_roster.self_membership = SelfMembership::Member;
+        assert!(group_roster_ffi(complete_roster).unwrap().complete);
         let mut unknown_roster = roster.clone();
         unknown_roster.members[0].devices = None;
         assert!(
@@ -839,6 +875,7 @@ mod group_roster_tests {
                 .is_none()
         );
         let ffi = group_roster_ffi(roster).expect("ffi roster");
+        assert!(!ffi.complete);
         assert_eq!(ffi.epoch, 12);
         assert_eq!(ffi.roster_revision, 12);
         assert!(matches!(ffi.self_membership, SelfMembershipFfi::Removed));
