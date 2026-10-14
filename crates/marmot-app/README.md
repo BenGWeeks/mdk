@@ -235,14 +235,18 @@ membership, provider response, profile hydration, and network completion, withou
 
 ## Groups and invitations
 
-Member and roster records expose `devices: Option<Vec<MemberDevice>>` grouped by
-account. `None` means unknown (staged/pending/seed/identity-only rows without
-canonical admission, or projection unavailable); `Some(list)` is authoritative
-and always nonempty for an admitted member. Disbanded historical rosters have
-`None` after live MLS state is deleted. See the
-[binding contract](../marmot-uniffi/README.md#device-local-membership-events) for
-group-scoped IDs, active-installation flags, cache-only labels, and unknown join
-times. KeyPackage inventory `is_this_installation` equals `local_state.is_local()`.
+Member and roster records contain one row per projected account with optional
+canonical `devices`. Null means unknown; non-null device lists are authoritative
+at the captured MLS frontier and always nonempty. `AppGroupRoster.complete`
+checks that the projected account set exactly matches canonical admitted MLS
+membership, with all leaves represented, for a nonterminal local copy. Staged
+additions/removals and historical departed/disbanded copies can be incomplete.
+Seeded reads hydrate before returning rows; recovery and snapshots describe the
+local captured epoch. Pending UI acceptance after MLS join can already be
+complete. Hosts should use the flag instead of inferring completeness from counts
+or device presence. See the [full binding contract](../marmot-uniffi/API-REFERENCE.md)
+for state guarantees and the PR #2279 distinct-account count dependency.
+KeyPackage inventory `is_this_installation` equals `local_state.is_local()`.
 
 
 **Creating and inviting.** Group creation and invites take pubkeys at the action boundary. The app canonicalizes and

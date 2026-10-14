@@ -290,6 +290,7 @@ async fn real_departure_then_disband_projects_after_mls_deletion() {
         .unwrap();
     let assert_projection = |app: &MarmotApp, client: &AppClient| {
         let roster = client.group_roster_session(&group).unwrap();
+        assert!(!roster.complete);
         assert!(!roster.members.is_empty());
         assert!(roster.members.iter().all(|member| member.devices.is_none()));
         let rows = app
@@ -440,6 +441,7 @@ async fn late_competing_commit_cannot_restore_terminal_app_copy() {
             Some(SelfMembership::Removed)
         );
         assert!(!can_send(client, &group));
+        assert!(!client.group_roster_session(&group).unwrap().complete);
         assert_eq!(unread(), 0);
         assert_eq!(installed_group_routes(client, &group), 0);
     };
@@ -593,6 +595,12 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
         .unwrap();
     deliver_new(&mut bob_client, &relay, &mut bob_cursor).await;
     bob_client.sync().await.unwrap();
+    let pending_roster = bob_client.group_roster_session(&group).unwrap();
+    assert!(pending_roster.group_record.pending_confirmation);
+    assert!(
+        pending_roster.complete,
+        "UI acceptance is separate from MLS admission"
+    );
     bob_client.accept_group_invite(&group).unwrap();
     let mut sibling = sibling_app.client("bob").await.unwrap();
     sibling.sync().await.unwrap();
@@ -1830,7 +1838,25 @@ async fn member_devices_group_accounts_and_survive_self_update_reopen_and_leaf_r
     let departing_leaf = sibling.runtime.own_leaf_index(&group).unwrap();
     assert_ne!(surviving_leaf, departing_leaf);
 
+    let admitted = bob_client
+        .runtime
+        .session()
+        .canonical_group_membership(&group)
+        .unwrap();
+    let admitted_accounts = admitted
+        .devices
+        .iter()
+        .map(|leaf| hex::encode(leaf.member.as_slice()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let roster = bob_client.group_roster_session(&group).unwrap();
+    assert!(roster.complete);
     let rows = bob_client.members(&group).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.member_id_hex.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        admitted_accounts
+    );
     assert_eq!(
         rows.len(),
         2,
@@ -1915,6 +1941,15 @@ async fn member_devices_group_accounts_and_survive_self_update_reopen_and_leaf_r
     member.id = MemberId::new(hex::decode(&staged_account.account_id_hex).unwrap());
     staged.members.push(member);
     storage.put_group(&staged).unwrap();
+    assert!(!alice.group_roster_session(&group).unwrap().complete);
+    assert!(
+        !alice
+            .group_read_snapshot()
+            .unwrap()
+            .group_roster(&group)
+            .unwrap()
+            .complete
+    );
     let staged_rows = alice.members(&group).unwrap();
     assert_eq!(staged_rows.len(), 3);
     assert!(
@@ -1929,7 +1964,33 @@ async fn member_devices_group_accounts_and_survive_self_update_reopen_and_leaf_r
         alice.group_roster_session(&group).unwrap().members,
         staged_rows
     );
+    // A staged removal can hide an account while both its leaves remain admitted.
+    let mut omitted = original.clone();
+    omitted
+        .members
+        .retain(|member| hex::encode(member.id.as_slice()) != bob.account_id_hex);
+    storage.put_group(&omitted).unwrap();
+    let omitted_roster = alice.group_roster_session(&group).unwrap();
+    assert_eq!(omitted_roster.members.len(), 1);
+    assert!(omitted_roster.members.iter().all(|row| {
+        row.devices
+            .as_ref()
+            .is_some_and(|devices| !devices.is_empty())
+    }));
+    assert!(
+        !omitted_roster.complete,
+        "known devices on every returned row do not prove completeness"
+    );
+    assert!(
+        !alice
+            .group_read_snapshot()
+            .unwrap()
+            .group_roster(&group)
+            .unwrap()
+            .complete
+    );
     storage.put_group(&original).unwrap();
+    assert!(alice.group_roster_session(&group).unwrap().complete);
     assert_eq!(
         rows.iter()
             .find(|m| m.member_id_hex != bob.account_id_hex)
@@ -2229,4 +2290,101 @@ async fn member_device_labels_reuse_validation_until_package_changes() {
         warmed + 1,
         "unchanged rejected packages must not be revalidated"
     );
+}
+
+/// Seeded state is never presented as a successful provisional roster. Verified
+/// retained membership is still complete when repair or UI confirmation is pending.
+#[tokio::test]
+async fn group_roster_completeness_hydration_pending_and_departed_views() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("completeness frontier", &[])
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    assert!(client.group_roster_session(&group).unwrap().complete);
+    drop(client);
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut client = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(client.members(&group).is_err());
+    assert!(client.group_roster_session(&group).is_err());
+    assert!(client.group_read_snapshot().is_err());
+    client
+        .runtime
+        .session_mut()
+        .ensure_group_hydrated(&group)
+        .unwrap();
+    let hydrated = client.group_roster_session(&group).unwrap();
+    assert!(hydrated.complete);
+    assert!(
+        client
+            .group_read_snapshot()
+            .unwrap()
+            .group_roster(&group)
+            .unwrap()
+            .complete
+    );
+
+    // A pending SelfUpdate does not change the admitted account set.
+    client
+        .runtime
+        .session_mut()
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        client.runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::PendingPublish(_))
+    ));
+    assert!(client.group_roster_session(&group).unwrap().complete);
+
+    // A newer stored departure overrides a previously complete worker snapshot.
+    let snapshot = client.group_read_snapshot().unwrap();
+    for membership in [SelfMembership::Left, SelfMembership::Removed] {
+        app.set_group_self_membership("alice", &group_hex, SelfMembership::Member)
+            .unwrap();
+        app.set_group_self_membership("alice", &group_hex, membership)
+            .unwrap();
+        let roster = client.group_roster_session(&group).unwrap();
+        assert_eq!(roster.group_record.self_membership, membership);
+        assert!(!roster.complete);
+        let public = crate::groups::app_group_roster_from_session(roster, "", HashMap::new());
+        assert!(!public.complete);
+        // The raw captured snapshot remains complete at its earlier frontier;
+        // runtime reads overlay the newer stored departure.
+        assert!(snapshot.group_roster(&group).unwrap().complete);
+    }
+}
+
+/// Unrecoverable freezes canonical MLS; it does not turn known admitted devices
+/// into unknown rows or imply a partial roster at that frozen local epoch.
+#[tokio::test]
+async fn group_roster_completeness_survives_unrecoverable_reopen() {
+    let (_dir, app, alice, group, _) = member_device_label_fixture().await;
+    let before = alice.group_roster_session(&group).unwrap();
+    assert!(before.complete);
+    let storage = app.account_storage("alice").unwrap();
+    let mut record = storage.get_group(&group).unwrap();
+    record.unrecoverable = true;
+    storage.put_group(&record).unwrap();
+    drop(alice);
+    let reopened = app.client("alice").await.unwrap();
+    let frozen = reopened.group_roster_session(&group).unwrap();
+    assert_eq!(
+        frozen.mls_state.lifecycle_state,
+        AppGroupLifecycleState::Unrecoverable
+    );
+    assert!(frozen.complete);
+    assert_eq!(frozen.members, before.members);
 }

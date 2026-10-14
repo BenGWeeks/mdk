@@ -1007,6 +1007,7 @@ pub(crate) struct GroupReadSnapshot {
     groups: HashMap<GroupId, AppGroupRecord>,
     members: HashMap<GroupId, Vec<AppGroupMemberRecord>>,
     mls_state: HashMap<GroupId, AppGroupMlsState>,
+    roster_complete: HashMap<GroupId, bool>,
     quarantined: Vec<AppQuarantinedGroup>,
 }
 
@@ -1059,12 +1060,15 @@ impl GroupReadSnapshot {
         &self,
         group_id: &GroupId,
     ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+        let group_record = self
+            .groups
+            .get(group_id)
+            .cloned()
+            .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?;
         Ok(crate::groups::AppGroupRosterSession {
-            group_record: self
-                .groups
-                .get(group_id)
-                .cloned()
-                .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?,
+            complete: self.roster_complete.get(group_id).copied().unwrap_or(false)
+                && group_record.self_membership == SelfMembership::Member,
+            group_record,
             members: self.members(group_id)?,
             mls_state: self.group_mls_state(group_id)?,
         })
@@ -2429,8 +2433,21 @@ impl AppClient {
         profiles: &HashMap<String, String>,
         cached_labels: Option<&MemberDeviceLabels>,
     ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
+        Ok(self
+            .member_projection_with_profiles(group_id, profiles, cached_labels)?
+            .0)
+    }
+
+    /// Capture projected accounts and canonical coverage from the same worker read.
+    fn member_projection_with_profiles(
+        &self,
+        group_id: &GroupId,
+        profiles: &HashMap<String, String>,
+        cached_labels: Option<&MemberDeviceLabels>,
+    ) -> Result<(Vec<AppGroupMemberRecord>, bool), AppError> {
+        let group = self.runtime.group_record(group_id)?;
         // Disband deletes live MLS state but keeps the historical roster.
-        let devices = if self.runtime.group_record(group_id)?.disbanded.is_some() {
+        let devices = if group.disbanded.is_some() {
             Vec::new()
         } else {
             self.runtime
@@ -2438,6 +2455,10 @@ impl AppClient {
                 .canonical_group_membership(group_id)?
                 .devices
         };
+        let canonical_accounts = devices
+            .iter()
+            .map(|leaf| hex::encode(leaf.member.as_slice()))
+            .collect::<std::collections::BTreeSet<_>>();
         let mut members = std::collections::BTreeMap::new();
         for member in self.runtime.members(group_id)? {
             let member_id_hex = hex::encode(member.id.as_slice());
@@ -2451,6 +2472,13 @@ impl AppClient {
                     devices: None,
                 });
         }
+        let complete = !group.is_terminal()
+            && !canonical_accounts.is_empty()
+            && members
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                == canonical_accounts;
         let owned_labels;
         let labels = if let Some(labels) = cached_labels {
             labels
@@ -2475,7 +2503,7 @@ impl AppClient {
                 devices.sort_by_key(|device| (!device.is_this_installation, device.leaf_index));
             }
         }
-        Ok(members.into_values().collect())
+        Ok((members.into_values().collect(), complete))
     }
 
     fn member_device_package_metadata(
@@ -2616,7 +2644,8 @@ impl AppClient {
             .cloned()
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
         let profiles = self.app.profiles_by_id()?;
-        let members = self.members_with_profiles_unchecked(group_id, &profiles, None)?;
+        let (members, complete) =
+            self.member_projection_with_profiles(group_id, &profiles, None)?;
         if let Some(membership) = self
             .app
             .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?
@@ -2625,6 +2654,7 @@ impl AppClient {
         }
         let mls_state = self.group_mls_state_unchecked(group_id)?;
         Ok(crate::groups::AppGroupRosterSession {
+            complete: complete && group_record.self_membership == SelfMembership::Member,
             group_record,
             members,
             mls_state,
@@ -2756,6 +2786,7 @@ impl AppClient {
         let mut groups = HashMap::new();
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
+        let mut roster_complete = HashMap::new();
         // Device enrichment is shared across groups in this worker capture.
         // Only roster accounts are read; no full directory or history scan.
         let mut account_ids = std::collections::BTreeSet::new();
@@ -2778,8 +2809,9 @@ impl AppClient {
             if let Some(membership) = stored_self_memberships.get(&group.group_id_hex) {
                 group_record.self_membership = *membership;
             }
-            let records =
-                self.members_with_profiles_unchecked(&group_id, &profiles, Some(&labels))?;
+            let (records, complete) =
+                self.member_projection_with_profiles(&group_id, &profiles, Some(&labels))?;
+            roster_complete.insert(group_id.clone(), complete);
             let state = self.group_mls_state_unchecked(&group_id)?;
             groups.insert(group_id.clone(), group_record);
             members.insert(group_id.clone(), records);
@@ -2797,6 +2829,7 @@ impl AppClient {
             groups,
             members,
             mls_state,
+            roster_complete,
             quarantined: self.quarantined_groups(),
         })
     }
@@ -7682,6 +7715,7 @@ mod self_membership_backfill_tests {
 
         let roster = client.group_roster_session(&group_id).unwrap();
 
+        assert!(!roster.complete);
         assert!(
             roster.members.is_empty(),
             "fixture must omit the local account"

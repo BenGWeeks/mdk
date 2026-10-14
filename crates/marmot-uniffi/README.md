@@ -761,11 +761,18 @@ the conversion cache. Custom events do not change chat-list activity or notifica
 
 `group_roster(...)` returns `GroupRosterFfi` with `members: Vec<GroupMemberDetailsFfi>`;
 `group_members(...)` returns `Vec<AppGroupMemberRecordFfi>`. Both member records expose
-`devices: Option<Vec<MemberDeviceFfi>>` (Kotlin `List<MemberDeviceFfi>?`). `None`
-(Kotlin `null`) means MDK does not know: staged, pending, seed or identity-only
-rows without canonical admission, or an unavailable projection. `Some(list)` is
-canonical and authoritative; an admitted member always has at least one device.
-Disbanded historical rosters have `None` after live MLS state is deleted.
+`devices: Option<Vec<MemberDeviceFfi>>` (Kotlin `List<MemberDeviceFfi>?`). Rows
+are deduplicated by account, so sibling devices share a row. Null means unknown;
+non-null device lists are authoritative at the captured admitted MLS frontier
+and always nonempty. `GroupRosterFfi.complete` (Kotlin `complete: Boolean`, Swift
+`complete: Bool`) verifies that every admitted account and leaf is represented,
+with no extra account rows, for a nonterminal local copy. Hosts consume this flag
+instead of a roster/count heuristic. Staged additions/removals and departed or
+disbanded copies can be incomplete even if self-membership is Member or every
+returned row has devices. Pending UI acceptance after MLS join can be complete;
+seeded reads hydrate before returning rows, and authoritative failures error.
+Recovery/catch-up completeness refers to the captured local epoch, not remote
+freshness. See the [full roster contract](API-REFERENCE.md) for state semantics.
 Each device has `device_id`, `leaf_index`, `client_label`, `joined_at`, and
 `is_this_installation`. The active installation sorts first,
 then devices sort by leaf index. Account-level `local`/`is_self` retain their
@@ -773,7 +780,8 @@ existing meaning; `is_this_installation` identifies only the active own leaf and
 `local_account_key_packages(...)` and `refresh_account_key_packages(...)` return
 `Vec<AccountKeyPackageInventoryEntryFfi>` with `is_this_installation: bool`
 (Kotlin `isThisInstallation: Boolean`) derived from durable local ownership.
-Existing MLS member counts remain leaf counts; the member rows provide person counts.
+`member_count` remains unchanged here: it equals roster row count only together
+with PR #2279 (distinct-account counting) and a complete matching projection.
 
 `device_id` is lowercase SHA-256 hex over the domain `marmot-app/member-device-id/v1`,
 length-prefixed opaque MLS group bytes, and length-prefixed leaf signature-key bytes

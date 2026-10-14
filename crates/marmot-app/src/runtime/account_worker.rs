@@ -6259,6 +6259,7 @@ fn group_roster_from_snapshot(
     {
         session.group_record.self_membership = membership;
     }
+    session.complete &= session.group_record.self_membership == crate::SelfMembership::Member;
     Ok(session)
 }
 
@@ -7471,6 +7472,38 @@ mod tests {
             reused_account_id_credential: false,
             kind,
             phase,
+        }
+    }
+
+    #[tokio::test]
+    async fn group_roster_snapshot_departure_overlay_invalidates_completeness() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("snapshot roster", &[]).await.unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        let snapshot = client.group_read_snapshot().unwrap();
+        assert!(
+            group_roster_from_snapshot(&app, "alice", &snapshot, &group)
+                .unwrap()
+                .complete
+        );
+        for membership in [crate::SelfMembership::Left, crate::SelfMembership::Removed] {
+            app.set_group_self_membership("alice", &group_hex, crate::SelfMembership::Member)
+                .unwrap();
+            app.set_group_self_membership("alice", &group_hex, membership)
+                .unwrap();
+            let roster = group_roster_from_snapshot(&app, "alice", &snapshot, &group).unwrap();
+            assert_eq!(roster.group_record.self_membership, membership);
+            assert!(
+                !roster.complete,
+                "old leaf evidence cannot make a newer departure complete"
+            );
+            assert_eq!(roster.members, snapshot.members(&group).unwrap());
         }
     }
 

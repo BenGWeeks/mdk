@@ -6,6 +6,8 @@
 
 ### Added
 
+- `GroupRosterFfi.complete` (Kotlin `complete: Boolean`, Swift `complete: Bool`) exposes runtime-owned roster completeness. Use the flag instead of host count/device heuristics. Regenerate bindings with the matching library; member_count is unchanged and row-count equality depends on PR #2279.
+
 - Devices are unknown when not canonically admitted or unavailable; known lists
   are authoritative and nonempty for admitted members.
 

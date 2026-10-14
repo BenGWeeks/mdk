@@ -449,6 +449,7 @@ mod tests {
         ] {
             let known = devices.is_some();
             let mirror: MarmotGroupRoster = GroupRosterFfi {
+                complete: known,
                 group_id_hex: "01".repeat(16),
                 members: vec![GroupMemberDetailsFfi {
                     member_id_hex: "aa".repeat(32),
@@ -467,6 +468,7 @@ mod tests {
                 lifecycle_state: GroupLifecycleStateFfi::Stable,
             }
             .into();
+            assert_eq!(mirror.complete, known);
             let row = unsafe { &*mirror.members };
             assert_eq!(row.has_devices, known);
             assert_eq!(row.devices_len, usize::from(known));
@@ -682,6 +684,10 @@ c_mirror! {
     /// `marmot_group_roster_free`.
     MarmotGroupRoster from GroupRosterFfi,
     free marmot_group_roster_free {
+        /// True means exact canonical account/leaf coverage at the captured
+        /// nonterminal local frontier. Staged mismatches and Left/Removed or
+        /// disbanded history are false. This does not assert remote freshness.
+        copy complete: bool,
         str group_id_hex,
         vec members/members_len: MarmotGroupMemberDetails,
         copy epoch: u64,
